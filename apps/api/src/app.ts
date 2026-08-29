@@ -4,6 +4,8 @@ import { eq, sql } from "drizzle-orm";
 import { Elysia } from "elysia";
 import { db } from "./db";
 import { adminModule } from "./modules/admin";
+import { operationApprovalModule } from "./modules/agent/approval-http";
+import { machineTokenModule } from "./modules/auth/machine-token-http";
 import { AuthService } from "./modules/auth/service";
 import { BackupModule } from "./modules/backup";
 import { deployModule } from "./modules/deploy/http";
@@ -36,6 +38,8 @@ export const app = new Elysia()
   .use(serversModule)
   .use(quotaModule)
   .use(adminModule)
+  .use(machineTokenModule)
+  .use(operationApprovalModule)
   .use(deployModule)
   .use(velocityModule)
   .use(telemetryPlugin({ store: new InMemoryRollupStore() }))

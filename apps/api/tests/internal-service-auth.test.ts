@@ -5,9 +5,14 @@ import {
   internalAuthRefusal,
   verifyInternalServiceRequest,
 } from "../src/modules/auth/internal-service";
-import { velocityModule } from "../src/modules/velocity/http";
+import { createVelocityModule } from "../src/modules/velocity/http";
+import { MemoryTransferStore, TransferService } from "../src/modules/velocity/transfers";
 
-const velocityApp = new Elysia().use(velocityModule);
+const velocityApp = new Elysia().use(
+  createVelocityModule(
+    new TransferService(new MemoryTransferStore(), () => new Date("2026-08-30T12:00:00.000Z")),
+  ),
+);
 
 const originalInternalKey = process.env.INTERNAL_API_KEY;
 

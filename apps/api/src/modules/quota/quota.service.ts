@@ -107,7 +107,7 @@ export abstract class QuotaService {
 
       serversLimit: quota.serversLimit,
       serversUsed: servers.length,
-      deploymentHeadroomReserved: headroomHeldByUser(userId),
+      deploymentHeadroomReserved: await headroomHeldByUser(userId),
     };
   }
 

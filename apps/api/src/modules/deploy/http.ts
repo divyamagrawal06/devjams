@@ -80,7 +80,7 @@ export const deployModule = new Elysia({ name: "authenticated-deployments" })
     { body: ruleOperationBody },
   )
   .get("/v1/deployments/:id", async ({ identity, params, set }) => {
-    const row = getDeployment(params.id);
+    const row = await getDeployment(params.id);
     if (!row || !(await ownsDeploymentTarget(identity.userId, row.serverId))) {
       set.status = 404;
       return notFound({ tool: "get_deployment", resource: `deployment ${params.id}` });
@@ -88,7 +88,7 @@ export const deployModule = new Elysia({ name: "authenticated-deployments" })
     return row;
   })
   .post("/v1/deployments/:id/abort", async ({ identity, params, set }) => {
-    const row = getDeployment(params.id);
+    const row = await getDeployment(params.id);
     if (!row || !(await ownsDeploymentTarget(identity.userId, row.serverId))) {
       set.status = 404;
       return notFound({ tool: "abort", resource: `deployment ${params.id}` });

@@ -1,8 +1,8 @@
 # Farlands Live
 
-**A game-server control plane whose entire surface (provisioning, rule authoring, live
-deployment, rollback and telemetry) is exposed as an agent action space, with irreversibility
-engineered out.**
+**A game-server and general workload control plane whose entire surface (provisioning, rule
+authoring, live deployment, rollback and telemetry) is exposed as an agent action space, with
+irreversibility engineered out.**
 
 A live multiplayer world an AI agent can safely reshape while people are inside it. Every change
 is health-checked, approved by a human, and reversible.
@@ -79,9 +79,9 @@ the server list.
 In most "AI + X" projects the model produces text a human then acts on. Here the model's output
 *is* the action, and the engineering problem is making that safe.
 
-- **The action space is a fixed set of typed operations.** A validated rule document, or a
-  scoped server lifecycle call. Never code, never a shell, never raw cluster access. The rule
-  schema is simultaneously the capability ceiling and the security boundary.
+- **The action space is a fixed set of typed operations.** A validated rule document, a scoped
+  workload lifecycle call, bounded inline Node files, or a non-root OCI workload. User code is
+  data inside an isolated workload; the agent never receives a shell or raw cluster access.
 - **Every rule change is reversible, and the reversal is one operation.** A snapshot precedes
   every change. The limit, stated plainly: rollback restores the rules. Effects a bad rule
   already had on the world persist unless the owner accepts a snapshot restore and its data loss.
@@ -102,11 +102,30 @@ In most "AI + X" projects the model produces text a human then acts on. Here the
 | **Phone** | Live world feed, proposals as push notifications, approve or reject against a readable diff, and rollback with one thumb. |
 | **Web** | Dashboard, rule authoring, the review screen, deployment progress. |
 
+### Workload catalog
+
+The agent can discover and provision 12 typed templates through `list_server_templates` and
+`create_server`:
+
+| Category | Templates |
+|---|---|
+| Minecraft | Paper, Vanilla Java, Bedrock |
+| Dedicated games | Rust, Counter-Strike 2, Valheim, Terraria, Factorio, Project Zomboid |
+| Web and services | Node.js static site, Node.js service |
+| Advanced | Custom OCI container |
+
+Node workloads accept bounded inline files and receive a public load-balancer address. The custom
+container template accepts an explicit image, command, environment, persistent-data mount, and up
+to eight declared ports. It is deliberately broad, but it is not cluster-admin access: custom
+containers run non-root with a read-only root filesystem, no service-account token, dropped Linux
+capabilities, resource quotas, and network policy that blocks tenant/internal and instance-metadata
+destinations.
+
 ### The tool boundary is the safety boundary
 
 | Class | Tools | Effect |
 |---|---|---|
-| **READ** | `list_servers`, `get_server`, `get_world_telemetry`, `list_rule_sets`, `get_rule_set`, `diff_rule_sets`, `get_deployment` | No live effect. Scoped to the caller's own servers: telemetry is a behavioural record of named players. |
+| **READ** | `list_server_templates`, `list_servers`, `get_server`, `get_world_telemetry`, `list_rule_sets`, `get_rule_set`, `diff_rule_sets`, `get_deployment` | No live effect. Scoped to the caller's own servers: telemetry is a behavioural record of named players. |
 | **DRAFT** | `author_rules`, `preview_deploy` | Plain English in, validated rule document out. Deploys nothing. Rate-limited, because they invoke a model and create durable versions. |
 | **ACT** | `deploy_rules`, `rollback`, `create_server`, `power_action` | Changes a live world. Requires an approval token minted by a human against the exact content being deployed. |
 
@@ -167,7 +186,7 @@ Two different operations get called rollback, and conflating them loses data.
 | **Entrypoint** | AWS Network Load Balancer, one stable hostname per server |
 | **Proxy** | Velocity with a dynamic-routing plugin, extended with player transfer and a lobby |
 | **Orchestration** | Kubernetes on EKS, namespace per tenant, Karpenter within a hard spend ceiling |
-| **Game server** | Paper 26.x in a pod with a persistent volume; RCON as the control channel |
+| **Workloads** | Minecraft Java/Bedrock, LinuxGSM game images, Node sites/services, and bounded custom OCI containers, each with persistent storage |
 | **Control plane** | Bun + Elysia, TypeScript: lifecycle, deployment controller, telemetry, billing of quota |
 | **Rule runtime** | A pre-built, pre-reviewed Java plugin that interprets an injected JSON rule document |
 | **Database** | Postgres + Drizzle: versions, deployments, approvals, rollups, proposals |
@@ -262,9 +281,9 @@ the thing worth looking at first.
 
 ## What this is not
 
-Do not claim, and do not build toward: AI that writes plugins; changing a server without a
-restart; AI-generated quests or dialogue; agents that play Minecraft. All four positions are
-occupied, some heavily.
+Do not claim: changing a server without a restart; AI-generated quests or dialogue; agents that
+play Minecraft; or that a custom workload receives a shell or cluster-admin authority. Inline Node
+files and user-selected OCI images are supported, but they remain quota-bound workload inputs.
 
 The claim that holds is narrower and harder: a game-server control plane exposed as a gated agent
 action space, where a rule change is delivered by health-checked server replacement with no

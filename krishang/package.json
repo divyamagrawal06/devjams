@@ -4,8 +4,7 @@
   "packageManager": "bun@1.2.21",
   "workspaces": [
     "packages/*",
-    "apps/api",
-    "apps/web"
+    "apps/api"
   ],
   "engines": {
     "bun": ">=1.2.0",
@@ -14,7 +13,6 @@
   "scripts": {
     "mock": "bun run --cwd apps/api mock",
     "dev:api": "bun run --cwd apps/api mock",
-    "dev:web": "bun run --cwd apps/web dev",
     "test": "bun test",
     "lint": "biome check .",
     "format": "biome format --write ."

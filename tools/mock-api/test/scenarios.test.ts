@@ -50,27 +50,48 @@ async function startDeployment(scenario: string, stepMs = 5) {
   return started.body.deployment.deployment_id as string;
 }
 
-async function settle(ms: number) {
-  await new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 async function stateOf(id: string): Promise<DeploymentState> {
   const { body } = await call(`/v1/deployments/${id}`);
   return body.deployment.state;
 }
 
+async function waitForState(
+  id: string,
+  predicate: (state: DeploymentState) => boolean,
+  timeoutMs = 1_000,
+): Promise<DeploymentState> {
+  const deadline = Date.now() + timeoutMs;
+  let state = await stateOf(id);
+
+  while (!predicate(state) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    state = await stateOf(id);
+  }
+
+  if (!predicate(state)) {
+    throw new Error(`deployment ${id} did not reach the expected state; last state was ${state}`);
+  }
+  return state;
+}
+
+async function expectStateToRemain(id: string, expected: DeploymentState, polls = 20) {
+  for (let poll = 0; poll < polls; poll += 1) {
+    expect(await stateOf(id)).toBe(expected);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+}
+
 describe("happy path", () => {
   test("walks every state and ends at idle", async () => {
     const id = await startDeployment("happy", 4);
-    await settle(200);
-    expect(await stateOf(id)).toBe("idle");
+    expect(await waitForState(id, (state) => state === "idle")).toBe("idle");
   });
 });
 
 describe("failure paths", () => {
   test("a build failure ends at failed, and the original is untouched", async () => {
     const id = await startDeployment("fail_at_building", 4);
-    await settle(200);
+    await waitForState(id, (state) => state === "failed");
 
     const { body } = await call(`/v1/deployments/${id}`);
     expect(body.deployment.state).toBe("failed");
@@ -82,7 +103,7 @@ describe("failure paths", () => {
 
   test("an abort before cutover leaves no trace", async () => {
     const id = await startDeployment("abort_at_verifying", 4);
-    await settle(200);
+    await waitForState(id, (state) => state === "aborted");
 
     const { body } = await call(`/v1/deployments/${id}`);
     expect(body.deployment.state).toBe("aborted");
@@ -91,21 +112,15 @@ describe("failure paths", () => {
 
   test("a stalled deployment stops emitting, which is what watch must detect", async () => {
     const id = await startDeployment("stall", 4);
-    await settle(150);
-
-    const first = await stateOf(id);
-    expect(first).toBe("presync");
-
-    // Still presync well after the step budget would have advanced it.
-    await settle(150);
-    expect(await stateOf(id)).toBe("presync");
+    expect(await waitForState(id, (state) => state === "presync")).toBe("presync");
+    await expectStateToRemain(id, "presync");
   });
 });
 
 describe("abort endpoint", () => {
   test("aborts a pre-cutover deployment", async () => {
     const id = await startDeployment("stall", 4);
-    await settle(120);
+    await waitForState(id, (state) => state === "presync");
 
     const { body } = await call(`/v1/deployments/${id}/abort`, { method: "POST" });
     expect(body.no_op).toBe(false);
@@ -114,7 +129,7 @@ describe("abort endpoint", () => {
 
   test("is a no-op once the deployment is past cutover", async () => {
     const id = await startDeployment("happy", 4);
-    await settle(200);
+    await waitForState(id, (state) => state === "idle");
 
     const { body } = await call(`/v1/deployments/${id}/abort`, { method: "POST" });
     expect(body.no_op).toBe(true);

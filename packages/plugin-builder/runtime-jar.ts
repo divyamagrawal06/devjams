@@ -1,6 +1,10 @@
-import { get, list } from "@vercel/blob";
+import { readArtifactBytes, sha256Digest } from "./storage";
 
-const DEFAULT_RUNTIME_JAR_BLOB_PATHNAME = "plugin-builder/runtime/farlands-plugin-1.0.0.jar";
+export type RuntimeJar = {
+  bytes: Uint8Array;
+  digest: string;
+  minecraftVersion: string;
+};
 
 function requiredEnv(name: string): string {
   const value = process.env[name];
@@ -12,52 +16,29 @@ function requiredEnv(name: string): string {
   return value;
 }
 
-let cachedRuntimeJar: Buffer | null = null;
+let cachedRuntime: { cacheKey: string; value: RuntimeJar } | null = null;
 
-export async function getRuntimeJar(): Promise<Buffer> {
-  if (cachedRuntimeJar) {
-    // Return a copy to prevent in-place modifications from mutating cached buffer
-    return Buffer.from(cachedRuntimeJar);
+/** Load and verify a reviewed, pinned interpreter release. */
+export async function getRuntimeJar(): Promise<RuntimeJar> {
+  const uri = requiredEnv("FARLANDS_RULE_RUNTIME_URI");
+  const expectedDigest = requiredEnv("FARLANDS_RULE_RUNTIME_SHA256");
+  const minecraftVersion = requiredEnv("FARLANDS_RULE_RUNTIME_MINECRAFT_VERSION");
+  const cacheKey = `${uri}\u0000${expectedDigest}\u0000${minecraftVersion}`;
+  if (cachedRuntime?.cacheKey === cacheKey) {
+    return { ...cachedRuntime.value, bytes: new Uint8Array(cachedRuntime.value.bytes) };
   }
 
-  const token = requiredEnv("BLOB_READ_WRITE_TOKEN");
-
-  const runtimeJarPathname =
-    process.env.RUNTIME_JAR_BLOB_PATHNAME ?? DEFAULT_RUNTIME_JAR_BLOB_PATHNAME;
-
-  let url = runtimeJarPathname;
-
-  if (!url.startsWith("http://") && !url.startsWith("https://")) {
-    const response = await list({
-      token,
-      prefix: runtimeJarPathname,
-    });
-
-    const foundBlob = response.blobs.find((b) => b.pathname === runtimeJarPathname);
-
-    if (!foundBlob) {
-      throw new Error(`Runtime jar blob not found for pathname: ${runtimeJarPathname}`);
-    }
-
-    url = foundBlob.url;
+  const bytes = await readArtifactBytes(uri);
+  if (bytes.byteLength === 0) throw new Error(`Rule runtime was empty at ${uri}`);
+  const digest = sha256Digest(bytes);
+  if (digest !== expectedDigest) {
+    throw new Error(`Rule runtime digest mismatch: expected ${expectedDigest}, received ${digest}`);
+  }
+  if (!/^\d+\.\d+(?:\.\d+)?$/.test(minecraftVersion)) {
+    throw new Error("FARLANDS_RULE_RUNTIME_MINECRAFT_VERSION must be a pinned numeric version");
   }
 
-  const result = await get(url, {
-    access: "private",
-    token,
-    useCache: false,
-  });
-
-  if (!result?.stream) {
-    throw new Error(`Runtime jar blob not found at URL: ${url}`);
-  }
-
-  const bytes = await new Response(result.stream).arrayBuffer();
-
-  if (bytes.byteLength === 0) {
-    throw new Error(`Runtime jar blob was empty at URL: ${url}`);
-  }
-
-  cachedRuntimeJar = Buffer.from(bytes);
-  return Buffer.from(cachedRuntimeJar);
+  const value = { bytes: new Uint8Array(bytes), digest, minecraftVersion };
+  cachedRuntime = { cacheKey, value };
+  return { ...value, bytes: new Uint8Array(value.bytes) };
 }

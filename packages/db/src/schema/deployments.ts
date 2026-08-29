@@ -36,6 +36,9 @@ export const deployments = pgTable(
     fromVersion: text("from_version"),
     toVersion: text("to_version").notNull(),
     approvedContentDigest: text("approved_content_digest").notNull(),
+    artifactUrl: text("artifact_url"),
+    artifactDigest: text("artifact_digest"),
+    artifactRuntimeVersion: text("artifact_runtime_version"),
     initiatedBy: text("initiated_by").notNull(),
     namespace: text("namespace"),
     liveDeployment: text("live_deployment"),
@@ -55,6 +58,10 @@ export const deployments = pgTable(
       sql`${table.queueStatus} IN ('waiting', 'running', 'complete')`,
     ),
     check("deployments_approved_digest_sha256_check", sha256Check(table.approvedContentDigest)),
+    check(
+      "deployments_artifact_digest_sha256_check",
+      sql`${table.artifactDigest} IS NULL OR ${sha256Check(table.artifactDigest)}`,
+    ),
     index("deployments_server_started_idx").on(table.serverId, table.startedAt),
     index("deployments_user_started_idx").on(table.userId, table.startedAt),
     index("deployments_queue_claim_idx").on(

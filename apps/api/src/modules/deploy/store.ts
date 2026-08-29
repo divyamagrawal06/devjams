@@ -12,6 +12,9 @@ export type DeploymentRecord = DeploymentView & {
   liveDeployment: string | null;
   liveService: string | null;
   approvedContentDigest: string;
+  artifactUrl: string | null;
+  artifactDigest: string | null;
+  artifactRuntimeVersion: string | null;
   initiatedBy: string;
   queueStatus: QueueStatus;
   queueSequence: number;
@@ -27,6 +30,9 @@ export type DeploymentPatch = Partial<
     | "namespace"
     | "liveDeployment"
     | "liveService"
+    | "artifactUrl"
+    | "artifactDigest"
+    | "artifactRuntimeVersion"
     | "error"
     | "finishedAt"
     | "workerId"
@@ -85,6 +91,9 @@ function toRecord(row: DeploymentRow): DeploymentRecord {
     liveDeployment: row.liveDeployment,
     liveService: row.liveService,
     approvedContentDigest: row.approvedContentDigest,
+    artifactUrl: row.artifactUrl,
+    artifactDigest: row.artifactDigest,
+    artifactRuntimeVersion: row.artifactRuntimeVersion,
     initiatedBy: row.initiatedBy,
     queueStatus: row.queueStatus as QueueStatus,
     queueSequence: row.queueSequence,
@@ -107,6 +116,9 @@ function insertValues(record: Omit<DeploymentRecord, "queueSequence">) {
     fromVersion: record.fromVersion,
     toVersion: record.toVersion ?? "",
     approvedContentDigest: record.approvedContentDigest,
+    artifactUrl: record.artifactUrl,
+    artifactDigest: record.artifactDigest,
+    artifactRuntimeVersion: record.artifactRuntimeVersion,
     initiatedBy: record.initiatedBy,
     namespace: record.namespace,
     liveDeployment: record.liveDeployment,
@@ -124,6 +136,11 @@ function updateValues(patch: DeploymentPatch) {
     ...(patch.namespace !== undefined ? { namespace: patch.namespace } : {}),
     ...(patch.liveDeployment !== undefined ? { liveDeployment: patch.liveDeployment } : {}),
     ...(patch.liveService !== undefined ? { liveService: patch.liveService } : {}),
+    ...(patch.artifactUrl !== undefined ? { artifactUrl: patch.artifactUrl } : {}),
+    ...(patch.artifactDigest !== undefined ? { artifactDigest: patch.artifactDigest } : {}),
+    ...(patch.artifactRuntimeVersion !== undefined
+      ? { artifactRuntimeVersion: patch.artifactRuntimeVersion }
+      : {}),
     ...(patch.error !== undefined ? { error: patch.error } : {}),
     ...(patch.finishedAt !== undefined
       ? { finishedAt: patch.finishedAt ? new Date(patch.finishedAt) : null }

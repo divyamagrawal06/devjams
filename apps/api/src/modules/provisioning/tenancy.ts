@@ -291,19 +291,27 @@ http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 `;
 
   const receiver = `#!/usr/bin/env python3
-import os, socket, subprocess, sys
+import os, sys, tarfile, urllib.parse, urllib.request
 PORT = int(os.environ.get("WORLD_SYNC_PORT", "8080"))
 ROOT = os.environ.get("WORLD_ROOT", "/data/world")
+SOURCE = os.environ["SOURCE_SYNC_URL"]
+PHASE = os.environ.get("WORLD_SYNC_PHASE", "presync")
+
+parsed = urllib.parse.urlparse(SOURCE)
+if parsed.scheme != "http" or parsed.port != PORT or parsed.path != "/stream":
+    raise ValueError("SOURCE_SYNC_URL must name the tenant world-sync service")
+if not parsed.hostname or not parsed.hostname.endswith(".svc.cluster.local"):
+    raise ValueError("SOURCE_SYNC_URL must stay inside cluster DNS")
+query = "?delta=1" if PHASE == "delta" else ""
+request = urllib.request.Request(SOURCE + query, data=b"", method="POST")
 os.makedirs(ROOT, exist_ok=True)
-srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(("0.0.0.0", PORT)); srv.listen(1)
-print("receiver listening on %s" % PORT, flush=True)
-conn, _ = srv.accept()
-os.makedirs(ROOT, exist_ok=True)
-proc = subprocess.Popen(["tar", "-C", ROOT, "-xf", "-"], stdin=conn)
-proc.wait()
-conn.close(); srv.close()
-sys.exit(proc.returncode)
+with urllib.request.urlopen(request, timeout=900) as response:
+    if response.status == 204:
+        sys.exit(0)
+    if response.headers.get_content_type() != "application/x-tar":
+        raise RuntimeError("world-sync sender returned an unexpected content type")
+    with tarfile.open(fileobj=response, mode="r|") as archive:
+        archive.extractall(path=ROOT, filter="data")
 `;
 
   const body: k8s.V1ConfigMap = {

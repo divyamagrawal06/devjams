@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { DeploymentState, DeploymentView } from "@farlands/contracts";
 import { digestsEqual, PRE_CUTOVER_STATES } from "@farlands/contracts";
-import { buildRuleJar, readStaticRule } from "@farlands/plugin-builder";
 import { deleteCandidate, provisionCandidate } from "../provisioning/candidate";
 import { releaseDeploymentHeadroom, reserveDeploymentHeadroom } from "../quota/headroom";
+import { RulesService } from "../rules/service";
 import { issueTransfer, waitForAck } from "../velocity/transfers";
 import { AuthClient } from "./invariant";
 import { deploymentQueue } from "./queue";
@@ -28,6 +28,9 @@ function view(row: DeploymentRecord): DeploymentView {
     liveDeployment: _d,
     liveService: _s,
     approvedContentDigest: _c,
+    artifactUrl: _au,
+    artifactDigest: _ad,
+    artifactRuntimeVersion: _ar,
     initiatedBy: _i,
     queueStatus: _q,
     queueSequence: _qs,
@@ -90,6 +93,9 @@ export async function enqueueDeploy(input: {
     liveDeployment: null,
     liveService: null,
     approvedContentDigest: input.approvedContentDigest,
+    artifactUrl: null,
+    artifactDigest: null,
+    artifactRuntimeVersion: null,
     initiatedBy: input.initiatedBy,
     queueStatus: "waiting",
     workerId: null,
@@ -113,8 +119,23 @@ async function runMachine(id: string): Promise<void> {
   if (row?.queueStatus !== "running") return;
 
   await transition(id, "building");
-  const built = await buildRuleJar(readStaticRule());
-  assertApprovedArtifactDigest(row.approvedContentDigest, built.contentDigest);
+  const artifact = await RulesService.resolveDeploymentArtifact({
+    serverId: row.serverId,
+    userId: row.userId,
+    ruleSetVersion: row.toVersion ?? "",
+  });
+  assertApprovedArtifactDigest(row.approvedContentDigest, artifact.artifactDigest);
+  await RulesService.verifyDeploymentArtifact(artifact);
+  await transition(
+    id,
+    "building",
+    {
+      artifactUrl: artifact.artifactUrl,
+      artifactDigest: artifact.artifactDigest,
+      artifactRuntimeVersion: artifact.runtimeMinecraftVersion,
+    },
+    `verified immutable artifact ${artifact.artifactDigest}`,
+  );
 
   await transition(id, "staging");
   let candidate;
@@ -123,7 +144,9 @@ async function runMachine(id: string): Promise<void> {
     candidate = await provisionCandidate({
       liveServerId: row.serverId,
       deploymentId: id,
-      jarUrl: built.jarUrl,
+      artifactUrl: artifact.artifactUrl,
+      artifactDigest: artifact.artifactDigest,
+      artifactRuntimeVersion: artifact.runtimeMinecraftVersion,
     });
     await transition(id, "staging", {
       candidatePod: candidate.deploymentName,

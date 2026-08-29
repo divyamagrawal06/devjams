@@ -57,6 +57,13 @@
       "when": 1788038000000,
       "tag": "0007_durable_deployment_state",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1788040000000,
+      "tag": "0008_rule_artifact_provenance",
+      "breakpoints": true
     }
   ]
 }

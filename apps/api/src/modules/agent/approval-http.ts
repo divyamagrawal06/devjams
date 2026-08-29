@@ -1,6 +1,8 @@
+import { digestsEqual } from "@farlands/contracts";
 import { Elysia, t } from "elysia";
 import { machineTokenService } from "../auth/machine-tokens";
 import { AuthService } from "../auth/service";
+import { RulesService } from "../rules/service";
 import { ServerService } from "../servers/service";
 import { deployRulesApprovalClaim, operationApprovalService } from "./approvals";
 
@@ -46,6 +48,25 @@ export const operationApprovalModule = new Elysia({ name: "operation-approval-mi
       if (authorization === "invalid_principal") {
         set.status = 400;
         return { error: "Approval recipient is not an active credential owned by this account" };
+      }
+
+      let artifact;
+      try {
+        artifact = await RulesService.resolveDeploymentArtifact({
+          serverId: body.server_id,
+          userId,
+          ruleSetVersion: String(body.rule_set_version),
+        });
+        if (!digestsEqual(artifact.artifactDigest, body.content_digest)) {
+          set.status = 409;
+          return { error: "Reviewed digest does not match the immutable deployment artifact" };
+        }
+        await RulesService.verifyDeploymentArtifact(artifact);
+      } catch (error) {
+        set.status = 409;
+        return {
+          error: error instanceof Error ? error.message : "Reviewed artifact is unavailable",
+        };
       }
 
       const claim = deployRulesApprovalClaim(

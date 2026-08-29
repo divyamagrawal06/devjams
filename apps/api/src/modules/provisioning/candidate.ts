@@ -38,7 +38,9 @@ export type CandidateResources = {
 export async function provisionCandidate(input: {
   liveServerId: string;
   deploymentId: string;
-  jarUrl: string;
+  artifactUrl: string;
+  artifactDigest: string;
+  artifactRuntimeVersion: string;
 }): Promise<CandidateResources> {
   const [server] = await db
     .select()
@@ -59,6 +61,13 @@ export async function provisionCandidate(input: {
     .limit(1);
   if (!config) throw new Error(`Server ${input.liveServerId} has no config`);
 
+  assertCandidateArtifactCompatibility({
+    artifactUrl: input.artifactUrl,
+    artifactDigest: input.artifactDigest,
+    artifactRuntimeVersion: input.artifactRuntimeVersion,
+    serverRuntimeVersion: config.version,
+  });
+
   const namespace = await ensureTenantNamespace(server.userId);
   const names = candidateNames(input.liveServerId, input.deploymentId);
   const clients = makeKubernetesClients();
@@ -71,12 +80,15 @@ export async function provisionCandidate(input: {
     "farlands.dev/live-server-id": input.liveServerId,
     "farlands.dev/deployment-id": input.deploymentId,
     "farlands.dev/role": "candidate",
+    "farlands.dev/artifact": input.artifactDigest.slice("sha256:".length, 19),
   };
+  const annotations = { "farlands.dev/rule-artifact-digest": input.artifactDigest };
+  const artifactLoader = buildArtifactLoader(input);
 
   await clients.core.createNamespacedPersistentVolumeClaim({
     namespace,
     body: {
-      metadata: { name: names.pvc, namespace, labels },
+      metadata: { name: names.pvc, namespace, labels, annotations },
       spec: {
         accessModes: ["ReadWriteOnce"],
         storageClassName: config.storageClass,
@@ -88,7 +100,7 @@ export async function provisionCandidate(input: {
   await clients.core.createNamespacedConfigMap({
     namespace,
     body: {
-      metadata: { name: names.configMap, namespace, labels },
+      metadata: { name: names.configMap, namespace, labels, annotations },
       data: {
         EULA: "true",
         ENABLE_RCON: "true",
@@ -105,13 +117,17 @@ export async function provisionCandidate(input: {
   await clients.apps.createNamespacedDeployment({
     namespace,
     body: {
-      metadata: { name: names.deployment, namespace, labels },
+      metadata: { name: names.deployment, namespace, labels, annotations },
       spec: {
         replicas: 1,
         selector: { matchLabels: { "farlands.dev/deployment-id": input.deploymentId } },
         template: {
-          metadata: { labels },
+          metadata: { labels, annotations },
           spec: {
+            automountServiceAccountToken: false,
+            serviceAccountName:
+              process.env.FARLANDS_ARTIFACT_SERVICE_ACCOUNT ?? "farlands-artifact-reader",
+            securityContext: { fsGroup: 1000, seccompProfile: { type: "RuntimeDefault" } },
             tolerations: [
               {
                 key: "farlands.sh/nodepool",
@@ -121,17 +137,20 @@ export async function provisionCandidate(input: {
               },
             ],
             initContainers: [
+              artifactLoader,
               {
                 name: "world-receiver",
                 image: "python:3.12-alpine",
-                command: [
-                  "sh",
-                  "-c",
-                  "apk add --no-cache tar >/dev/null && python3 /sync/receiver.py",
-                ],
+                command: ["sh", "-c", "python3 /sync/receiver.py --once"],
                 env: [
                   { name: "WORLD_SYNC_PORT", value: String(WORLD_SYNC_PORT) },
                   { name: "WORLD_ROOT", value: "/data/world" },
+                  {
+                    name: "SOURCE_SYNC_URL",
+                    value: `http://${k8sRow.serviceName}.${namespace}.svc.cluster.local:${WORLD_SYNC_PORT}/stream`,
+                  },
+                  { name: "WORLD_SYNC_TRANSFER_ID", value: input.deploymentId },
+                  { name: "WORLD_SYNC_PHASE", value: "presync" },
                 ],
                 volumeMounts: [
                   { name: "server-data", mountPath: "/data" },
@@ -172,6 +191,7 @@ export async function provisionCandidate(input: {
                 name: "rcon",
                 secret: { secretName: "rcon-password" },
               },
+              { name: "tmp", emptyDir: {} },
             ],
           },
         },
@@ -182,7 +202,7 @@ export async function provisionCandidate(input: {
   await clients.core.createNamespacedService({
     namespace,
     body: {
-      metadata: { name: names.service, namespace, labels },
+      metadata: { name: names.service, namespace, labels, annotations },
       spec: {
         type: "ClusterIP",
         selector: { "farlands.dev/deployment-id": input.deploymentId },
@@ -205,6 +225,78 @@ export async function provisionCandidate(input: {
     pvcName: names.pvc,
     liveDeploymentName: k8sRow.deploymentName,
     liveServiceName: k8sRow.serviceName,
+  };
+}
+
+type CandidateArtifactInput = {
+  artifactUrl: string;
+  artifactDigest: string;
+  artifactRuntimeVersion: string;
+};
+
+export function assertCandidateArtifactCompatibility(
+  input: CandidateArtifactInput & {
+    serverRuntimeVersion: string | null;
+  },
+): void {
+  if (!input.artifactUrl.startsWith("s3://")) {
+    throw new Error("Candidate rule artifacts must use immutable s3:// storage");
+  }
+  if (!/^sha256:[0-9a-f]{64}$/.test(input.artifactDigest)) {
+    throw new Error("Candidate rule artifact digest is invalid");
+  }
+  if (!input.serverRuntimeVersion || input.serverRuntimeVersion === "latest") {
+    throw new Error("Candidate Minecraft runtime must be pinned before rules can deploy");
+  }
+  if (input.artifactRuntimeVersion !== input.serverRuntimeVersion) {
+    throw new Error(
+      `Rule runtime ${input.artifactRuntimeVersion} is incompatible with server runtime ${input.serverRuntimeVersion}`,
+    );
+  }
+}
+
+export function buildArtifactLoader(input: CandidateArtifactInput) {
+  const image = process.env.FARLANDS_ARTIFACT_FETCH_IMAGE?.trim();
+  if (!image) {
+    throw new Error("FARLANDS_ARTIFACT_FETCH_IMAGE must pin the reviewed artifact loader image");
+  }
+  if (!/@sha256:[0-9a-f]{64}$/.test(image)) {
+    throw new Error("FARLANDS_ARTIFACT_FETCH_IMAGE must use an immutable sha256 image digest");
+  }
+  return {
+    name: "rule-artifact",
+    image,
+    imagePullPolicy: "IfNotPresent" as const,
+    command: [
+      "/bin/sh",
+      "-ceu",
+      [
+        "mkdir -p /data/plugins",
+        'aws s3 cp "$ARTIFACT_URI" /data/plugins/farlands-rules.jar.partial --only-show-errors',
+        'printf "%s  %s\\n" "$ARTIFACT_SHA256" "/data/plugins/farlands-rules.jar.partial" | sha256sum -c -',
+        "mv /data/plugins/farlands-rules.jar.partial /data/plugins/farlands-rules.jar",
+      ].join("\n"),
+    ],
+    env: [
+      { name: "HOME", value: "/tmp" },
+      { name: "ARTIFACT_URI", value: input.artifactUrl },
+      {
+        name: "ARTIFACT_SHA256",
+        value: input.artifactDigest.slice("sha256:".length),
+      },
+    ],
+    securityContext: {
+      allowPrivilegeEscalation: false,
+      capabilities: { drop: ["ALL"] },
+      readOnlyRootFilesystem: true,
+      runAsNonRoot: true,
+      runAsUser: 1000,
+      runAsGroup: 1000,
+    },
+    volumeMounts: [
+      { name: "server-data", mountPath: "/data" },
+      { name: "tmp", mountPath: "/tmp" },
+    ],
   };
 }
 

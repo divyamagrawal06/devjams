@@ -1,0 +1,19 @@
+{
+  "name": "farlands-live",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:api": "bun run --cwd apps/api dev",
+    "test:api": "bun run --cwd apps/api test",
+    "db:migrate": "bunx drizzle-kit migrate --config packages/db/drizzle.config.ts",
+    "typecheck": "bunx tsc --noEmit -p apps/api/tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "drizzle-kit": "^0.31.10",
+    "typescript": "^5.9.3"
+  }
+}

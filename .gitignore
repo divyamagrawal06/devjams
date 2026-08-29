@@ -1,0 +1,69 @@
+# Secrets — never commit real credentials or certs
+.env
+.env.*
+!.env.example
+!**/.env.example
+*.pem
+*.key
+*.p12
+*.jks
+root.crt
+**/root.crt
+credentials.json
+kubeconfig
+*.kubeconfig
+
+# Dependencies
+node_modules/
+
+# Bun install artifacts. bun.lock is committed.
+*.bun
+
+# Java / Gradle / Maven
+.gradle/
+**/build/
+target/
+out/
+*.class
+*.jar
+!**/gradle/wrapper/gradle-wrapper.jar
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OpenTofu / Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+!*.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Archives and local scratch
+*.zip
+*.tar.gz
+*.tgz
+*.log
+*.tsbuildinfo
+/local/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build outputs
+dist/
+.next/
+coverage/

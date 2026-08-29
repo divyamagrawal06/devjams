@@ -11,7 +11,6 @@ import {
   abortDeployment,
   enqueueDeploy,
   getDeployment,
-  reconcileInFlight,
   rollbackServer,
 } from "./controller";
 
@@ -33,9 +32,6 @@ const ruleOperationBody = t.Object(
 );
 
 export const deployModule = new Elysia({ name: "authenticated-deployments" })
-  .onStart(async () => {
-    await reconcileInFlight();
-  })
   .derive(async ({ headers }) => ({
     identity: await AuthService.requireAgentIdentityFromHeaders(headers),
   }))

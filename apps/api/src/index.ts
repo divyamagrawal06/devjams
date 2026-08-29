@@ -1,6 +1,7 @@
 import "./load-env";
 import type { Elysia } from "elysia";
 import { app } from "./app";
+import { reconcileInFlight } from "./modules/deploy/controller";
 import { type RollupStore, telemetryPlugin } from "./modules/telemetry/index.ts";
 
 export { app };
@@ -14,6 +15,8 @@ export { app };
 export function registerTelemetry<T extends Elysia>(instance: T, store: RollupStore) {
   return instance.use(telemetryPlugin({ store }));
 }
+
+await reconcileInFlight();
 
 app.listen(process.env.PORT || 3001);
 

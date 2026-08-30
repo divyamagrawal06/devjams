@@ -1,4 +1,5 @@
 import { Elysia } from "elysia";
+import { internalAuthRefusal, verifyInternalServiceRequest } from "../auth/internal-service";
 import { AuthService } from "../auth/service";
 import { ServersModel } from "./model";
 import { ServerService } from "./service";
@@ -22,16 +23,11 @@ export const serversModule = new Elysia({ prefix: "/api/servers" })
   // Internal route must come BEFORE .derive() so it doesn't require
   // user session auth — it uses its own x-internal-key mechanism instead.
   .get("/internal", async ({ headers, query, set }) => {
-    const internalKey = process.env.INTERNAL_API_KEY;
-
-    if (!internalKey) {
-      set.status = 503;
-      return { success: false, error: "Internal API not configured" };
-    }
-
-    if (headers["x-internal-key"] !== internalKey) {
-      set.status = 401;
-      return { success: false, error: "Unauthorized" };
+    const authResult = verifyInternalServiceRequest(headers);
+    if (authResult !== "authorized") {
+      const refusal = internalAuthRefusal(authResult);
+      set.status = refusal.status;
+      return { success: false, ...refusal.body };
     }
 
     if (query.game && !VALID_GAMES.includes(query.game)) {
@@ -54,7 +50,7 @@ export const serversModule = new Elysia({ prefix: "/api/servers" })
 
   // All routes below this derive require a valid user session.
   .derive(async ({ headers }) => ({
-    userId: await AuthService.requireUserId(headers.cookie ?? ""),
+    userId: await AuthService.requireUserIdFromHeaders(headers),
   }))
   .get("/", async ({ userId }) => {
     const servers = await ServerService.getAllByUser(userId);

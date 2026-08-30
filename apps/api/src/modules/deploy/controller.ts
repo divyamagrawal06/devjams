@@ -1,11 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { DeploymentState, DeploymentView } from "@farlands/contracts";
-import { PRE_CUTOVER_STATES } from "@farlands/contracts";
+import { digestsEqual, PRE_CUTOVER_STATES } from "@farlands/contracts";
 import { buildRuleJar, readStaticRule } from "@farlands/plugin-builder";
 import { deleteCandidate, provisionCandidate } from "../provisioning/candidate";
 import { releaseDeploymentHeadroom, reserveDeploymentHeadroom } from "../quota/headroom";
 import { issueTransfer, waitForAck } from "../velocity/transfers";
-import { redeemApprovalToken } from "./approvals-stub";
 import { AuthClient } from "./invariant";
 import { admitNext, complete, enqueue, queuePosition } from "./queue";
 
@@ -14,6 +13,8 @@ export type DeploymentRecord = DeploymentView & {
   namespace: string | null;
   liveDeployment: string | null;
   liveService: string | null;
+  approvedContentDigest: string;
+  initiatedBy: string;
 };
 
 const store = new Map<string, DeploymentRecord>();
@@ -21,8 +22,37 @@ const liveByServer = new Map<string, string>();
 
 const nowIso = () => new Date().toISOString();
 
+type RollbackTargetLookup = (serverId: string) => string | undefined;
+
+export function rollbackTargetError(
+  serverId: string,
+  targetVersion: string,
+  lookup: RollbackTargetLookup = (id) => liveByServer.get(id),
+): string | null {
+  const recordedTarget = lookup(serverId);
+  if (!recordedTarget) return "No rollback target recorded for this server";
+  if (recordedTarget !== targetVersion) {
+    return "Rollback target does not match the recorded previous version";
+  }
+  return null;
+}
+
+export function assertApprovedArtifactDigest(approvedDigest: string, builtDigest: string): void {
+  if (!digestsEqual(approvedDigest, builtDigest)) {
+    throw new Error("Built rule artifact digest does not match the human-approved content digest");
+  }
+}
+
 function view(row: DeploymentRecord): DeploymentView {
-  const { userId: _u, namespace: _n, liveDeployment: _d, liveService: _s, ...rest } = row;
+  const {
+    userId: _u,
+    namespace: _n,
+    liveDeployment: _d,
+    liveService: _s,
+    approvedContentDigest: _c,
+    initiatedBy: _i,
+    ...rest
+  } = row;
   return rest;
 }
 
@@ -57,9 +87,9 @@ export function getDeployment(id: string): DeploymentView | null {
 export async function enqueueDeploy(input: {
   serverId: string;
   ruleSetVersion: string;
-  approvalToken: string;
+  approvedContentDigest: string;
   initiatedBy: string;
-  userId?: string;
+  userId: string;
 }): Promise<DeploymentView> {
   const id = randomUUID();
   const row: DeploymentRecord = {
@@ -74,40 +104,37 @@ export async function enqueueDeploy(input: {
     error: null,
     startedAt: nowIso(),
     finishedAt: null,
-    userId: input.userId ?? "unknown",
+    userId: input.userId,
     namespace: null,
     liveDeployment: null,
     liveService: null,
+    approvedContentDigest: input.approvedContentDigest,
+    initiatedBy: input.initiatedBy,
   };
   store.set(id, row);
   enqueue(id);
   const admitted = admitNext();
   if (admitted === id) {
-    void runMachine(id, input.approvalToken).catch((error) => {
-      console.error(`[deploy ${id}] machine failed`, error);
-    });
+    startMachine(id);
   }
   return getDeployment(id)!;
 }
 
-async function runMachine(id: string, approvalToken: string): Promise<void> {
+function startMachine(id: string): void {
+  void runMachine(id).catch(async (error) => {
+    console.error(`[deploy ${id}] machine failed`, error);
+    await failAndAbort(id, error);
+  });
+}
+
+async function runMachine(id: string): Promise<void> {
   const row = store.get(id);
   if (!row) return;
 
   // building — no cluster objects yet. AuthClient forbids touching A.
   await transition(id, "building");
-  redeemApprovalToken({
-    token: approvalToken,
-    serverId: row.serverId,
-    expectedDigest: null,
-  });
   const built = await buildRuleJar(readStaticRule());
-  redeemApprovalToken({
-    token: approvalToken,
-    serverId: row.serverId,
-    expectedDigest: built.contentDigest,
-    alreadyRedeemed: true,
-  });
+  assertApprovedArtifactDigest(row.approvedContentDigest, built.contentDigest);
 
   await transition(id, "staging");
   let candidate;
@@ -176,22 +203,28 @@ export async function abortDeployment(id: string, error?: string): Promise<Deplo
   if (admitted) {
     const nxt = store.get(admitted);
     if (nxt) {
-      void runMachine(admitted, "dev-approval-token").catch((err) => {
-        console.error(`[deploy ${admitted}] machine failed`, err);
-      });
+      startMachine(admitted);
     }
   }
   return view(next);
 }
 
-export async function rollbackServer(serverId: string): Promise<DeploymentView> {
-  const from = liveByServer.get(serverId);
-  if (!from) throw new Error("No rollback target recorded for this server");
+export async function rollbackServer(input: {
+  serverId: string;
+  targetVersion: string;
+  approvedContentDigest: string;
+  initiatedBy: string;
+  userId: string;
+}): Promise<DeploymentView> {
+  const { serverId } = input;
+  const targetError = rollbackTargetError(serverId, input.targetVersion);
+  if (targetError) throw new Error(targetError);
   return enqueueDeploy({
     serverId,
-    ruleSetVersion: from,
-    approvalToken: "dev-approval-token",
-    initiatedBy: "rollback",
+    ruleSetVersion: input.targetVersion,
+    approvedContentDigest: input.approvedContentDigest,
+    initiatedBy: input.initiatedBy,
+    userId: input.userId,
   });
 }
 

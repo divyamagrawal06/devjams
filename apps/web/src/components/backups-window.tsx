@@ -31,6 +31,7 @@ import {
   formatUtcDateTime,
   weeklyScheduleLabel,
 } from "@/lib/backups";
+import { type OperatorReceiptStatus, operatorReceiptOutcome } from "@/lib/operator-receipts";
 
 const RESTORE_CONFIRMATION = "RESTORE_BACKUP_DISCARDS_NEWER_DATA";
 
@@ -48,6 +49,19 @@ type BackupsWindowProps = {
 type BackupMutationResponse = {
   success: boolean;
   data: Backup;
+};
+
+type StopActionResponse = {
+  success: boolean;
+  data: {
+    success: boolean;
+    action: "stop";
+    status: string;
+    receipt: {
+      receiptId: string;
+      status: OperatorReceiptStatus;
+    };
+  };
 };
 
 function humanizeState(value: string): string {
@@ -163,15 +177,23 @@ export function BackupsWindow({
       const requestKey =
         window.sessionStorage.getItem(storageKey) ?? `recovery-stop:${crypto.randomUUID()}`;
       window.sessionStorage.setItem(storageKey, requestKey);
-      return api(`/api/servers/${encodeURIComponent(changedServerId)}/action`, {
+      return api<StopActionResponse>(`/api/servers/${encodeURIComponent(changedServerId)}/action`, {
         method: "POST",
         body: JSON.stringify({ action: "stop", requestKey }),
       });
     },
-    onSuccess: async (_result, changedServerId) => {
-      window.sessionStorage.removeItem(`indexd:recovery-stop:${changedServerId}`);
+    onSuccess: async (result, changedServerId) => {
+      const receiptStatus = result.data.receipt.status;
+      const outcome = operatorReceiptOutcome(receiptStatus);
+      if (outcome.clearRequestKey) {
+        window.sessionStorage.removeItem(`indexd:recovery-stop:${changedServerId}`);
+      }
       setAnnouncement(
-        "Stop completed with a durable receipt. Restore remains paused until stopped state is freshly observed.",
+        outcome.completed
+          ? "Stop completed with a durable receipt. Restore remains paused until stopped state is freshly observed."
+          : outcome.pending
+            ? "Stop accepted with a durable receipt. Completion has not been observed yet, so restore remains paused and the same request key is retained."
+            : `Stop ${receiptStatus}. Completion was not observed, and the same request key is retained for a safe retry.`,
       );
       await queryClient.invalidateQueries({ queryKey: ["servers"] });
     },
@@ -263,7 +285,12 @@ export function BackupsWindow({
   const serverRunning = selectedServer.currentState === "running";
   const serverStopped = ["ready", "stopped"].includes(selectedServer.currentState);
   const serverCanStop = selectedServer.currentState === "running";
-  const stopWasRequested = stopRealm.isSuccess && stopRealm.variables === selectedServer.id;
+  const stopReceiptStatus = stopRealm.data?.data.receipt.status;
+  const stopReceiptOutcome = stopReceiptStatus ? operatorReceiptOutcome(stopReceiptStatus) : null;
+  const stopWasRequested =
+    stopRealm.isSuccess &&
+    stopRealm.variables === selectedServer.id &&
+    Boolean(stopReceiptOutcome?.pending || stopReceiptOutcome?.completed);
   const createDisabled =
     !recoveryControlsAvailable ||
     !serverRunning ||
@@ -633,11 +660,14 @@ export function BackupsWindow({
                             <Power aria-hidden="true" size={15} />
                             {stopRealm.isPending
                               ? "Requesting stop…"
-                              : stopWasRequested || selectedServer.currentState === "stopping"
-                                ? "Stop requested"
-                                : serverCanStop
-                                  ? `Stop ${selectedServer.name}`
-                                  : `Wait for ${humanizeState(selectedServer.currentState)}`}
+                              : stopReceiptOutcome?.pending ||
+                                  selectedServer.currentState === "stopping"
+                                ? "Stop accepted"
+                                : stopReceiptOutcome?.completed
+                                  ? "Stop completed; refreshing"
+                                  : serverCanStop
+                                    ? `Stop ${selectedServer.name}`
+                                    : `Wait for ${humanizeState(selectedServer.currentState)}`}
                           </button>
                         </div>
                       ) : (

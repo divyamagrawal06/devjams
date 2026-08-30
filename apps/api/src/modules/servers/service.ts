@@ -215,6 +215,19 @@ type GameType = (typeof VALID_GAMES)[number];
 type StateType = (typeof VALID_STATES)[number];
 type DesiredStateType = (typeof VALID_DESIRED_STATES)[number];
 
+export type OperatorReceiptDisposition = "create" | "reuse" | "retry" | "conflict";
+
+export function operatorReceiptDisposition(
+  existing: { serverId: string; action: string; status: string } | null,
+  serverId: string,
+  action: ServerActionInput["action"],
+): OperatorReceiptDisposition {
+  if (!existing) return "create";
+  if (existing.serverId !== serverId || existing.action !== action) return "conflict";
+  if (existing.status === "failed" || existing.status === "refused") return "retry";
+  return "reuse";
+}
+
 export abstract class ServerService {
   private static readonly selection = {
     id: gameServers.id,
@@ -630,7 +643,7 @@ export abstract class ServerService {
     const { action, requestKey = `legacy:${crypto.randomUUID()}` } = serverActionDto.parse(data);
     await this.requireOwnership(userId, serverId);
     const id = `orc_${crypto.randomUUID().replaceAll("-", "")}`;
-    const receipt = await db.transaction(async (tx) => {
+    const reservation = await db.transaction(async (tx) => {
       await tx.execute(
         sql`SELECT pg_advisory_xact_lock(hashtext(${`operator:${userId}:${requestKey}`}))`,
       );
@@ -640,24 +653,62 @@ export abstract class ServerService {
         .where(
           and(eq(operatorReceipts.userId, userId), eq(operatorReceipts.requestKey, requestKey)),
         );
-      if (existing) return existing;
+      const disposition = operatorReceiptDisposition(existing ?? null, serverId, action);
+      if (disposition === "conflict") {
+        throw status(409, "That request key is already bound to another operation");
+      }
+      if (existing && disposition === "reuse") {
+        return { receipt: existing, shouldExecute: false, reused: true };
+      }
+      if (existing && disposition === "retry") {
+        const acceptedAt = new Date();
+        const previousAttempt =
+          typeof existing.detail.attempt === "number" ? existing.detail.attempt : 1;
+        const attempt = previousAttempt + 1;
+        const [retried] = await tx
+          .update(operatorReceipts)
+          .set({
+            status: "accepted",
+            observedState: null,
+            detail: { ...existing.detail, attempt, retried_from: existing.status },
+            acceptedAt,
+            completedAt: null,
+            updatedAt: acceptedAt,
+          })
+          .where(eq(operatorReceipts.id, existing.id))
+          .returning();
+        if (!retried) throw status(500, "Could not retry the operation receipt");
+        await tx.insert(controlPlaneEvents).values({
+          serverId,
+          type: "operator_action",
+          data: { receipt_id: existing.id, action, status: "accepted", attempt, retry: true },
+        });
+        return { receipt: retried, shouldExecute: true, reused: true };
+      }
 
       const [created] = await tx
         .insert(operatorReceipts)
-        .values({ id, userId, serverId, requestKey, action, status: "accepted" })
+        .values({
+          id,
+          userId,
+          serverId,
+          requestKey,
+          action,
+          status: "accepted",
+          detail: { attempt: 1 },
+        })
         .returning();
       if (!created) throw status(500, "Could not create an operation receipt");
       await tx.insert(controlPlaneEvents).values({
         serverId,
         type: "operator_action",
-        data: { receipt_id: id, action, status: "accepted" },
+        data: { receipt_id: id, action, status: "accepted", attempt: 1 },
       });
-      return created;
+      return { receipt: created, shouldExecute: true, reused: false };
     });
-    if (receipt.id !== id) {
-      if (receipt.serverId !== serverId || receipt.action !== action) {
-        throw status(409, "That request key is already bound to another operation");
-      }
+    const receipt = reservation.receipt;
+    const attempt = typeof receipt.detail.attempt === "number" ? receipt.detail.attempt : 1;
+    if (!reservation.shouldExecute) {
       return {
         success: receipt.status === "completed",
         action,
@@ -678,16 +729,22 @@ export abstract class ServerService {
             completedAt,
             updatedAt: completedAt,
           })
-          .where(eq(operatorReceipts.id, id))
+          .where(eq(operatorReceipts.id, receipt.id))
           .returning();
         await tx.insert(controlPlaneEvents).values({
           serverId,
           type: "operator_action",
-          data: { receipt_id: id, action, status: "completed", observed_state: result.status },
+          data: {
+            receipt_id: receipt.id,
+            action,
+            status: "completed",
+            observed_state: result.status,
+            attempt,
+          },
         });
         return rows;
       });
-      return { ...result, receipt: this.publicReceipt(completed!, false) };
+      return { ...result, receipt: this.publicReceipt(completed!, reservation.reused) };
     } catch (error) {
       const failedAt = new Date();
       const code =
@@ -699,11 +756,11 @@ export abstract class ServerService {
         await tx
           .update(operatorReceipts)
           .set({ status: receiptStatus, completedAt: failedAt, updatedAt: failedAt })
-          .where(eq(operatorReceipts.id, id));
+          .where(eq(operatorReceipts.id, receipt.id));
         await tx.insert(controlPlaneEvents).values({
           serverId,
           type: "operator_action",
-          data: { receipt_id: id, action, status: receiptStatus },
+          data: { receipt_id: receipt.id, action, status: receiptStatus, attempt },
         });
       });
       throw error;

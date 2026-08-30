@@ -31,6 +31,7 @@ import {
   type QuotaUsage,
   type WorkloadCatalogueResponse,
 } from "@/lib/api";
+import { type OperatorReceiptStatus, operatorReceiptOutcome } from "@/lib/operator-receipts";
 
 type PowerAction = "start" | "stop" | "restart";
 
@@ -86,7 +87,7 @@ export function projectedQuotaIssues(
 }
 
 export function shouldClearPowerRequestKey(receiptStatus: string): boolean {
-  return receiptStatus === "completed";
+  return operatorReceiptOutcome(receiptStatus as OperatorReceiptStatus).clearRequestKey;
 }
 
 function stateTone(state: string) {

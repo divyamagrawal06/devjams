@@ -12,6 +12,11 @@ import { MemoryDeploymentStore } from "../src/modules/deploy/store";
 
 const DIGEST = "sha256:" + "a".repeat(64);
 const OLD_DIGEST = "sha256:" + "c".repeat(64);
+const STORE_NOW = "2026-08-30T12:00:05.000Z";
+
+function deploymentStore(): MemoryDeploymentStore {
+  return new MemoryDeploymentStore(() => new Date(STORE_NOW));
+}
 
 function deployment(
   id: string,
@@ -67,6 +72,7 @@ class TestRuntime implements DeploymentMachineRuntime {
   }> = [];
   waitRouteFailures = 0;
   lobbyMoveFailures = 0;
+  sourceMoveThrows = 0;
 
   constructor(private readonly artifactDigest = DIGEST) {}
 
@@ -132,6 +138,10 @@ class TestRuntime implements DeploymentMachineRuntime {
       toRoute: input.toRoute,
       sourcePlayers: [...input.sourcePlayers],
     });
+    if (input.fromRoute === "srv_alpha" && this.sourceMoveThrows > 0) {
+      this.sourceMoveThrows -= 1;
+      throw new Error("backend restarted while the durable transfer was pending");
+    }
     if (input.fromRoute === "lobby" && this.lobbyMoveFailures > 0) {
       this.lobbyMoveFailures -= 1;
       const failed = input.sourcePlayers.at(-1);
@@ -209,7 +219,7 @@ function expectOrdered(values: string[], expected: string[]): void {
 
 describe("real cutover state machine", () => {
   test("runs A to lobby to verified B, retains A, and records rollback head", async () => {
-    const store = new MemoryDeploymentStore();
+    const store = deploymentStore();
     await store.create(deployment("dep_happy"));
     const runtime = new TestRuntime();
 
@@ -278,7 +288,7 @@ describe("real cutover state machine", () => {
   });
 
   test("resumes safely after a route observation failure without claiming cutover", async () => {
-    const store = new MemoryDeploymentStore();
+    const store = deploymentStore();
     await store.create(deployment("dep_resume"));
     const runtime = new TestRuntime();
     runtime.waitRouteFailures = 1;
@@ -302,7 +312,7 @@ describe("real cutover state machine", () => {
   });
 
   test("resumes draining idempotently after a backend restart", async () => {
-    const store = new MemoryDeploymentStore();
+    const store = deploymentStore();
     await store.create(
       deployment("dep_draining", "draining", {
         namespace: "fl-owner",
@@ -330,7 +340,7 @@ describe("real cutover state machine", () => {
   });
 
   test("retries a partially acknowledged lobby handoff without advancing the rule head", async () => {
-    const store = new MemoryDeploymentStore();
+    const store = deploymentStore();
     await store.create(deployment("dep_partial"));
     const runtime = new TestRuntime();
     runtime.lobbyMoveFailures = 1;
@@ -354,12 +364,22 @@ describe("real cutover state machine", () => {
   });
 
   test("runs an immutable prior artifact through the same safe path as a rollback", async () => {
-    const store = new MemoryDeploymentStore();
-    await store.recordCutover({
+    const store = deploymentStore();
+    await store.create(
+      deployment("dep_seed", "cutover", {
+        fromVersion: null,
+        toVersion: "6",
+        approvedContentDigest: OLD_DIGEST,
+        artifactDigest: OLD_DIGEST,
+        routeSwitched: true,
+      }),
+    );
+    await store.commitCutover({
       serverId: "srv_alpha",
       deploymentId: "dep_seed",
       version: "6",
       digest: OLD_DIGEST,
+      workerId: "worker_test",
     });
     await store.create(deployment("dep_forward"));
     await executeDeploymentMachine("dep_forward", new TestRuntime(), store);
@@ -388,8 +408,39 @@ describe("real cutover state machine", () => {
 });
 
 describe("abort and transfer invariants", () => {
+  test("restart compensation retains and settles a pending source-to-lobby liability", async () => {
+    const store = deploymentStore();
+    await store.create(deployment("dep_pending_lobby"));
+    const runtime = new TestRuntime();
+    runtime.sourceMoveThrows = 1;
+
+    await expect(executeDeploymentMachine("dep_pending_lobby", runtime, store)).rejects.toThrow(
+      /durable transfer was pending/,
+    );
+    expect(await store.find("dep_pending_lobby")).toMatchObject({
+      state: "freezing",
+      sourcePlayers: ["Alice", "Bob"],
+      lobbyPlayers: ["Alice", "Bob"],
+    });
+
+    await abortDeploymentWithRuntime(
+      "dep_pending_lobby",
+      runtime,
+      store,
+      "reconciled after backend restart",
+    );
+    expect(await store.find("dep_pending_lobby")).toMatchObject({
+      state: "aborted",
+      sourcePlayers: [],
+      lobbyPlayers: [],
+    });
+    expect(
+      runtime.transfers.map((transfer) => `${transfer.fromRoute}->${transfer.toRoute}`),
+    ).toEqual(["srv_alpha->lobby", "srv_alpha->lobby", "lobby->srv_alpha"]);
+  });
+
   test("refuses to advance the rule head to anything except the verified deployment artifact", async () => {
-    const store = new MemoryDeploymentStore();
+    const store = deploymentStore();
     await store.create(
       deployment("dep_tamper", "cutover", {
         artifactDigest: DIGEST,
@@ -403,6 +454,7 @@ describe("abort and transfer invariants", () => {
         deploymentId: "dep_tamper",
         version: "7",
         digest: OLD_DIGEST,
+        workerId: "worker_test",
       }),
     ).rejects.toThrow(/verified artifact exactly/);
     expect(await store.findRuleHead("srv_alpha")).toBeNull();
@@ -419,7 +471,7 @@ describe("abort and transfer invariants", () => {
     test("compensates an abort from " + state, async () => {
       const hasCandidate = ["staging", "presync", "freezing", "verifying"].includes(state);
       const playersInLobby = ["freezing", "verifying"].includes(state);
-      const store = new MemoryDeploymentStore();
+      const store = deploymentStore();
       await store.create(
         deployment("dep_abort_" + state, state, {
           namespace: hasCandidate ? "fl-owner" : null,
@@ -468,7 +520,7 @@ describe("abort and transfer invariants", () => {
   }
 
   test("post-cutover abort is a no-op and never deletes B or retires A", async () => {
-    const store = new MemoryDeploymentStore();
+    const store = deploymentStore();
     await store.create(deployment("dep_noop", "cutover", { routeSwitched: true }));
     const runtime = new TestRuntime();
 

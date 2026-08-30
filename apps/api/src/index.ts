@@ -1,7 +1,7 @@
 import "./load-env";
 import type { Elysia } from "elysia";
 import { app } from "./app";
-import { reconcileInFlight } from "./modules/deploy/controller";
+import { reconcileInFlight, startDeploymentLeaseReaper } from "./modules/deploy/controller";
 import { type RollupStore, telemetryPlugin } from "./modules/telemetry/index.ts";
 
 export { app };
@@ -17,6 +17,7 @@ export function registerTelemetry<T extends Elysia>(instance: T, store: RollupSt
 
 export async function start() {
   await reconcileInFlight();
+  startDeploymentLeaseReaper();
 
   app.listen(process.env.PORT || 3001);
 

@@ -2,7 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { restartDisposition } from "../src/modules/deploy/controller";
+import {
+  fenceProvisionedCandidate,
+  reconcileExpiredDeployments,
+  reconcilePendingCandidateCleanup,
+  restartDisposition,
+  withLeaseHeartbeat,
+} from "../src/modules/deploy/controller";
 import { DurableDeploymentQueue } from "../src/modules/deploy/queue";
 import { type DeploymentRecord, MemoryDeploymentStore } from "../src/modules/deploy/store";
 import { MemoryHeadroomStore } from "../src/modules/quota/headroom";
@@ -82,6 +88,160 @@ describe("durable deployment queue and reconciliation", () => {
 
     now = new Date("2026-08-30T12:01:30.001Z");
     expect(await store.listRecoverable()).toHaveLength(2);
+    await expect(restartedWorker.claimNext()).resolves.toBeNull();
+    await expect(firstWorker.renew("dep_first")).resolves.toBe(false);
+  });
+
+  test("fills every configured worker slot in durable FIFO order", async () => {
+    const store = new MemoryDeploymentStore();
+    await store.create(deployment("dep_first"));
+    await store.create(deployment("dep_second"));
+    await store.create(deployment("dep_third"));
+    const queue = new DurableDeploymentQueue(store, {
+      workerId: "worker_pool",
+      maxConcurrent: 2,
+      leaseMs: 60_000,
+    });
+
+    await expect(queue.claimAvailable()).resolves.toEqual(["dep_first", "dep_second"]);
+    await queue.complete("dep_first");
+    await expect(queue.claimAvailable()).resolves.toEqual(["dep_third"]);
+  });
+
+  test("reclaims an abandoned lease before admitting queued work", async () => {
+    let now = new Date("2026-08-30T12:00:00.000Z");
+    const store = new MemoryDeploymentStore(() => now);
+    await store.create(deployment("dep_abandoned"));
+    await store.create(deployment("dep_waiting"));
+    const queue = new DurableDeploymentQueue(store, {
+      workerId: "worker_recovery",
+      maxConcurrent: 1,
+      leaseMs: 1_000,
+    });
+    await expect(queue.claimNext()).resolves.toBe("dep_abandoned");
+    await store.transition("dep_abandoned", "staging");
+
+    now = new Date("2026-08-30T12:00:01.001Z");
+    const aborted: string[] = [];
+    await expect(
+      reconcileExpiredDeployments(queue, store, {
+        abort: async (id) => {
+          expect((await store.find(id))?.workerId).toBe("worker_recovery");
+          await expect(queue.renew(id)).resolves.toBe(true);
+          aborted.push(id);
+          await store.transition(id, "aborted", {
+            queueStatus: "complete",
+            workerId: null,
+            leaseExpiresAt: null,
+          });
+        },
+        releaseHeadroom: async () => undefined,
+      }),
+    ).resolves.toEqual(["dep_abandoned"]);
+    expect(aborted).toEqual(["dep_abandoned"]);
+    await expect(queue.claimAvailable()).resolves.toEqual(["dep_waiting"]);
+  });
+
+  test("fences and cleans provisioning that returns after lease recovery", async () => {
+    const effects: string[] = [];
+    await expect(
+      fenceProvisionedCandidate({
+        renew: async () => false,
+        cleanup: async () => {
+          effects.push("candidate deleted");
+        },
+        recordCleanupRetry: async () => {
+          effects.push("cleanup retry recorded");
+        },
+        releaseHeadroom: async () => {
+          effects.push("headroom released");
+        },
+      }),
+    ).resolves.toBe(false);
+    expect(effects).toEqual(["candidate deleted", "headroom released"]);
+  });
+
+  test("a thrown heartbeat marks ownership lost before the machine starts", async () => {
+    let operationStarted = false;
+    const queue = {
+      heartbeatIntervalMs: 1,
+      renew: async () => {
+        throw new Error("database connection lost");
+      },
+    };
+
+    await expect(
+      withLeaseHeartbeat(
+        "dep_heartbeat",
+        async () => {
+          operationStarted = true;
+          return "must not commit";
+        },
+        queue,
+      ),
+    ).rejects.toThrow(/lost its durable queue lease/);
+    expect(operationStarted).toBe(false);
+  });
+
+  test("persists and retries candidate cleanup after a transient deletion failure", async () => {
+    const effects: string[] = [];
+    await expect(
+      fenceProvisionedCandidate({
+        renew: async () => false,
+        cleanup: async () => {
+          throw new Error("temporary Kubernetes outage");
+        },
+        recordCleanupRetry: async () => {
+          effects.push("cleanup retry recorded");
+        },
+        releaseHeadroom: async () => {
+          effects.push("headroom released");
+        },
+      }),
+    ).resolves.toBe(false);
+    expect(effects).toEqual(["cleanup retry recorded", "headroom released"]);
+
+    const store = new MemoryDeploymentStore();
+    await store.create(
+      deployment("dep_cleanup", {
+        state: "aborted",
+        queueStatus: "complete",
+        candidatePod: "candidate-b",
+        namespace: "fl-owner",
+      }),
+    );
+    let attempts = 0;
+    const cleanup = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("temporary Kubernetes outage");
+    };
+    await expect(
+      reconcilePendingCandidateCleanup(store, cleanup, () => undefined),
+    ).resolves.toEqual([]);
+    expect((await store.find("dep_cleanup"))?.candidatePod).toBe("candidate-b");
+    await expect(
+      reconcilePendingCandidateCleanup(store, cleanup, () => undefined),
+    ).resolves.toEqual(["dep_cleanup"]);
+    expect((await store.find("dep_cleanup"))?.candidatePod).toBeNull();
+    expect((await store.find("dep_cleanup"))?.namespace).toBeNull();
+  });
+
+  test("terminalization never erases a concurrently published cleanup marker", async () => {
+    const store = new MemoryDeploymentStore();
+    await store.create(deployment("dep_race", { state: "staging", queueStatus: "running" }));
+    await store.transition("dep_race", "aborted", {
+      candidatePod: "candidate-late",
+      namespace: "fl-owner",
+      queueStatus: "complete",
+    });
+    await store.transition("dep_race", "aborted", {
+      error: "deployment worker lease expired before cutover",
+      queueStatus: "complete",
+      workerId: null,
+      leaseExpiresAt: null,
+    });
+    expect((await store.find("dep_race"))?.candidatePod).toBe("candidate-late");
+    expect((await store.find("dep_race"))?.namespace).toBe("fl-owner");
   });
 
   test("defines conservative restart actions for every in-flight boundary", () => {
@@ -95,25 +255,46 @@ describe("durable deployment queue and reconciliation", () => {
   });
 
   test("persists transitions and rollback heads independently of one worker", async () => {
-    const store = new MemoryDeploymentStore();
+    const store = new MemoryDeploymentStore(() => new Date("2026-08-30T12:00:00.000Z"));
     await store.create(deployment("dep_change"));
     await store.transition("dep_change", "building", {}, "worker admitted");
-    await store.transition("dep_change", "verifying", { candidatePod: "candidate-b" });
-    await store.recordCutover({
+    await store.transition("dep_change", "cutover", {
+      candidatePod: "candidate-b",
+      artifactDigest: `sha256:${"a".repeat(64)}`,
+      routeSwitched: true,
+      queueStatus: "running",
+      workerId: "worker_one",
+      leaseExpiresAt: "2026-08-30T12:15:00.000Z",
+    });
+    await store.commitCutover({
       serverId: "srv_alpha",
       deploymentId: "dep_change",
       version: "7",
       digest: `sha256:${"a".repeat(64)}`,
+      workerId: "worker_one",
     });
-    await store.recordCutover({
+    await store.create(
+      deployment("dep_next", {
+        state: "cutover",
+        toVersion: "8",
+        approvedContentDigest: `sha256:${"c".repeat(64)}`,
+        artifactDigest: `sha256:${"c".repeat(64)}`,
+        routeSwitched: true,
+        queueStatus: "running",
+        workerId: "worker_two",
+        leaseExpiresAt: "2026-08-30T12:15:00.000Z",
+      }),
+    );
+    await store.commitCutover({
       serverId: "srv_alpha",
       deploymentId: "dep_next",
       version: "8",
       digest: `sha256:${"c".repeat(64)}`,
+      workerId: "worker_two",
     });
 
     const restartedReader = store;
-    expect((await restartedReader.find("dep_change"))?.state).toBe("verifying");
+    expect((await restartedReader.find("dep_change"))?.state).toBe("draining");
     expect((await restartedReader.find("dep_change"))?.candidatePod).toBe("candidate-b");
     expect(await restartedReader.findRuleHead("srv_alpha")).toEqual({
       currentVersion: "8",
@@ -121,7 +302,40 @@ describe("durable deployment queue and reconciliation", () => {
       previousVersion: "7",
       previousDigest: `sha256:${"a".repeat(64)}`,
     });
-    expect(store.events.map((event) => event.state)).toEqual(["queued", "building", "verifying"]);
+    expect(store.events.map((event) => event.state)).toEqual([
+      "queued",
+      "building",
+      "cutover",
+      "draining",
+      "cutover",
+      "draining",
+    ]);
+  });
+
+  test("does not advance either cutover state or rule head after lease expiry", async () => {
+    const store = new MemoryDeploymentStore(() => new Date("2026-08-30T12:00:00.000Z"));
+    await store.create(
+      deployment("dep_expired", {
+        state: "cutover",
+        artifactDigest: `sha256:${"a".repeat(64)}`,
+        routeSwitched: true,
+        queueStatus: "running",
+        workerId: "worker_old",
+        leaseExpiresAt: "2026-08-30T12:00:00.000Z",
+      }),
+    );
+
+    await expect(
+      store.commitCutover({
+        serverId: "srv_alpha",
+        deploymentId: "dep_expired",
+        version: "7",
+        digest: `sha256:${"a".repeat(64)}`,
+        workerId: "worker_old",
+      }),
+    ).rejects.toThrow(/lost its cutover lease/);
+    expect((await store.find("dep_expired"))?.state).toBe("cutover");
+    await expect(store.findRuleHead("srv_alpha")).resolves.toBeNull();
   });
 
   test("makes headroom reservation idempotent and owner-bound", async () => {
@@ -163,6 +377,7 @@ describe("scoped durable Velocity transfers", () => {
       players: ["Alice", "Bob"],
       attempt: 1,
     });
+    expect((await service.listPending())[0]?.attempt).toBe(1);
 
     let wrongRealmTransferCount = 0;
     try {
@@ -213,7 +428,7 @@ describe("scoped durable Velocity transfers", () => {
       expiresInMs: 1_000,
     });
     expect(retriedId).toBe(id);
-    expect((await service.listPending())[0]).toMatchObject({ transferId: id, attempt: 1 });
+    expect((await service.listPending())[0]).toMatchObject({ transferId: id, attempt: 2 });
   });
 
   test("retries a partially failed acknowledgement with the same idempotency key", async () => {
@@ -234,7 +449,7 @@ describe("scoped durable Velocity transfers", () => {
     });
 
     await expect(service.issue(input)).resolves.toBe(id);
-    expect(await store.find(id)).toMatchObject({ status: "pending", ack: null, attempts: 0 });
+    expect(await store.find(id)).toMatchObject({ status: "pending", ack: null, attempts: 2 });
   });
 });
 

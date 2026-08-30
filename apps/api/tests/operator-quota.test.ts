@@ -4,6 +4,7 @@ import { Elysia } from "elysia";
 import { maintenanceBounds, operatorModule, windowsOverlap } from "../src/modules/operator/http";
 import { allocationViolations } from "../src/modules/quota/quota.service";
 import { serversModule } from "../src/modules/servers";
+import { operatorReceiptDisposition } from "../src/modules/servers/service";
 
 describe("aggregate quota and operator safety", () => {
   test("admits aggregate capacity, not one oversized-per-server interpretation", () => {
@@ -36,6 +37,23 @@ describe("aggregate quota and operator safety", () => {
         { startsAt: new Date("2026-08-30T14:00:00Z"), durationMinutes: 15 },
       ),
     ).toBe(false);
+  });
+
+  test("retries terminal receipts without changing their operation identity", () => {
+    const base = { serverId: "server-a", action: "stop", status: "accepted" };
+    expect(operatorReceiptDisposition(null, "server-a", "stop")).toBe("create");
+    expect(operatorReceiptDisposition(base, "server-a", "stop")).toBe("reuse");
+    expect(operatorReceiptDisposition({ ...base, status: "completed" }, "server-a", "stop")).toBe(
+      "reuse",
+    );
+    expect(operatorReceiptDisposition({ ...base, status: "failed" }, "server-a", "stop")).toBe(
+      "retry",
+    );
+    expect(operatorReceiptDisposition({ ...base, status: "refused" }, "server-a", "stop")).toBe(
+      "retry",
+    );
+    expect(operatorReceiptDisposition(base, "server-b", "stop")).toBe("conflict");
+    expect(operatorReceiptDisposition(base, "server-a", "restart")).toBe("conflict");
   });
 
   test("all operator and workload catalogue routes fail closed without a session", async () => {

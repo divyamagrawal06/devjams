@@ -22,6 +22,33 @@ export const WORLD_SYNC_NAMES = "world,world_nether,world_the_end";
 export const RCON_PORT = 25575;
 export const VELOCITY_SECRET_NAME =
   process.env.FARLANDS_VELOCITY_SECRET_NAME ?? "velocity-forwarding-secret";
+const DEFAULT_ARTIFACT_SERVICE_ACCOUNT = "farlands-artifact-reader";
+
+export function artifactServiceAccountName(
+  configured = process.env.FARLANDS_ARTIFACT_SERVICE_ACCOUNT,
+): string {
+  const name = configured?.trim() || DEFAULT_ARTIFACT_SERVICE_ACCOUNT;
+  if (name.length > 63 || !/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(name)) {
+    throw new Error("FARLANDS_ARTIFACT_SERVICE_ACCOUNT must be a DNS-1123 service account name");
+  }
+  return name;
+}
+
+export function buildArtifactServiceAccount(
+  namespace: string,
+  name = artifactServiceAccountName(),
+  roleArn = process.env.FARLANDS_ARTIFACT_ROLE_ARN?.trim(),
+): k8s.V1ServiceAccount {
+  return {
+    metadata: {
+      name,
+      namespace,
+      labels: { "farlands.dev/kind": "rule-artifact-reader" },
+      ...(roleArn ? { annotations: { "eks.amazonaws.com/role-arn": roleArn } } : {}),
+    },
+    automountServiceAccountToken: false,
+  };
+}
 
 export type TenantQuotaMirror = {
   cpuLimit: string;
@@ -225,6 +252,31 @@ async function ensureRconSecret(core: k8s.CoreV1Api, namespace: string): Promise
   });
 }
 
+async function ensureArtifactServiceAccount(core: k8s.CoreV1Api, namespace: string): Promise<void> {
+  const body = buildArtifactServiceAccount(namespace);
+  const name = body.metadata?.name;
+  if (!name) throw new Error("Artifact ServiceAccount name is unavailable");
+  try {
+    const existing = await core.readNamespacedServiceAccount({ name, namespace });
+    const expectedRole = body.metadata?.annotations?.["eks.amazonaws.com/role-arn"];
+    if (
+      expectedRole &&
+      existing.metadata?.annotations?.["eks.amazonaws.com/role-arn"] !== expectedRole
+    ) {
+      throw new Error(`Artifact ServiceAccount ${namespace}/${name} has the wrong IAM role`);
+    }
+    return;
+  } catch (error) {
+    if (!notFound(error)) throw error;
+  }
+
+  try {
+    await core.createNamespacedServiceAccount({ namespace, body });
+  } catch (error) {
+    if (!alreadyExists(error)) throw error;
+  }
+}
+
 async function copyVelocitySecret(core: k8s.CoreV1Api, namespace: string): Promise<void> {
   try {
     await core.readNamespacedSecret({
@@ -257,7 +309,7 @@ async function copyVelocitySecret(core: k8s.CoreV1Api, namespace: string): Promi
 
 export function buildWorldSyncScripts(): { sender: string; receiver: string } {
   const sender = `#!/usr/bin/env python3
-import datetime, http.server, io, json, os, stat, sys, tarfile, urllib.parse
+import http.server, io, json, os, stat, sys, tarfile, time, urllib.parse
 PORT = int(os.environ.get("WORLD_SYNC_PORT", "8080"))
 ROOT = os.path.realpath(os.environ.get("WORLD_ROOT", "/data"))
 
@@ -293,13 +345,13 @@ def source_manifest():
                 paths.append(os.path.relpath(os.path.join(current, name), ROOT))
     return paths
 
-def parse_since(value):
-    if not value:
-        raise ValueError("delta requires since")
-    parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        raise ValueError("since must include a timezone")
-    return parsed.timestamp()
+def parse_since_ns(value):
+    if not value or not value.isascii() or not value.isdigit():
+        raise ValueError("delta requires a source snapshot boundary")
+    parsed = int(value)
+    if parsed < 1:
+        raise ValueError("source snapshot boundary must be positive")
+    return parsed
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -314,19 +366,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(404); self.end_headers(); return
         try:
             query = urllib.parse.parse_qs(parsed.query, strict_parsing=True) if parsed.query else {}
-            if set(query) - {"delta", "since"}:
+            if set(query) - {"delta", "since_ns"}:
                 raise ValueError("unsupported query parameter")
             delta = query.get("delta", []) == ["1"]
             if query.get("delta", []) not in ([], ["1"]):
                 raise ValueError("delta must equal 1")
-            since_timestamp = parse_since(query.get("since", [None])[0]) if delta else None
+            since_ns = parse_since_ns(query.get("since_ns", [None])[0]) if delta else None
         except (ValueError, TypeError) as error:
             self.send_response(400); self.end_headers(); self.wfile.write(str(error).encode()); return
 
+        snapshot_started_ns = time.time_ns()
         entries = source_manifest()
         manifest = json.dumps(entries, separators=(",", ":")).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/x-tar")
+        self.send_header("X-Farlands-Snapshot-Started-Ns", str(snapshot_started_ns))
         self.end_headers()
         with tarfile.open(fileobj=self.wfile, mode="w|") as archive:
             info = tarfile.TarInfo(".farlands-source-manifest.json")
@@ -339,7 +393,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 metadata = os.lstat(full_path)
                 if stat.S_ISLNK(metadata.st_mode):
                     continue
-                if delta and not stat.S_ISDIR(metadata.st_mode) and metadata.st_mtime <= since_timestamp:
+                if delta and not stat.S_ISDIR(metadata.st_mode) and metadata.st_mtime_ns <= since_ns:
                     continue
                 archive.add(full_path, arcname=relative, recursive=False)
 
@@ -353,6 +407,7 @@ ROOT = os.path.realpath(os.environ.get("WORLD_ROOT", "/data"))
 SOURCE = os.environ["SOURCE_SYNC_URL"]
 PHASE = os.environ.get("WORLD_SYNC_PHASE", "presync")
 SINCE = os.environ.get("WORLD_SYNC_SINCE")
+SINCE_FILE = os.environ.get("WORLD_SYNC_SINCE_FILE")
 MARKER = os.environ.get("WORLD_SYNC_MARKER")
 MANIFEST = ".farlands-source-manifest.json"
 
@@ -420,10 +475,16 @@ def prune(expected):
         if world not in expected and os.path.isdir(base) and not os.listdir(base):
             os.rmdir(base)
 
-def mark_complete():
+def source_boundary(response):
+    value = response.headers.get("X-Farlands-Snapshot-Started-Ns", "")
+    if not value.isascii() or not value.isdigit() or int(value) < 1:
+        raise RuntimeError("world-sync sender omitted its source snapshot boundary")
+    return value
+
+def mark_complete(boundary):
     if PHASE == "presync" and MARKER:
         with open(MARKER, "w", encoding="utf-8") as handle:
-            handle.write("complete\\n")
+            handle.write(boundary + "\\n")
 
 if PHASE == "presync" and MARKER and os.path.isfile(MARKER):
     sys.exit(0)
@@ -435,14 +496,18 @@ if not parsed.hostname or not parsed.hostname.endswith(".svc.cluster.local"):
     raise ValueError("SOURCE_SYNC_URL must stay inside cluster DNS")
 if PHASE not in ("presync", "delta"):
     raise ValueError("WORLD_SYNC_PHASE must be presync or delta")
-if PHASE == "delta" and not SINCE:
-    raise ValueError("WORLD_SYNC_SINCE is required for delta sync")
-query = "?" + urllib.parse.urlencode({"delta": "1", "since": SINCE}) if PHASE == "delta" else ""
+if PHASE == "delta" and SINCE_FILE:
+    with open(SINCE_FILE, "r", encoding="utf-8") as handle:
+        SINCE = handle.read().strip()
+if PHASE == "delta" and (not SINCE or not SINCE.isascii() or not SINCE.isdigit()):
+    raise ValueError("delta sync requires a source-host snapshot boundary")
+query = "?" + urllib.parse.urlencode({"delta": "1", "since_ns": SINCE}) if PHASE == "delta" else ""
 request = urllib.request.Request(SOURCE + query, data=b"", method="POST")
 os.makedirs(ROOT, exist_ok=True)
 with urllib.request.urlopen(request, timeout=900) as response:
+    boundary = source_boundary(response)
     if response.status == 204:
-        prune(set()); mark_complete(); sys.exit(0)
+        prune(set()); mark_complete(boundary); sys.exit(0)
     if response.headers.get_content_type() != "application/x-tar":
         raise RuntimeError("world-sync sender returned an unexpected content type")
     with tarfile.open(fileobj=response, mode="r|") as archive:
@@ -459,7 +524,7 @@ if not all(is_managed(relative) for relative in expected):
     raise RuntimeError("world-sync manifest contains an unmanaged path")
 prune(expected)
 os.unlink(manifest_path)
-mark_complete()
+mark_complete(boundary)
 `;
 
   return { sender, receiver };
@@ -499,6 +564,7 @@ export async function ensureTenantNamespace(
   await upsertQuota(clients.core, namespace, quota);
   await ensureLimitRange(clients.core, namespace);
   await ensureDefaultDeny(clients.networking, namespace);
+  await ensureArtifactServiceAccount(clients.core, namespace);
   await ensureRconSecret(clients.core, namespace);
   await copyVelocitySecret(clients.core, namespace);
   await ensureWorldSyncConfigMap(clients.core, namespace);

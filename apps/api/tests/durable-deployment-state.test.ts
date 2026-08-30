@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   fenceProvisionedCandidate,
   reconcileExpiredDeployments,
+  reconcilePendingCandidateCleanup,
   restartDisposition,
 } from "../src/modules/deploy/controller";
 import { DurableDeploymentQueue } from "../src/modules/deploy/queue";
@@ -133,12 +134,58 @@ describe("durable deployment queue and reconciliation", () => {
         cleanup: async () => {
           effects.push("candidate deleted");
         },
+        recordCleanupRetry: async () => {
+          effects.push("cleanup retry recorded");
+        },
         releaseHeadroom: async () => {
           effects.push("headroom released");
         },
       }),
     ).resolves.toBe(false);
     expect(effects).toEqual(["candidate deleted", "headroom released"]);
+  });
+
+  test("persists and retries candidate cleanup after a transient deletion failure", async () => {
+    const effects: string[] = [];
+    await expect(
+      fenceProvisionedCandidate({
+        renew: async () => false,
+        cleanup: async () => {
+          throw new Error("temporary Kubernetes outage");
+        },
+        recordCleanupRetry: async () => {
+          effects.push("cleanup retry recorded");
+        },
+        releaseHeadroom: async () => {
+          effects.push("headroom released");
+        },
+      }),
+    ).resolves.toBe(false);
+    expect(effects).toEqual(["cleanup retry recorded", "headroom released"]);
+
+    const store = new MemoryDeploymentStore();
+    await store.create(
+      deployment("dep_cleanup", {
+        state: "aborted",
+        queueStatus: "complete",
+        candidatePod: "candidate-b",
+        namespace: "fl-owner",
+      }),
+    );
+    let attempts = 0;
+    const cleanup = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("temporary Kubernetes outage");
+    };
+    await expect(
+      reconcilePendingCandidateCleanup(store, cleanup, () => undefined),
+    ).resolves.toEqual([]);
+    expect((await store.find("dep_cleanup"))?.candidatePod).toBe("candidate-b");
+    await expect(
+      reconcilePendingCandidateCleanup(store, cleanup, () => undefined),
+    ).resolves.toEqual(["dep_cleanup"]);
+    expect((await store.find("dep_cleanup"))?.candidatePod).toBeNull();
+    expect((await store.find("dep_cleanup"))?.namespace).toBeNull();
   });
 
   test("defines conservative restart actions for every in-flight boundary", () => {

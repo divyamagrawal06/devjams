@@ -1,6 +1,6 @@
 import type { DeploymentState, DeploymentView } from "@farlands/contracts";
 import { deploymentStateEvents, deployments, serverRuleHeads } from "@repo/db";
-import { and, asc, count, eq, inArray, lt, notInArray, sql } from "drizzle-orm";
+import { and, asc, count, eq, inArray, isNotNull, lt, notInArray, sql } from "drizzle-orm";
 
 import { db } from "../../db";
 
@@ -57,6 +57,7 @@ export interface DeploymentStore {
   renewLease(id: string, workerId: string, leaseMs: number): Promise<boolean>;
   completeQueue(id: string): Promise<void>;
   listRecoverable(): Promise<DeploymentRecord[]>;
+  listPendingCandidateCleanup(): Promise<DeploymentRecord[]>;
   findRuleHead(serverId: string): Promise<RuleHead | null>;
   commitCutover(input: {
     serverId: string;
@@ -311,6 +312,22 @@ export class DrizzleDeploymentStore implements DeploymentStore {
     return rows.map(toRecord);
   }
 
+  async listPendingCandidateCleanup(): Promise<DeploymentRecord[]> {
+    const rows = await db
+      .select()
+      .from(deployments)
+      .where(
+        and(
+          eq(deployments.queueStatus, "complete"),
+          inArray(deployments.state, ["aborted", "failed"]),
+          isNotNull(deployments.candidatePod),
+          isNotNull(deployments.namespace),
+        ),
+      )
+      .orderBy(asc(deployments.queueSequence));
+    return rows.map(toRecord);
+  }
+
   async findRuleHead(serverId: string): Promise<RuleHead | null> {
     const row = await db.query.serverRuleHeads.findFirst({
       where: eq(serverRuleHeads.serverId, serverId),
@@ -485,6 +502,19 @@ export class MemoryDeploymentStore implements DeploymentStore {
         (row) =>
           !(["idle", "aborted", "failed"] as DeploymentState[]).includes(row.state) &&
           row.queueStatus !== "complete",
+      )
+      .sort((a, b) => a.queueSequence - b.queueSequence)
+      .map((row) => ({ ...row }));
+  }
+
+  async listPendingCandidateCleanup(): Promise<DeploymentRecord[]> {
+    return [...this.records.values()]
+      .filter(
+        (row) =>
+          row.queueStatus === "complete" &&
+          (row.state === "aborted" || row.state === "failed") &&
+          row.candidatePod !== null &&
+          row.namespace !== null,
       )
       .sort((a, b) => a.queueSequence - b.queueSequence)
       .map((row) => ({ ...row }));

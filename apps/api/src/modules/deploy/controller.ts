@@ -176,6 +176,24 @@ async function runMachine(id: string): Promise<void> {
           liveServerId: row.serverId,
           deploymentId: id,
         }),
+      recordCleanupRetry: async (error) => {
+        const current = await deploymentStore.find(id);
+        const state = current?.state === "failed" ? "failed" : "aborted";
+        await deploymentStore.transition(
+          id,
+          state,
+          {
+            candidatePod: candidate.deploymentName,
+            namespace: candidate.namespace,
+            error: `candidate cleanup pending: ${errorMessage(error)}`,
+            finishedAt: nowIso(),
+            queueStatus: "complete",
+            workerId: null,
+            leaseExpiresAt: null,
+          },
+          "candidate cleanup persisted for retry after lease loss",
+        );
+      },
       releaseHeadroom: () => releaseDeploymentHeadroom(id),
     });
     if (!leaseRetained) return;
@@ -199,7 +217,7 @@ async function runMachine(id: string): Promise<void> {
 }
 
 async function failAndAbort(id: string, error: unknown): Promise<void> {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = errorMessage(error);
   const row = await deploymentStore.find(id);
   if (!row) return;
   await abortDeployment(id, message);
@@ -213,19 +231,65 @@ type ExpiredRecoveryActions = {
 type ProvisionedCandidateFence = {
   renew(): Promise<boolean>;
   cleanup(): Promise<void>;
+  recordCleanupRetry(error: unknown): Promise<void>;
   releaseHeadroom(): Promise<void>;
 };
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 export async function fenceProvisionedCandidate(
   actions: ProvisionedCandidateFence,
 ): Promise<boolean> {
   if (await actions.renew()) return true;
   try {
-    await actions.cleanup();
+    try {
+      await actions.cleanup();
+    } catch (error) {
+      await actions.recordCleanupRetry(error);
+    }
   } finally {
     await actions.releaseHeadroom();
   }
   return false;
+}
+
+export async function reconcilePendingCandidateCleanup(
+  store: DeploymentStore = deploymentStore,
+  cleanup: (row: DeploymentRecord) => Promise<void> = async (row) => {
+    if (!row.namespace || !row.candidatePod) return;
+    await deleteCandidate({
+      namespace: row.namespace,
+      deploymentName: row.candidatePod,
+      liveServerId: row.serverId,
+      deploymentId: row.id,
+    });
+  },
+  reportError: (row: DeploymentRecord, error: unknown) => void = (row, error) => {
+    console.error(`[deploy ${row.id}] candidate cleanup retry failed`, error);
+  },
+): Promise<string[]> {
+  const cleaned: string[] = [];
+  for (const row of await store.listPendingCandidateCleanup()) {
+    try {
+      await cleanup(row);
+      await store.transition(
+        row.id,
+        row.state,
+        {
+          candidatePod: null,
+          namespace: null,
+          error: "candidate resources cleaned after lease loss",
+        },
+        "completed durable candidate cleanup retry",
+      );
+      cleaned.push(row.id);
+    } catch (error) {
+      reportError(row, error);
+    }
+  }
+  return cleaned;
 }
 
 export async function reconcileExpiredDeployments(
@@ -269,6 +333,7 @@ export async function reconcileExpiredDeployments(
 
 async function startAvailable(): Promise<void> {
   await reconcileExpiredDeployments();
+  await reconcilePendingCandidateCleanup();
   const admitted = await deploymentQueue.claimAvailable();
   for (const deploymentId of admitted) startMachine(deploymentId);
 }

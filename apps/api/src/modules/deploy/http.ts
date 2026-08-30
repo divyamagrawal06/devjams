@@ -7,12 +7,7 @@ import {
 } from "../agent/approvals";
 import { AuthService } from "../auth/service";
 import { ServerService } from "../servers/service";
-import {
-  abortDeployment,
-  enqueueDeploy,
-  getDeployment,
-  rollbackServer,
-} from "./controller";
+import { abortDeployment, enqueueDeploy, getDeployment, rollbackServer } from "./controller";
 
 export async function ownsDeploymentTarget(
   userId: string,

@@ -7,4 +7,6 @@ public final class TransferInstruction {
     public String fromRoute;
     public String toRoute;
     public String message;
+    public List<String> players;
+    public int attempt;
 }

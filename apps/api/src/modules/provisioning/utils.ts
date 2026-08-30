@@ -105,3 +105,12 @@ export function calculateContainerMemory(heapMb: number): number {
 
   return heapMb + overheadMb;
 }
+
+export function requiredPinnedImage(environmentName: string): string {
+  const image = process.env[environmentName]?.trim();
+  if (!image) throw new Error(`${environmentName} must pin a reviewed image`);
+  if (!/@sha256:[0-9a-f]{64}$/.test(image)) {
+    throw new Error(`${environmentName} must use an immutable sha256 image digest`);
+  }
+  return image;
+}

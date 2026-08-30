@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 
 import {
   type DeploymentStatusReader,
+  resolveKubeconfigAwsProfile,
   waitForDeploymentReplicasReady,
 } from "../src/modules/provisioning/kubernetes";
 
@@ -44,4 +45,29 @@ test("waits for all replicas to disappear when scaling down", async () => {
   });
 
   expect(appsApi.calls).toBe(2);
+});
+
+test("preserves the selected kubeconfig AWS profile unless explicitly overridden", () => {
+  // Use the resolver's structural boundary instead of constructing the SDK
+  // class. Bun mocks are process-wide, so a different test file replacing the
+  // Kubernetes module must not make this unit test depend on file order.
+  const kubeConfig = {
+    getUser(name: string) {
+      return name === "maintainer"
+        ? {
+            name,
+            exec: {
+              apiVersion: "client.authentication.k8s.io/v1beta1",
+              command: "aws",
+              args: ["eks", "get-token"],
+              env: [{ name: "AWS_PROFILE", value: "maintainer" }],
+            },
+          }
+        : null;
+    },
+  };
+  const context = { user: "maintainer" };
+
+  expect(resolveKubeconfigAwsProfile(kubeConfig, context, "")).toBe("maintainer");
+  expect(resolveKubeconfigAwsProfile(kubeConfig, context, "release-bot")).toBe("release-bot");
 });

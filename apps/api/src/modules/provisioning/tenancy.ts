@@ -17,6 +17,8 @@ export const RCON_SECRET_KEY = "password";
 export const RCON_PASSWORD_MOUNT = "/run/secrets/rcon";
 export const RCON_PASSWORD_FILE = `${RCON_PASSWORD_MOUNT}/${RCON_SECRET_KEY}`;
 export const WORLD_SYNC_PORT = 8080;
+export const WORLD_SYNC_ROOT = "/data";
+export const WORLD_SYNC_NAMES = "world,world_nether,world_the_end";
 export const RCON_PORT = 25575;
 export const VELOCITY_SECRET_NAME =
   process.env.FARLANDS_VELOCITY_SECRET_NAME ?? "velocity-forwarding-secret";
@@ -305,66 +307,231 @@ async function copyVelocitySecret(core: k8s.CoreV1Api, namespace: string): Promi
   });
 }
 
-async function ensureWorldSyncConfigMap(core: k8s.CoreV1Api, namespace: string): Promise<void> {
+export function buildWorldSyncScripts(): { sender: string; receiver: string } {
   const sender = `#!/usr/bin/env python3
-import http.server, os, subprocess, sys
+import http.server, io, json, os, stat, sys, tarfile, time, urllib.parse
 PORT = int(os.environ.get("WORLD_SYNC_PORT", "8080"))
-ROOT = os.environ.get("WORLD_ROOT", "/data/world")
+ROOT = os.path.realpath(os.environ.get("WORLD_ROOT", "/data"))
+
+def managed_names():
+    names = []
+    for raw in os.environ.get("WORLD_NAMES", "world,world_nether,world_the_end").split(","):
+        name = raw.strip()
+        if not name or name in (".", "..") or os.path.basename(name) != name or "\\\\" in name:
+            raise ValueError("WORLD_NAMES must contain simple directory names")
+        if name not in names:
+            names.append(name)
+    if not names:
+        raise ValueError("WORLD_NAMES cannot be empty")
+    return tuple(names)
+
+NAMES = managed_names()
+
+def source_manifest():
+    paths = []
+    for world in NAMES:
+        base = os.path.join(ROOT, world)
+        if not os.path.isdir(base) or os.path.islink(base):
+            continue
+        paths.append(world)
+        for current, directories, files in os.walk(base, followlinks=False):
+            directories[:] = sorted(
+                name for name in directories if not os.path.islink(os.path.join(current, name))
+            )
+            files = sorted(
+                name for name in files if not os.path.islink(os.path.join(current, name))
+            )
+            for name in directories + files:
+                paths.append(os.path.relpath(os.path.join(current, name), ROOT))
+    return paths
+
+def parse_since_ns(value):
+    if not value or not value.isascii() or not value.isdigit():
+        raise ValueError("delta requires a source snapshot boundary")
+    parsed = int(value)
+    if parsed < 1:
+        raise ValueError("source snapshot boundary must be positive")
+    return parsed
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\\n" % (self.address_string(), fmt % args))
     def do_GET(self):
-        if self.path.startswith("/health"):
+        if urllib.parse.urlparse(self.path).path == "/health":
             self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return
         self.send_response(404); self.end_headers()
     def do_POST(self):
-        if not self.path.startswith("/stream"):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/stream":
             self.send_response(404); self.end_headers(); return
-        if not os.path.isdir(ROOT):
-            self.send_response(204); self.end_headers(); return
-        extra = []
-        if "delta=1" in self.path:
-            extra = ["--newer-mtime", os.environ.get("DELTA_SINCE", "1970-01-01")]
-        proc = subprocess.Popen(["tar", "-C", ROOT, "-cf", "-", *extra, "."], stdout=subprocess.PIPE)
+        try:
+            query = urllib.parse.parse_qs(parsed.query, strict_parsing=True) if parsed.query else {}
+            if set(query) - {"delta", "since_ns"}:
+                raise ValueError("unsupported query parameter")
+            delta = query.get("delta", []) == ["1"]
+            if query.get("delta", []) not in ([], ["1"]):
+                raise ValueError("delta must equal 1")
+            since_ns = parse_since_ns(query.get("since_ns", [None])[0]) if delta else None
+        except (ValueError, TypeError) as error:
+            self.send_response(400); self.end_headers(); self.wfile.write(str(error).encode()); return
+
+        snapshot_started_ns = time.time_ns()
+        entries = source_manifest()
+        manifest = json.dumps(entries, separators=(",", ":")).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/x-tar")
+        self.send_header("X-Farlands-Snapshot-Started-Ns", str(snapshot_started_ns))
         self.end_headers()
-        assert proc.stdout is not None
-        while True:
-            chunk = proc.stdout.read(1024 * 256)
-            if not chunk: break
-            self.wfile.write(chunk)
-        proc.wait()
-        if proc.returncode != 0:
-            sys.stderr.write("tar failed %s\\n" % proc.returncode)
+        with tarfile.open(fileobj=self.wfile, mode="w|") as archive:
+            info = tarfile.TarInfo(".farlands-source-manifest.json")
+            info.size = len(manifest); info.mode = 0o600
+            archive.addfile(info, io.BytesIO(manifest))
+            for relative in entries:
+                full_path = os.path.realpath(os.path.join(ROOT, relative))
+                if os.path.commonpath((ROOT, full_path)) != ROOT:
+                    raise RuntimeError("world path escaped the managed root")
+                metadata = os.lstat(full_path)
+                if stat.S_ISLNK(metadata.st_mode):
+                    continue
+                if delta and not stat.S_ISDIR(metadata.st_mode) and metadata.st_mtime_ns <= since_ns:
+                    continue
+                archive.add(full_path, arcname=relative, recursive=False)
 
 http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 `;
 
   const receiver = `#!/usr/bin/env python3
-import os, sys, tarfile, urllib.parse, urllib.request
+import json, os, posixpath, sys, tarfile, urllib.parse, urllib.request
 PORT = int(os.environ.get("WORLD_SYNC_PORT", "8080"))
-ROOT = os.environ.get("WORLD_ROOT", "/data/world")
+ROOT = os.path.realpath(os.environ.get("WORLD_ROOT", "/data"))
 SOURCE = os.environ["SOURCE_SYNC_URL"]
 PHASE = os.environ.get("WORLD_SYNC_PHASE", "presync")
+SINCE = os.environ.get("WORLD_SYNC_SINCE")
+SINCE_FILE = os.environ.get("WORLD_SYNC_SINCE_FILE")
+MARKER = os.environ.get("WORLD_SYNC_MARKER")
+MANIFEST = ".farlands-source-manifest.json"
+
+def managed_names():
+    names = []
+    for raw in os.environ.get("WORLD_NAMES", "world,world_nether,world_the_end").split(","):
+        name = raw.strip()
+        if not name or name in (".", "..") or os.path.basename(name) != name or "\\\\" in name:
+            raise ValueError("WORLD_NAMES must contain simple directory names")
+        if name not in names:
+            names.append(name)
+    if not names:
+        raise ValueError("WORLD_NAMES cannot be empty")
+    return tuple(names)
+
+NAMES = managed_names()
+
+def normalize_relative(value):
+    if not isinstance(value, str) or not value or "\\\\" in value:
+        raise RuntimeError("world-sync manifest contains an invalid path")
+    normalized = posixpath.normpath(value)
+    if normalized != value or normalized.startswith("/") or normalized in (".", ".."):
+        raise RuntimeError("world-sync manifest contains a non-canonical path")
+    return normalized
+
+def is_managed(relative):
+    return any(relative == name or relative.startswith(name + "/") for name in NAMES)
+
+def extraction_filter(member, destination):
+    filtered = tarfile.data_filter(member, destination)
+    if filtered is None:
+        return None
+    relative = filtered.name[2:] if filtered.name.startswith("./") else filtered.name
+    if relative == MANIFEST:
+        if not filtered.isfile():
+            raise tarfile.FilterError("world-sync manifest must be a regular file")
+        return filtered
+    relative = normalize_relative(relative)
+    if not is_managed(relative) or filtered.issym() or filtered.islnk():
+        raise tarfile.FilterError("archive member is outside managed world roots")
+    if not filtered.isdir() and not filtered.isfile():
+        raise tarfile.FilterError("archive member type is not allowed")
+    return filtered
+
+def prune(expected):
+    for world in NAMES:
+        base = os.path.join(ROOT, world)
+        if not os.path.lexists(base):
+            continue
+        if os.path.islink(base):
+            os.unlink(base); continue
+        for current, directories, files in os.walk(base, topdown=False, followlinks=False):
+            for name in files:
+                path = os.path.join(current, name)
+                relative = os.path.relpath(path, ROOT).replace(os.sep, "/")
+                if relative not in expected:
+                    os.unlink(path)
+            for name in directories:
+                path = os.path.join(current, name)
+                relative = os.path.relpath(path, ROOT).replace(os.sep, "/")
+                if os.path.islink(path):
+                    if relative not in expected: os.unlink(path)
+                elif relative not in expected and not os.listdir(path):
+                    os.rmdir(path)
+        if world not in expected and os.path.isdir(base) and not os.listdir(base):
+            os.rmdir(base)
+
+def source_boundary(response):
+    value = response.headers.get("X-Farlands-Snapshot-Started-Ns", "")
+    if not value.isascii() or not value.isdigit() or int(value) < 1:
+        raise RuntimeError("world-sync sender omitted its source snapshot boundary")
+    return value
+
+def mark_complete(boundary):
+    if PHASE == "presync" and MARKER:
+        with open(MARKER, "w", encoding="utf-8") as handle:
+            handle.write(boundary + "\\n")
+
+if PHASE == "presync" and MARKER and os.path.isfile(MARKER):
+    sys.exit(0)
 
 parsed = urllib.parse.urlparse(SOURCE)
 if parsed.scheme != "http" or parsed.port != PORT or parsed.path != "/stream":
     raise ValueError("SOURCE_SYNC_URL must name the tenant world-sync service")
 if not parsed.hostname or not parsed.hostname.endswith(".svc.cluster.local"):
     raise ValueError("SOURCE_SYNC_URL must stay inside cluster DNS")
-query = "?delta=1" if PHASE == "delta" else ""
+if PHASE not in ("presync", "delta"):
+    raise ValueError("WORLD_SYNC_PHASE must be presync or delta")
+if PHASE == "delta" and SINCE_FILE:
+    with open(SINCE_FILE, "r", encoding="utf-8") as handle:
+        SINCE = handle.read().strip()
+if PHASE == "delta" and (not SINCE or not SINCE.isascii() or not SINCE.isdigit()):
+    raise ValueError("delta sync requires a source-host snapshot boundary")
+query = "?" + urllib.parse.urlencode({"delta": "1", "since_ns": SINCE}) if PHASE == "delta" else ""
 request = urllib.request.Request(SOURCE + query, data=b"", method="POST")
 os.makedirs(ROOT, exist_ok=True)
 with urllib.request.urlopen(request, timeout=900) as response:
+    boundary = source_boundary(response)
     if response.status == 204:
-        sys.exit(0)
+        prune(set()); mark_complete(boundary); sys.exit(0)
     if response.headers.get_content_type() != "application/x-tar":
         raise RuntimeError("world-sync sender returned an unexpected content type")
     with tarfile.open(fileobj=response, mode="r|") as archive:
-        archive.extractall(path=ROOT, filter="data")
+        archive.extractall(path=ROOT, filter=extraction_filter)
+manifest_path = os.path.join(ROOT, MANIFEST)
+if not os.path.isfile(manifest_path):
+    raise RuntimeError("world-sync response did not include the source manifest")
+with open(manifest_path, "r", encoding="utf-8") as handle:
+    raw_expected = json.load(handle)
+if not isinstance(raw_expected, list):
+    raise RuntimeError("world-sync manifest must be a list")
+expected = {normalize_relative(value) for value in raw_expected}
+if not all(is_managed(relative) for relative in expected):
+    raise RuntimeError("world-sync manifest contains an unmanaged path")
+prune(expected)
+os.unlink(manifest_path)
+mark_complete(boundary)
 `;
+
+  return { sender, receiver };
+}
+
+async function ensureWorldSyncConfigMap(core: k8s.CoreV1Api, namespace: string): Promise<void> {
+  const { sender, receiver } = buildWorldSyncScripts();
 
   const body: k8s.V1ConfigMap = {
     metadata: { name: "cm-world-sync", namespace },

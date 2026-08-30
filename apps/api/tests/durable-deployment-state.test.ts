@@ -7,6 +7,7 @@ import {
   reconcileExpiredDeployments,
   reconcilePendingCandidateCleanup,
   restartDisposition,
+  withLeaseHeartbeat,
 } from "../src/modules/deploy/controller";
 import { DurableDeploymentQueue } from "../src/modules/deploy/queue";
 import { type DeploymentRecord, MemoryDeploymentStore } from "../src/modules/deploy/store";
@@ -33,6 +34,18 @@ function deployment(
     namespace: null,
     liveDeployment: null,
     liveService: null,
+    livePvc: null,
+    liveProxyTarget: null,
+    candidateService: null,
+    candidatePvc: null,
+    sourcePlayers: [],
+    lobbyPlayers: [],
+    sourcePlayerCount: 0,
+    presyncCompletedAt: null,
+    savesDisabled: false,
+    candidateHealthy: false,
+    routeSwitched: false,
+    abortRequestedAt: null,
     approvedContentDigest: `sha256:${"a".repeat(64)}`,
     artifactUrl: null,
     artifactDigest: null,
@@ -113,8 +126,8 @@ describe("durable deployment queue and reconciliation", () => {
     await expect(
       reconcileExpiredDeployments(queue, store, {
         abort: async (id) => {
-          expect((await store.find(id))?.workerId).toBe("recovery_worker_recovery");
-          await expect(queue.renew(id)).resolves.toBe(false);
+          expect((await store.find(id))?.workerId).toBe("worker_recovery");
+          await expect(queue.renew(id)).resolves.toBe(true);
           aborted.push(id);
           await store.transition(id, "aborted", {
             queueStatus: "complete",
@@ -146,6 +159,28 @@ describe("durable deployment queue and reconciliation", () => {
       }),
     ).resolves.toBe(false);
     expect(effects).toEqual(["candidate deleted", "headroom released"]);
+  });
+
+  test("a thrown heartbeat marks ownership lost before the machine starts", async () => {
+    let operationStarted = false;
+    const queue = {
+      heartbeatIntervalMs: 1,
+      renew: async () => {
+        throw new Error("database connection lost");
+      },
+    };
+
+    await expect(
+      withLeaseHeartbeat(
+        "dep_heartbeat",
+        async () => {
+          operationStarted = true;
+          return "must not commit";
+        },
+        queue,
+      ),
+    ).rejects.toThrow(/lost its durable queue lease/);
+    expect(operationStarted).toBe(false);
   });
 
   test("persists and retries candidate cleanup after a transient deletion failure", async () => {
@@ -223,8 +258,10 @@ describe("durable deployment queue and reconciliation", () => {
     const store = new MemoryDeploymentStore(() => new Date("2026-08-30T12:00:00.000Z"));
     await store.create(deployment("dep_change"));
     await store.transition("dep_change", "building", {}, "worker admitted");
-    await store.transition("dep_change", "verifying", {
+    await store.transition("dep_change", "cutover", {
       candidatePod: "candidate-b",
+      artifactDigest: `sha256:${"a".repeat(64)}`,
+      routeSwitched: true,
       queueStatus: "running",
       workerId: "worker_one",
       leaseExpiresAt: "2026-08-30T12:15:00.000Z",
@@ -238,7 +275,11 @@ describe("durable deployment queue and reconciliation", () => {
     });
     await store.create(
       deployment("dep_next", {
-        state: "verifying",
+        state: "cutover",
+        toVersion: "8",
+        approvedContentDigest: `sha256:${"c".repeat(64)}`,
+        artifactDigest: `sha256:${"c".repeat(64)}`,
+        routeSwitched: true,
         queueStatus: "running",
         workerId: "worker_two",
         leaseExpiresAt: "2026-08-30T12:15:00.000Z",
@@ -264,9 +305,9 @@ describe("durable deployment queue and reconciliation", () => {
     expect(store.events.map((event) => event.state)).toEqual([
       "queued",
       "building",
-      "verifying",
+      "cutover",
       "draining",
-      "verifying",
+      "cutover",
       "draining",
     ]);
   });
@@ -275,7 +316,9 @@ describe("durable deployment queue and reconciliation", () => {
     const store = new MemoryDeploymentStore(() => new Date("2026-08-30T12:00:00.000Z"));
     await store.create(
       deployment("dep_expired", {
-        state: "verifying",
+        state: "cutover",
+        artifactDigest: `sha256:${"a".repeat(64)}`,
+        routeSwitched: true,
         queueStatus: "running",
         workerId: "worker_old",
         leaseExpiresAt: "2026-08-30T12:00:00.000Z",
@@ -291,7 +334,7 @@ describe("durable deployment queue and reconciliation", () => {
         workerId: "worker_old",
       }),
     ).rejects.toThrow(/lost its cutover lease/);
-    expect((await store.find("dep_expired"))?.state).toBe("verifying");
+    expect((await store.find("dep_expired"))?.state).toBe("cutover");
     await expect(store.findRuleHead("srv_alpha")).resolves.toBeNull();
   });
 
@@ -334,6 +377,7 @@ describe("scoped durable Velocity transfers", () => {
       players: ["Alice", "Bob"],
       attempt: 1,
     });
+    expect((await service.listPending())[0]?.attempt).toBe(1);
 
     let wrongRealmTransferCount = 0;
     try {
@@ -356,7 +400,7 @@ describe("scoped durable Velocity transfers", () => {
     await expect(restartedService.acknowledge(id, ack)).resolves.toEqual(ack);
   });
 
-  test("expires unacknowledged transfers and never redelivers them", async () => {
+  test("does not redeliver an expired transfer until the controller explicitly retries", async () => {
     let now = new Date("2026-08-30T12:00:00.000Z");
     const store = new MemoryTransferStore();
     const service = new TransferService(store, () => now);
@@ -374,6 +418,38 @@ describe("scoped durable Velocity transfers", () => {
       service.acknowledge(id, { movedPlayers: ["Alice"], failures: [] }),
     ).rejects.toThrow(/expired/);
     expect((await store.find(id))?.status).toBe("expired");
+
+    const retriedId = await service.issue({
+      deploymentId: "dep_change",
+      fromRoute: "realm-a",
+      toRoute: "lobby",
+      message: "Brief safety move",
+      sourcePlayers: ["Alice"],
+      expiresInMs: 1_000,
+    });
+    expect(retriedId).toBe(id);
+    expect((await service.listPending())[0]).toMatchObject({ transferId: id, attempt: 2 });
+  });
+
+  test("retries a partially failed acknowledgement with the same idempotency key", async () => {
+    const now = new Date("2026-08-30T12:00:00.000Z");
+    const store = new MemoryTransferStore();
+    const service = new TransferService(store, () => now);
+    const input = {
+      deploymentId: "dep_retry",
+      fromRoute: "lobby",
+      toRoute: "realm-b",
+      message: "Joining the verified replacement server",
+      sourcePlayers: ["Alice", "Bob"],
+    };
+    const id = await service.issue(input);
+    await service.acknowledge(id, {
+      movedPlayers: ["Alice"],
+      failures: [{ player: "Bob", reason: "connection failed" }],
+    });
+
+    await expect(service.issue(input)).resolves.toBe(id);
+    expect(await store.find(id)).toMatchObject({ status: "pending", ack: null, attempts: 2 });
   });
 });
 

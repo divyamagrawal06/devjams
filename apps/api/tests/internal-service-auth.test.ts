@@ -6,11 +6,14 @@ import {
   verifyInternalServiceRequest,
 } from "../src/modules/auth/internal-service";
 import { createVelocityModule } from "../src/modules/velocity/http";
+import { MemoryRouteRosterStore, RouteRosterService } from "../src/modules/velocity/roster";
 import { MemoryTransferStore, TransferService } from "../src/modules/velocity/transfers";
 
+const rosterStore = new MemoryRouteRosterStore();
 const velocityApp = new Elysia().use(
   createVelocityModule(
     new TransferService(new MemoryTransferStore(), () => new Date("2026-08-30T12:00:00.000Z")),
+    new RouteRosterService(rosterStore, () => new Date("2026-08-30T12:00:00.000Z")),
   ),
 );
 
@@ -69,11 +72,42 @@ describe("internal service authentication", () => {
     );
     expect(wrongAck.status).toBe(401);
 
+    const wrongRoster = await velocityApp.handle(
+      new Request("http://localhost/internal/velocity/roster", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-internal-key": "wrong" },
+        body: JSON.stringify({ routes: [] }),
+      }),
+    );
+    expect(wrongRoster.status).toBe(401);
+
     const authorized = await velocityApp.handle(
       new Request("http://localhost/internal/velocity/transfers", {
         headers: { "x-internal-key": "cluster-only-secret" },
       }),
     );
     expect(authorized.status).toBe(200);
+
+    const authorizedRoster = await velocityApp.handle(
+      new Request("http://localhost/internal/velocity/roster", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-internal-key": "cluster-only-secret",
+        },
+        body: JSON.stringify({
+          routes: [
+            {
+              route: "realm-a",
+              targetHost: "svc-a.example",
+              targetPort: 25565,
+              players: ["Alice"],
+            },
+          ],
+        }),
+      }),
+    );
+    expect(authorizedRoster.status).toBe(200);
+    expect(await rosterStore.find("realm-a")).toMatchObject({ players: ["Alice"] });
   });
 });

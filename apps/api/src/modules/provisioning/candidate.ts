@@ -1,4 +1,4 @@
-import { gameServers, serverConfigs, serverK8s } from "@repo/db/schema";
+import { gameServers, serverConfigs, serverK8s, serverRoutes } from "@repo/db/schema";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import {
@@ -6,8 +6,14 @@ import {
   makeKubernetesClients,
   waitForDeploymentReplicasReady,
 } from "./kubernetes";
-import { artifactServiceAccountName, ensureTenantNamespace, WORLD_SYNC_PORT } from "./tenancy";
-import { calculateContainerMemory, MinecraftUtils } from "./utils";
+import {
+  artifactServiceAccountName,
+  ensureTenantNamespace,
+  WORLD_SYNC_NAMES,
+  WORLD_SYNC_PORT,
+  WORLD_SYNC_ROOT,
+} from "./tenancy";
+import { calculateContainerMemory, MinecraftUtils, requiredPinnedImage } from "./utils";
 
 const SERVER_PORT = 25565;
 
@@ -33,6 +39,8 @@ export type CandidateResources = {
   pvcName: string;
   liveDeploymentName: string;
   liveServiceName: string;
+  livePvcName: string;
+  liveProxyTarget: string;
 };
 
 export async function provisionCandidate(input: {
@@ -53,6 +61,13 @@ export async function provisionCandidate(input: {
     where: eq(serverK8s.serverId, input.liveServerId),
   });
   if (!k8sRow) throw new Error(`Server ${input.liveServerId} has no k8s record`);
+
+  const routeRow = await db.query.serverRoutes.findFirst({
+    where: eq(serverRoutes.serverId, input.liveServerId),
+  });
+  if (!routeRow?.proxyTarget) {
+    throw new Error(`Server ${input.liveServerId} has no live Velocity route target`);
+  }
 
   const [config] = await db
     .select()
@@ -84,6 +99,7 @@ export async function provisionCandidate(input: {
   };
   const annotations = { "farlands.dev/rule-artifact-digest": input.artifactDigest };
   const artifactLoader = buildArtifactLoader(input);
+  const worldSyncImage = requiredPinnedImage("FARLANDS_WORLD_SYNC_IMAGE");
 
   await clients.core.createNamespacedPersistentVolumeClaim({
     namespace,
@@ -139,21 +155,31 @@ export async function provisionCandidate(input: {
               artifactLoader,
               {
                 name: "world-receiver",
-                image: "python:3.12-alpine",
+                image: worldSyncImage,
                 command: ["sh", "-c", "python3 /sync/receiver.py --once"],
                 env: [
                   { name: "WORLD_SYNC_PORT", value: String(WORLD_SYNC_PORT) },
-                  { name: "WORLD_ROOT", value: "/data/world" },
+                  { name: "WORLD_ROOT", value: WORLD_SYNC_ROOT },
+                  { name: "WORLD_NAMES", value: WORLD_SYNC_NAMES },
                   {
                     name: "SOURCE_SYNC_URL",
                     value: `http://${k8sRow.serviceName}.${namespace}.svc.cluster.local:${WORLD_SYNC_PORT}/stream`,
                   },
                   { name: "WORLD_SYNC_TRANSFER_ID", value: input.deploymentId },
                   { name: "WORLD_SYNC_PHASE", value: "presync" },
+                  { name: "WORLD_SYNC_MARKER", value: "/data/.farlands-presync-complete" },
                 ],
+                securityContext: {
+                  allowPrivilegeEscalation: false,
+                  capabilities: { drop: ["ALL"] },
+                  readOnlyRootFilesystem: true,
+                  runAsNonRoot: true,
+                  runAsUser: 1000,
+                  runAsGroup: 1000,
+                },
                 volumeMounts: [
                   { name: "server-data", mountPath: "/data" },
-                  { name: "world-sync", mountPath: "/sync" },
+                  { name: "world-sync", mountPath: "/sync", readOnly: true },
                 ],
               },
             ],
@@ -224,6 +250,8 @@ export async function provisionCandidate(input: {
     pvcName: names.pvc,
     liveDeploymentName: k8sRow.deploymentName,
     liveServiceName: k8sRow.serviceName,
+    livePvcName: k8sRow.pvcName,
+    liveProxyTarget: routeRow.proxyTarget,
   };
 }
 
@@ -255,13 +283,7 @@ export function assertCandidateArtifactCompatibility(
 }
 
 export function buildArtifactLoader(input: CandidateArtifactInput) {
-  const image = process.env.FARLANDS_ARTIFACT_FETCH_IMAGE?.trim();
-  if (!image) {
-    throw new Error("FARLANDS_ARTIFACT_FETCH_IMAGE must pin the reviewed artifact loader image");
-  }
-  if (!/@sha256:[0-9a-f]{64}$/.test(image)) {
-    throw new Error("FARLANDS_ARTIFACT_FETCH_IMAGE must use an immutable sha256 image digest");
-  }
+  const image = requiredPinnedImage("FARLANDS_ARTIFACT_FETCH_IMAGE");
   return {
     name: "rule-artifact",
     image,
@@ -330,6 +352,11 @@ export async function deleteCandidate(input: {
         name: names.pvc,
         namespace: ns,
       }),
+    () =>
+      clients.networking.deleteNamespacedNetworkPolicy({
+        name: names.networkPolicy,
+        namespace: ns,
+      }),
   ];
 
   const failures: unknown[] = [];
@@ -340,8 +367,8 @@ export async function deleteCandidate(input: {
       if (getKubernetesStatusCode(error) !== 404) failures.push(error);
     }
   }
-  if (failures.length > 0) {
-    throw new AggregateError(failures, "Candidate cleanup did not delete every resource");
+  if (failures.length) {
+    throw new AggregateError(failures, "Candidate cleanup left one or more resources behind");
   }
 }
 
@@ -354,13 +381,138 @@ export async function startPaperOnCandidate(
     name: deploymentName,
     namespace,
   });
-  const container = deploy.spec?.template?.spec?.containers?.[0];
+  const spec = deploy.spec;
+  if (!spec) throw new Error("candidate deployment spec missing");
+  const container = spec.template.spec?.containers?.[0];
   if (!container) throw new Error("candidate container missing");
   delete container.command;
   delete container.args;
+  container.startupProbe = {
+    tcpSocket: { port: SERVER_PORT },
+    failureThreshold: 60,
+    periodSeconds: 2,
+  };
+  container.readinessProbe = {
+    tcpSocket: { port: SERVER_PORT },
+    failureThreshold: 3,
+    periodSeconds: 2,
+  };
+  container.livenessProbe = {
+    tcpSocket: { port: SERVER_PORT },
+    failureThreshold: 6,
+    periodSeconds: 10,
+  };
+  spec.replicas = 1;
+  spec.template.metadata ??= {};
+  spec.template.metadata.annotations = {
+    ...(spec.template.metadata.annotations ?? {}),
+    "farlands.dev/candidate-started-at": new Date().toISOString(),
+  };
   await clients.apps.replaceNamespacedDeployment({
     name: deploymentName,
     namespace,
     body: deploy,
   });
+}
+
+export async function stopCandidateForDelta(
+  namespace: string,
+  deploymentName: string,
+): Promise<void> {
+  const clients = makeKubernetesClients();
+  await clients.apps.patchNamespacedDeployment({
+    name: deploymentName,
+    namespace,
+    body: [{ op: "replace", path: "/spec/replicas", value: 0 }],
+    fieldManager: "farlands-cutover",
+  });
+  await waitForDeploymentReplicasReady(clients.apps, deploymentName, namespace, 0, {
+    timeoutMs: 120_000,
+    intervalMs: 1_000,
+  });
+}
+
+export type CandidateHealthEvidence = {
+  podName: string;
+  artifactDigest: string;
+  pluginEnabled: boolean;
+  serverReady: boolean;
+};
+
+export async function verifyCandidateHealth(input: {
+  namespace: string;
+  deploymentName: string;
+  deploymentId: string;
+  artifactDigest: string;
+  timeoutMs?: number;
+}): Promise<CandidateHealthEvidence> {
+  const clients = makeKubernetesClients();
+  await waitForDeploymentReplicasReady(clients.apps, input.deploymentName, input.namespace, 1, {
+    timeoutMs: input.timeoutMs ?? 300_000,
+    intervalMs: 1_000,
+  });
+
+  const deployment = await clients.apps.readNamespacedDeployment({
+    name: input.deploymentName,
+    namespace: input.namespace,
+  });
+  const observedDigest = deployment.metadata?.annotations?.["farlands.dev/rule-artifact-digest"];
+  if (observedDigest !== input.artifactDigest) {
+    throw new Error("Candidate deployment annotation does not match the reviewed artifact digest");
+  }
+
+  const deadline = Date.now() + (input.timeoutMs ?? 300_000);
+  while (Date.now() < deadline) {
+    const pods = await clients.core.listNamespacedPod({
+      namespace: input.namespace,
+      labelSelector: `farlands.dev/deployment-id=${input.deploymentId}`,
+    });
+    const pod = pods.items.find(
+      (candidate) =>
+        candidate.metadata?.deletionTimestamp === undefined &&
+        candidate.status?.conditions?.some(
+          (condition) => condition.type === "Ready" && condition.status === "True",
+        ),
+    );
+    if (pod?.metadata?.name) {
+      const artifactInit = pod.status?.initContainerStatuses?.find(
+        (status) => status.name === "rule-artifact",
+      );
+      if (artifactInit?.state?.terminated?.exitCode !== 0) {
+        throw new Error("Candidate artifact loader did not complete successfully");
+      }
+      const gameStatus = pod.status?.containerStatuses?.find(
+        (status) => status.name === "game-server",
+      );
+      if ((gameStatus?.restartCount ?? 0) > 0) {
+        throw new Error("Candidate game server restarted during verification");
+      }
+      const logs = await clients.core.readNamespacedPodLog({
+        name: pod.metadata.name,
+        namespace: input.namespace,
+        container: "game-server",
+        tailLines: 1_000,
+        timestamps: true,
+      });
+      if (
+        /\b(?:SEVERE|FATAL)\b|Exception in server tick loop|Could not load ['"]?FarlandsPlugin/i.test(
+          logs,
+        )
+      ) {
+        throw new Error("Candidate logs contain a fatal startup or plugin-load error");
+      }
+      const pluginEnabled = logs.includes("Farlands Plugin Enabled");
+      const serverReady = /Done \([^)]+\)! For help/.test(logs);
+      if (pluginEnabled && serverReady) {
+        return {
+          podName: pod.metadata.name,
+          artifactDigest: observedDigest,
+          pluginEnabled,
+          serverReady,
+        };
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  throw new Error("Timed out waiting for candidate health evidence");
 }

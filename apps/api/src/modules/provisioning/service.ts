@@ -16,9 +16,11 @@ import {
   RCON_PASSWORD_FILE,
   RCON_PORT,
   RCON_SECRET_NAME,
+  WORLD_SYNC_NAMES,
   WORLD_SYNC_PORT,
+  WORLD_SYNC_ROOT,
 } from "./tenancy";
-import { calculateContainerMemory, MinecraftUtils } from "./utils";
+import { calculateContainerMemory, MinecraftUtils, requiredPinnedImage } from "./utils";
 
 const TEST_EXISTING_PVC_NAME = process.env.FARLANDS_TEST_EXISTING_PVC_NAME;
 const TEST_WORKLOAD_REPLICAS =
@@ -348,9 +350,9 @@ function buildDeployment(
             },
             {
               name: "world-sync",
-              image: "python:3.12-alpine",
+              image: requiredPinnedImage("FARLANDS_WORLD_SYNC_IMAGE"),
               imagePullPolicy: "IfNotPresent",
-              command: ["sh", "-c", "apk add --no-cache tar >/dev/null && python3 /sync/sender.py"],
+              command: ["python3", "/sync/sender.py"],
               ports: [
                 {
                   name: "world-sync",
@@ -360,15 +362,24 @@ function buildDeployment(
               ],
               env: [
                 { name: "WORLD_SYNC_PORT", value: String(WORLD_SYNC_PORT) },
-                { name: "WORLD_ROOT", value: `${DATA_MOUNT_PATH}/world` },
+                { name: "WORLD_ROOT", value: WORLD_SYNC_ROOT },
+                { name: "WORLD_NAMES", value: WORLD_SYNC_NAMES },
               ],
               resources: {
                 requests: { cpu: "50m", memory: "64Mi" },
                 limits: { cpu: "200m", memory: "128Mi" },
               },
+              securityContext: {
+                allowPrivilegeEscalation: false,
+                capabilities: { drop: ["ALL"] },
+                readOnlyRootFilesystem: true,
+                runAsNonRoot: true,
+                runAsUser: 1000,
+                runAsGroup: 1000,
+              },
               volumeMounts: [
                 { name: "server-data", mountPath: DATA_MOUNT_PATH },
-                { name: "world-sync", mountPath: "/sync" },
+                { name: "world-sync", mountPath: "/sync", readOnly: true },
               ],
             },
           ],

@@ -101,7 +101,7 @@ test("M1 harness uses the corrected HTTP tar protocol and exact freeze order", (
     "utf8",
   );
   expect(tenancy).toContain('urllib.request.Request(SOURCE + query, data=b"", method="POST")');
-  expect(tenancy).toContain('archive.extractall(path=ROOT, filter="data")');
+  expect(tenancy).toContain("archive.extractall(path=ROOT, filter=extraction_filter)");
   expect(measurement.indexOf('rcon.command("save-off")')).toBeLessThan(
     measurement.indexOf('rcon.command("save-all flush")'),
   );

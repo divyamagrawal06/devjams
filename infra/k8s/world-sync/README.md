@@ -17,6 +17,11 @@ must return `application/json` with the exact shape
 The harness rejects generic 2xx responses and identity mismatches, so a stale
 or incorrectly targeted service can never publish a measured result.
 
+The deployment sync path writes the source server's nanosecond snapshot-start
+boundary into the candidate PVC during presync. The frozen delta reads that
+marker and compares it with source-host `mtime_ns`; API-host wall-clock time is
+audit metadata only and is never used to decide which world files changed.
+
 The result is one JSON record. Preserve it with `--output` in the measurement job's
 durable result volume or CI artifact. Until a real cluster run produces that record,
 all product surfaces must continue to report the freeze estimate as `unmeasured`.

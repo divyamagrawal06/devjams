@@ -28,6 +28,7 @@ dependencies {
     annotationProcessor("com.velocitypowered:velocity-api:3.4.0-SNAPSHOT")
     // Gson is used for JSON parsing; we bundle it via shadow so we own the version.
     implementation("com.google.code.gson:gson:2.11.0")
+    testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
 }
 
 tasks {
@@ -46,5 +47,9 @@ tasks {
         options.encoding = "UTF-8"
         // Velocity's annotation processor requires source/target 21 to work correctly.
         options.release = 21
+    }
+
+    test {
+        useJUnitPlatform()
     }
 }

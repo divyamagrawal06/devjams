@@ -1,6 +1,7 @@
 import { Elysia } from "elysia";
 import { internalAuthRefusal, verifyInternalServiceRequest } from "../auth/internal-service";
 import { AuthService } from "../auth/service";
+import { workloadCatalogue } from "./catalog";
 import { ServersModel } from "./model";
 import { ServerService } from "./service";
 
@@ -56,6 +57,10 @@ export const serversModule = new Elysia({ prefix: "/api/servers" })
     const servers = await ServerService.getAllByUser(userId);
     return { success: true, data: servers };
   })
+  .get("/templates", () => ({
+    success: true,
+    data: { ...workloadCatalogue, observedAt: new Date().toISOString() },
+  }))
   .get("/:serverId", async ({ userId, params }) => {
     const server = await ServerService.getById(userId, params.serverId);
     return { success: true, data: server };

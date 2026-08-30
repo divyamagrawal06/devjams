@@ -1,38 +1,91 @@
 import { backups, gameServers, serverConfigs, userQuotas } from "@repo/db";
-import { and, count, eq, ne, sql } from "drizzle-orm";
+import { and, eq, ne, sql } from "drizzle-orm";
 import { status } from "elysia";
 import { db, type TransactionType } from "../../db";
 import { headroomHeldByUser } from "./headroom";
 
+export type QuotaLimits = {
+  serversLimit: number;
+  cpuLimit: number;
+  ramLimitMb: number;
+  storageLimitGb: number;
+};
+
+export type ResourceAllocation = {
+  servers: number;
+  cpu: number;
+  ramMb: number;
+  storageGb: number;
+};
+
+export function allocationViolations(limits: QuotaLimits, projected: ResourceAllocation): string[] {
+  const violations: string[] = [];
+  if (projected.servers > limits.serversLimit) violations.push("servers");
+  if (projected.cpu > limits.cpuLimit) violations.push("cpu");
+  if (projected.ramMb > limits.ramLimitMb) violations.push("ram");
+  if (projected.storageGb > limits.storageLimitGb) violations.push("storage");
+  return violations;
+}
+
+function allocationError(resource: string, limits: QuotaLimits): never {
+  const label: Record<string, string> = {
+    servers: `${limits.serversLimit} workloads`,
+    cpu: `${limits.cpuLimit} CPU cores`,
+    ram: `${limits.ramLimitMb}MB RAM`,
+    storage: `${limits.storageLimitGb}GB storage`,
+  };
+  throw status(403, `Account quota exceeded. This plan allows ${label[resource]}.`);
+}
+
+export function assertAllocationFits(limits: QuotaLimits, projected: ResourceAllocation): void {
+  const [first] = allocationViolations(limits, projected);
+  if (first) allocationError(first, limits);
+}
+
 export abstract class QuotaService {
-  // Resources are per server basis.
+  /**
+   * Locks the owner's quota projection and measures every non-deleted workload.
+   * Failed workloads still own their volume/configured capacity and therefore
+   * cannot disappear from admission accounting.
+   */
   static async getResourceLimits(userId: string, tx: TransactionType) {
     const [quota] = await tx
       .select()
       .from(userQuotas)
       .where(eq(userQuotas.userId, userId))
       .for("update");
-
     if (!quota) return null;
-    const [serverData] = await tx
+
+    const servers = await tx
       .select({
-        used: count(gameServers.id),
+        cpuCores: serverConfigs.cpuCores,
+        ramMb: serverConfigs.ramMb,
+        storageGb: serverConfigs.storageGb,
       })
       .from(gameServers)
-      .where(
-        and(
-          eq(gameServers.userId, userId),
-          ne(gameServers.currentState, "deleted"),
-          ne(gameServers.currentState, "failed"),
-        ),
-      );
+      .innerJoin(serverConfigs, eq(serverConfigs.serverId, gameServers.id))
+      .where(and(eq(gameServers.userId, userId), ne(gameServers.currentState, "deleted")));
+
+    const used = servers.reduce<ResourceAllocation>(
+      (total, server) => ({
+        servers: total.servers + 1,
+        cpu: total.cpu + (Number(server.cpuCores) || 0),
+        ramMb: total.ramMb + (server.ramMb || 0),
+        storageGb: total.storageGb + (server.storageGb || 0),
+      }),
+      { servers: 0, cpu: 0, ramMb: 0, storageGb: 0 },
+    );
 
     return {
-      serversLimit: quota.serversLimit,
-      serversUsed: serverData.used,
-      cpuLimit: quota.cpuLimit,
-      ramLimitMb: quota.ramLimitMb,
-      storageLimitGb: quota.storageLimitGb,
+      plan: quota.plan,
+      limits: {
+        serversLimit: quota.serversLimit,
+        cpuLimit: Number(quota.cpuLimit),
+        ramLimitMb: quota.ramLimitMb,
+        storageLimitGb: quota.storageLimitGb,
+      },
+      used,
+      backupsLimit: quota.backupsLimit,
     };
   }
 
@@ -40,10 +93,7 @@ export abstract class QuotaService {
     const [result] = await db
       .select({
         backupsLimit: userQuotas.backupsLimit,
-
-        backupsUsed: sql`
-          COUNT(DISTINCT ${backups.id})
-        `.mapWith(Number),
+        backupsUsed: sql`COUNT(DISTINCT ${backups.id})`.mapWith(Number),
       })
       .from(userQuotas)
       .leftJoin(
@@ -60,13 +110,11 @@ export abstract class QuotaService {
       )
       .where(eq(userQuotas.userId, userId))
       .groupBy(userQuotas.userId, userQuotas.backupsLimit);
-
-    return result;
+    return result ?? null;
   }
 
   static async getResourceUsage(userId: string) {
     const [quota] = await db.select().from(userQuotas).where(eq(userQuotas.userId, userId));
-
     if (!quota) return null;
 
     const servers = await db
@@ -77,142 +125,40 @@ export abstract class QuotaService {
       })
       .from(gameServers)
       .innerJoin(serverConfigs, eq(serverConfigs.serverId, gameServers.id))
-      .where(
-        and(
-          eq(gameServers.userId, userId),
-          ne(gameServers.currentState, "deleted"),
-          ne(gameServers.currentState, "failed"),
-        ),
-      );
-
-    let cpuUsed = 0;
-    let ramUsedMb = 0;
-    let storageUsedGb = 0;
-
-    for (const server of servers) {
-      cpuUsed += Number(server.cpuCores) || 0;
-      ramUsedMb += server.ramMb || 0;
-      storageUsedGb += server.storageGb || 0;
-    }
+      .where(and(eq(gameServers.userId, userId), ne(gameServers.currentState, "deleted")));
+    const used = servers.reduce<ResourceAllocation>(
+      (total, server) => ({
+        servers: total.servers + 1,
+        cpu: total.cpu + (Number(server.cpuCores) || 0),
+        ramMb: total.ramMb + (server.ramMb || 0),
+        storageGb: total.storageGb + (server.storageGb || 0),
+      }),
+      { servers: 0, cpu: 0, ramMb: 0, storageGb: 0 },
+    );
+    const limits: QuotaLimits = {
+      serversLimit: quota.serversLimit,
+      cpuLimit: Number(quota.cpuLimit),
+      ramLimitMb: quota.ramLimitMb,
+      storageLimitGb: quota.storageLimitGb,
+    };
+    const backupUsage = await this.getBackupUsage(userId);
 
     return {
+      plan: quota.plan,
       cpuLimit: quota.cpuLimit,
-      cpuUsed: String(cpuUsed),
-
+      cpuUsed: String(used.cpu),
       ramLimitMb: quota.ramLimitMb,
-      ramUsedMb,
-
+      ramUsedMb: used.ramMb,
       storageLimitGb: quota.storageLimitGb,
-      storageUsedGb,
-
+      storageUsedGb: used.storageGb,
       serversLimit: quota.serversLimit,
-      serversUsed: servers.length,
+      serversUsed: used.servers,
+      backupsLimit: backupUsage?.backupsLimit ?? quota.backupsLimit,
+      backupsUsed: backupUsage?.backupsUsed ?? 0,
+      overQuota:
+        allocationViolations(limits, used).length > 0 ||
+        (backupUsage?.backupsUsed ?? 0) > quota.backupsLimit,
       deploymentHeadroomReserved: await headroomHeldByUser(userId),
     };
-  }
-
-  /**
-   * Validates whether restarting a failed server would exceed quota limits.
-   * Called before transitioning a server from failed -> running state.
-   *
-   * Throws 403 status error if any limit would be exceeded.
-   * Returns silently if quota is satisfied.
-   */
-  static async validateRestartQuota(userId: string, serverId: string) {
-    // Fetch the quota limits and current usage
-    const [quota] = await db.select().from(userQuotas).where(eq(userQuotas.userId, userId));
-
-    if (!quota) throw status(404, "No quota found for this account.");
-
-    // Fetch the server being restarted (must be in failed state)
-    const [server] = await db
-      .select({
-        cpuCores: serverConfigs.cpuCores,
-        ramMb: serverConfigs.ramMb,
-        storageGb: serverConfigs.storageGb,
-      })
-      .from(gameServers)
-      .innerJoin(serverConfigs, eq(serverConfigs.serverId, gameServers.id))
-      .where(eq(gameServers.id, serverId));
-
-    if (!server) throw status(404, "Server or server configuration not found");
-
-    // Get current usage (excludes failed and deleted servers)
-    const servers = await db
-      .select({
-        cpuCores: serverConfigs.cpuCores,
-        ramMb: serverConfigs.ramMb,
-        storageGb: serverConfigs.storageGb,
-      })
-      .from(gameServers)
-      .innerJoin(serverConfigs, eq(serverConfigs.serverId, gameServers.id))
-      .where(
-        and(
-          eq(gameServers.userId, userId),
-          ne(gameServers.currentState, "deleted"),
-          ne(gameServers.currentState, "failed"),
-        ),
-      );
-
-    let cpuUsed = 0;
-    let ramUsedMb = 0;
-    let storageUsedGb = 0;
-
-    for (const srv of servers) {
-      cpuUsed += Number(srv.cpuCores) || 0;
-      ramUsedMb += srv.ramMb || 0;
-      storageUsedGb += srv.storageGb || 0;
-    }
-
-    // Get current server count (excludes failed and deleted)
-    const [serverCountResult] = await db
-      .select({
-        count: count(gameServers.id),
-      })
-      .from(gameServers)
-      .where(
-        and(
-          eq(gameServers.userId, userId),
-          ne(gameServers.currentState, "deleted"),
-          ne(gameServers.currentState, "failed"),
-        ),
-      );
-
-    const currentServersUsed = serverCountResult.count;
-
-    // Calculate projected usage if this server is restarted
-    const projectedServers = currentServersUsed + 1;
-    const projectedCpu = cpuUsed + (Number(server.cpuCores) || 0);
-    const projectedRam = ramUsedMb + server.ramMb;
-    const projectedStorage = storageUsedGb + server.storageGb;
-
-    // Validate against limits
-    if (projectedServers > quota.serversLimit) {
-      throw status(
-        403,
-        `Restarting this server would exceed your server limit. Current: ${currentServersUsed}, Limit: ${quota.serversLimit}`,
-      );
-    }
-
-    if (projectedCpu > Number(quota.cpuLimit)) {
-      throw status(
-        403,
-        `Restarting this server would exceed your CPU limit. This server requires ${server.cpuCores} cores. Current usage: ${cpuUsed}, Available: ${quota.cpuLimit}`,
-      );
-    }
-
-    if (projectedRam > quota.ramLimitMb) {
-      throw status(
-        403,
-        `Restarting this server would exceed your RAM limit. This server requires ${server.ramMb}MB. Current usage: ${ramUsedMb}MB, Available: ${quota.ramLimitMb}MB`,
-      );
-    }
-
-    if (projectedStorage > quota.storageLimitGb) {
-      throw status(
-        403,
-        `Restarting this server would exceed your storage limit. This server requires ${server.storageGb}GB. Current usage: ${storageUsedGb}GB, Available: ${quota.storageLimitGb}GB`,
-      );
-    }
   }
 }

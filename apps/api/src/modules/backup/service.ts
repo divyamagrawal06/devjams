@@ -202,36 +202,36 @@ export abstract class BackupService {
         .where(eq(gameServers.id, serverId))
         .for("update");
 
-      if (!server || server.currentState !== "running") {
+      if (server?.currentState !== "running") {
         throw status(409, "Server must be running before creating a backup");
       }
 
+      const [quota] = await tx
+        .select({ backupsLimit: userQuotas.backupsLimit })
+        .from(userQuotas)
+        .where(eq(userQuotas.userId, userId))
+        .for("update");
+      if (!quota) throw status(404, "User quota not found");
+
+      // Backup limits are account-wide, matching the quota summary and billing
+      // catalogue. Include pending work so concurrent creates cannot overbook.
       const [currentBackups] = await tx
         .select({ total: count() })
         .from(backups)
+        .innerJoin(gameServers, eq(gameServers.id, backups.serverId))
         .where(
-          and(eq(backups.serverId, serverId), notInArray(backups.status, ["deleted", "failed"])),
+          and(
+            eq(gameServers.userId, userId),
+            ne(gameServers.currentState, "deleted"),
+            notInArray(backups.status, ["deleted", "failed"]),
+          ),
         );
-
-      const [quota] = await tx
-        .select({ backupLimits: userQuotas.backupsLimit })
-        .from(userQuotas)
-        .where(eq(userQuotas.userId, userId));
-
-      /**
-       * Commented out utill quotas api is completed
-       **/
-
-      // User quota limit will be on per game server basis
-      // ex: if set to 3 means each game server can have a max of 3 backups.
-      // if(!quota){
-      //   throw status(404, "User quota not found");
-      // }
-
-      // if (currentBackups.total >= quota.backupLimits) {
-      //   // TODO: Delete old backup and create a new one without user intervention.
-      //   throw status(403, "Quota limit reached");
-      // }
+      if (currentBackups.total >= quota.backupsLimit) {
+        throw status(
+          403,
+          `Backup quota reached. This plan allows ${quota.backupsLimit} retained backups.`,
+        );
+      }
 
       const [existingPending] = await tx
         .select({ id: backups.id })
@@ -340,7 +340,7 @@ export abstract class BackupService {
         .where(eq(gameServers.id, serverId))
         .for("update");
 
-      if (!server || server.currentState !== "stopped") {
+      if (server?.currentState !== "stopped") {
         throw status(409, "Server must be stopped before restoring a backup");
       }
 

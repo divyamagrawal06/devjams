@@ -346,6 +346,9 @@ export function RuleEditor({
                 </Label>
                 <div className="space-y-2">
                   {rule.starterKitItems.map((item, idx) => (
+                    // This frozen lift models starter-kit edits by position;
+                    // changing its snapshot data shape would make the lift diverge.
+                    // biome-ignore lint/suspicious/noArrayIndexKey: positional identity is intentional in this unshipped lift
                     <div key={idx} className="flex items-center gap-2">
                       <Select
                         value={item.material}

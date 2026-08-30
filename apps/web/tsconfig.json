@@ -2,20 +2,14 @@
   "compilerOptions": {
     "strict": true,
     "target": "ES2022",
-    "lib": [
-      "dom",
-      "dom.iterable",
-      "es2022"
-    ],
+    "lib": ["dom", "dom.iterable", "es2022"],
     "jsx": "preserve",
     "module": "ESNext",
     "moduleResolution": "bundler",
     "noEmit": true,
     "skipLibCheck": true,
     "paths": {
-      "@/*": [
-        "./src/*"
-      ]
+      "@/*": ["./src/*"]
     },
     "allowJs": true,
     "incremental": true,
@@ -29,11 +23,6 @@
       }
     ]
   },
-  "include": [
-    ".next/types/**/*.ts",
-    "src"
-  ],
-  "exclude": [
-    "node_modules"
-  ]
+  "include": [".next/types/**/*.ts", "src"],
+  "exclude": ["node_modules"]
 }

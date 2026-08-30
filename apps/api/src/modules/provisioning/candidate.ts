@@ -7,6 +7,7 @@ import {
   waitForDeploymentReplicasReady,
 } from "./kubernetes";
 import {
+  artifactServiceAccountName,
   ensureTenantNamespace,
   WORLD_SYNC_NAMES,
   WORLD_SYNC_PORT,
@@ -140,8 +141,7 @@ export async function provisionCandidate(input: {
           metadata: { labels, annotations },
           spec: {
             automountServiceAccountToken: false,
-            serviceAccountName:
-              process.env.FARLANDS_ARTIFACT_SERVICE_ACCOUNT ?? "farlands-artifact-reader",
+            serviceAccountName: artifactServiceAccountName(),
             securityContext: { fsGroup: 1000, seccompProfile: { type: "RuntimeDefault" } },
             tolerations: [
               {

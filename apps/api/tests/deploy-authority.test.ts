@@ -1,9 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { contentDigest } from "@farlands/contracts";
+import { readStaticRule } from "@farlands/plugin-builder";
 import { Elysia } from "elysia";
-
-import { assertApprovedArtifactDigest } from "../src/modules/deploy/controller";
+import {
+  assertApprovedArtifactDigest,
+  rollbackTargetError,
+} from "../src/modules/deploy/controller";
 import { deployModule, ownsDeploymentTarget } from "../src/modules/deploy/http";
 
 const deployApp = new Elysia().use(deployModule);
@@ -56,11 +60,37 @@ describe("deployment authority boundary", () => {
     expect(`${controller}\n${http}`).not.toContain("approvals-stub");
   });
 
-  test("refuses any artifact whose digest differs from the reviewed digest", () => {
+  test("refuses any artifact whose digest differs from the reviewed digest", async () => {
     const approved = `sha256:${"a".repeat(64)}`;
     expect(() => assertApprovedArtifactDigest(approved, approved)).not.toThrow();
     expect(() => assertApprovedArtifactDigest(approved, `sha256:${"b".repeat(64)}`)).toThrow(
       /human-approved content digest/,
     );
+
+    const reviewedDigest = contentDigest(readStaticRule());
+    expect(reviewedDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(() => assertApprovedArtifactDigest(reviewedDigest, reviewedDigest)).not.toThrow();
+  });
+
+  test("checks rollback targets before a single-use approval is redeemed", async () => {
+    const approvedDigest = `sha256:${"a".repeat(64)}`;
+    await expect(rollbackTargetError("server-one", "7", approvedDigest, () => null)).resolves.toBe(
+      "No rollback target recorded for this server",
+    );
+    const head = {
+      currentVersion: "8",
+      currentDigest: `sha256:${"b".repeat(64)}`,
+      previousVersion: "6",
+      previousDigest: approvedDigest,
+    };
+    await expect(rollbackTargetError("server-one", "7", approvedDigest, () => head)).resolves.toBe(
+      "Rollback target does not match the recorded previous version",
+    );
+    await expect(
+      rollbackTargetError("server-one", "6", `sha256:${"c".repeat(64)}`, () => head),
+    ).resolves.toBe("Rollback digest does not match the recorded previous artifact");
+    await expect(
+      rollbackTargetError("server-one", "6", approvedDigest, () => head),
+    ).resolves.toBeNull();
   });
 });

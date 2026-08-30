@@ -1,6 +1,6 @@
 import { type DeploymentState, type DeploymentView, PRE_CUTOVER_STATES } from "@farlands/contracts";
 import { deploymentStateEvents, deployments, serverRuleHeads } from "@repo/db";
-import { and, asc, count, eq, inArray, isNull, lt, notInArray, sql } from "drizzle-orm";
+import { and, asc, count, eq, inArray, isNotNull, isNull, lt, notInArray, sql } from "drizzle-orm";
 
 import { db } from "../../db";
 
@@ -86,22 +86,19 @@ export interface DeploymentStore {
   requestAbort(id: string, requestedAt: Date): Promise<DeploymentRecord | null>;
   queuePosition(id: string): Promise<number | null>;
   claimNext(workerId: string, maxConcurrent: number, leaseMs: number): Promise<string | null>;
+  claimExpired(workerId: string, leaseMs: number): Promise<DeploymentRecord | null>;
   renewLease(id: string, workerId: string, leaseMs: number): Promise<boolean>;
   takeoverExpiredLease(id: string, workerId: string, leaseMs: number, now: Date): Promise<boolean>;
   completeQueue(id: string): Promise<void>;
   listRecoverable(): Promise<DeploymentRecord[]>;
+  listPendingCandidateCleanup(): Promise<DeploymentRecord[]>;
   findRuleHead(serverId: string): Promise<RuleHead | null>;
-  recordCutover(input: {
-    serverId: string;
-    deploymentId: string;
-    version: string;
-    digest: string;
-  }): Promise<void>;
   commitCutover(input: {
     serverId: string;
     deploymentId: string;
     version: string;
     digest: string;
+    workerId: string;
   }): Promise<DeploymentRecord>;
 }
 
@@ -325,9 +322,7 @@ export class DrizzleDeploymentStore implements DeploymentStore {
       const [active] = await tx
         .select({ value: count() })
         .from(deployments)
-        .where(
-          and(eq(deployments.queueStatus, "running"), sql`${deployments.leaseExpiresAt} > now()`),
-        );
+        .where(eq(deployments.queueStatus, "running"));
       if (Number(active?.value ?? 0) >= maxConcurrent) return null;
 
       const [candidate] = await tx
@@ -350,6 +345,42 @@ export class DrizzleDeploymentStore implements DeploymentStore {
         .where(and(eq(deployments.id, candidate.id), eq(deployments.queueStatus, "waiting")))
         .returning({ id: deployments.id });
       return claimed?.id ?? null;
+    });
+  }
+
+  async claimExpired(workerId: string, leaseMs: number): Promise<DeploymentRecord | null> {
+    return db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(1835103842)`);
+      const [candidate] = await tx
+        .select({ id: deployments.id })
+        .from(deployments)
+        .where(
+          and(
+            eq(deployments.queueStatus, "running"),
+            sql`(${deployments.leaseExpiresAt} IS NULL OR ${deployments.leaseExpiresAt} <= now())`,
+          ),
+        )
+        .orderBy(asc(deployments.queueSequence))
+        .limit(1)
+        .for("update", { skipLocked: true });
+      if (!candidate) return null;
+
+      const [claimed] = await tx
+        .update(deployments)
+        .set({
+          workerId,
+          leaseExpiresAt: sql`now() + (${leaseMs} * interval '1 millisecond')`,
+          updatedAt: sql`now()`,
+        })
+        .where(
+          and(
+            eq(deployments.id, candidate.id),
+            eq(deployments.queueStatus, "running"),
+            sql`(${deployments.leaseExpiresAt} IS NULL OR ${deployments.leaseExpiresAt} <= now())`,
+          ),
+        )
+        .returning();
+      return claimed ? toRecord(claimed) : null;
     });
   }
 
@@ -377,6 +408,7 @@ export class DrizzleDeploymentStore implements DeploymentStore {
           eq(deployments.id, id),
           eq(deployments.queueStatus, "running"),
           eq(deployments.workerId, workerId),
+          sql`${deployments.leaseExpiresAt} > now()`,
         ),
       )
       .returning({ id: deployments.id });
@@ -421,6 +453,22 @@ export class DrizzleDeploymentStore implements DeploymentStore {
     return rows.map(toRecord);
   }
 
+  async listPendingCandidateCleanup(): Promise<DeploymentRecord[]> {
+    const rows = await db
+      .select()
+      .from(deployments)
+      .where(
+        and(
+          eq(deployments.queueStatus, "complete"),
+          inArray(deployments.state, ["aborted", "failed"]),
+          isNotNull(deployments.candidatePod),
+          isNotNull(deployments.namespace),
+        ),
+      )
+      .orderBy(asc(deployments.queueSequence));
+    return rows.map(toRecord);
+  }
+
   async findRuleHead(serverId: string): Promise<RuleHead | null> {
     const row = await db.query.serverRuleHeads.findFirst({
       where: eq(serverRuleHeads.serverId, serverId),
@@ -435,36 +483,12 @@ export class DrizzleDeploymentStore implements DeploymentStore {
       : null;
   }
 
-  async recordCutover(input: {
-    serverId: string;
-    deploymentId: string;
-    version: string;
-    digest: string;
-  }): Promise<void> {
-    await db.execute(sql`
-      INSERT INTO ${serverRuleHeads} (
-        server_id, current_version, current_digest, previous_version,
-        previous_digest, current_deployment_id, updated_at
-      ) VALUES (
-        ${input.serverId}, ${input.version}, ${input.digest}, NULL,
-        NULL, ${input.deploymentId}, now()
-      )
-      ON CONFLICT (server_id) DO UPDATE SET
-        previous_version = ${serverRuleHeads.currentVersion},
-        previous_digest = ${serverRuleHeads.currentDigest},
-        current_version = excluded.current_version,
-        current_digest = excluded.current_digest,
-        current_deployment_id = excluded.current_deployment_id,
-        updated_at = now()
-      WHERE ${serverRuleHeads.currentDeploymentId} IS DISTINCT FROM excluded.current_deployment_id
-    `);
-  }
-
   async commitCutover(input: {
     serverId: string;
     deploymentId: string;
     version: string;
     digest: string;
+    workerId: string;
   }): Promise<DeploymentRecord> {
     return db.transaction(async (tx) => {
       const [current] = await tx
@@ -512,9 +536,17 @@ export class DrizzleDeploymentStore implements DeploymentStore {
       const [updated] = await tx
         .update(deployments)
         .set({ state: "draining", updatedAt: sql`now()` })
-        .where(eq(deployments.id, input.deploymentId))
+        .where(
+          and(
+            eq(deployments.id, input.deploymentId),
+            eq(deployments.state, "cutover"),
+            eq(deployments.queueStatus, "running"),
+            eq(deployments.workerId, input.workerId),
+            sql`${deployments.leaseExpiresAt} > clock_timestamp()`,
+          ),
+        )
         .returning();
-      if (!updated) throw new Error("Cutover transition could not be persisted");
+      if (!updated) throw new Error(`Deployment ${input.deploymentId} lost its cutover lease`);
       await tx.insert(deploymentStateEvents).values({
         deploymentId: input.deploymentId,
         state: "draining",
@@ -602,12 +634,7 @@ export class MemoryDeploymentStore implements DeploymentStore {
     leaseMs: number,
   ): Promise<string | null> {
     const now = this.now();
-    const active = [...this.records.values()].filter(
-      (row) =>
-        row.queueStatus === "running" &&
-        row.leaseExpiresAt !== null &&
-        new Date(row.leaseExpiresAt) > now,
-    );
+    const active = [...this.records.values()].filter((row) => row.queueStatus === "running");
     if (active.length >= maxConcurrent) return null;
     const candidate = [...this.records.values()]
       .filter((row) => row.queueStatus === "waiting")
@@ -617,6 +644,21 @@ export class MemoryDeploymentStore implements DeploymentStore {
     candidate.workerId = workerId;
     candidate.leaseExpiresAt = new Date(now.getTime() + leaseMs).toISOString();
     return candidate.id;
+  }
+
+  async claimExpired(workerId: string, leaseMs: number): Promise<DeploymentRecord | null> {
+    const now = this.now();
+    const candidate = [...this.records.values()]
+      .filter(
+        (row) =>
+          row.queueStatus === "running" &&
+          (row.leaseExpiresAt === null || new Date(row.leaseExpiresAt) <= now),
+      )
+      .sort((a, b) => a.queueSequence - b.queueSequence)[0];
+    if (!candidate) return null;
+    candidate.workerId = workerId;
+    candidate.leaseExpiresAt = new Date(now.getTime() + leaseMs).toISOString();
+    return { ...candidate };
   }
 
   async completeQueue(id: string): Promise<void> {
@@ -629,7 +671,14 @@ export class MemoryDeploymentStore implements DeploymentStore {
 
   async renewLease(id: string, workerId: string, leaseMs: number): Promise<boolean> {
     const record = this.records.get(id);
-    if (record?.queueStatus !== "running" || record.workerId !== workerId) return false;
+    if (
+      record?.queueStatus !== "running" ||
+      record.workerId !== workerId ||
+      record.leaseExpiresAt === null ||
+      new Date(record.leaseExpiresAt) <= this.now()
+    ) {
+      return false;
+    }
     record.leaseExpiresAt = new Date(this.now().getTime() + leaseMs).toISOString();
     return true;
   }
@@ -664,25 +713,21 @@ export class MemoryDeploymentStore implements DeploymentStore {
       .map((row) => ({ ...row }));
   }
 
-  async findRuleHead(serverId: string): Promise<RuleHead | null> {
-    return this.heads.get(serverId) ?? null;
+  async listPendingCandidateCleanup(): Promise<DeploymentRecord[]> {
+    return [...this.records.values()]
+      .filter(
+        (row) =>
+          row.queueStatus === "complete" &&
+          (row.state === "aborted" || row.state === "failed") &&
+          row.candidatePod !== null &&
+          row.namespace !== null,
+      )
+      .sort((a, b) => a.queueSequence - b.queueSequence)
+      .map((row) => ({ ...row }));
   }
 
-  async recordCutover(input: {
-    serverId: string;
-    deploymentId: string;
-    version: string;
-    digest: string;
-  }): Promise<void> {
-    if (this.headDeploymentIds.get(input.serverId) === input.deploymentId) return;
-    const current = this.heads.get(input.serverId);
-    this.heads.set(input.serverId, {
-      currentVersion: input.version,
-      currentDigest: input.digest,
-      previousVersion: current?.currentVersion ?? null,
-      previousDigest: current?.currentDigest ?? null,
-    });
-    this.headDeploymentIds.set(input.serverId, input.deploymentId);
+  async findRuleHead(serverId: string): Promise<RuleHead | null> {
+    return this.heads.get(serverId) ?? null;
   }
 
   async commitCutover(input: {
@@ -690,6 +735,7 @@ export class MemoryDeploymentStore implements DeploymentStore {
     deploymentId: string;
     version: string;
     digest: string;
+    workerId: string;
   }): Promise<DeploymentRecord> {
     const record = this.records.get(input.deploymentId);
     if (!record) throw new Error(`Unknown deployment ${input.deploymentId}`);
@@ -707,7 +753,24 @@ export class MemoryDeploymentStore implements DeploymentStore {
     if (record.state !== "cutover" || !record.routeSwitched || record.lobbyPlayers.length > 0) {
       throw new Error("Cutover cannot commit before route and roster handoff complete");
     }
-    await this.recordCutover(input);
+    if (
+      record.queueStatus !== "running" ||
+      record.workerId !== input.workerId ||
+      record.leaseExpiresAt === null ||
+      new Date(record.leaseExpiresAt) <= this.now()
+    ) {
+      throw new Error(`Deployment ${input.deploymentId} lost its cutover lease`);
+    }
+    if (this.headDeploymentIds.get(input.serverId) !== input.deploymentId) {
+      const current = this.heads.get(input.serverId);
+      this.heads.set(input.serverId, {
+        currentVersion: input.version,
+        currentDigest: input.digest,
+        previousVersion: current?.currentVersion ?? null,
+        previousDigest: current?.currentDigest ?? null,
+      });
+      this.headDeploymentIds.set(input.serverId, input.deploymentId);
+    }
     record.state = "draining";
     this.events.push({
       deploymentId: input.deploymentId,

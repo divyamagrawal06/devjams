@@ -102,7 +102,7 @@ export class DrizzleTransferStore implements TransferStore {
         .update(velocityTransfers)
         .set({
           status: "pending",
-          attempts: 0,
+          attempts: sql`${velocityTransfers.attempts} + 1`,
           ack: null,
           expiresAt: new Date(record.expiresAt),
           acknowledgedAt: null,
@@ -124,10 +124,9 @@ export class DrizzleTransferStore implements TransferStore {
         and(eq(velocityTransfers.status, "pending"), sql`${velocityTransfers.expiresAt} <= ${now}`),
       );
     const rows = await db
-      .update(velocityTransfers)
-      .set({ attempts: sql`${velocityTransfers.attempts} + 1`, updatedAt: sql`now()` })
-      .where(and(eq(velocityTransfers.status, "pending"), gt(velocityTransfers.expiresAt, now)))
-      .returning();
+      .select()
+      .from(velocityTransfers)
+      .where(and(eq(velocityTransfers.status, "pending"), gt(velocityTransfers.expiresAt, now)));
     return rows.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()).map(toRecord);
   }
 
@@ -183,8 +182,8 @@ export class MemoryTransferStore implements TransferStore {
       assertSameTransfer(existing, record);
       if (canRetry(existing)) {
         existing.status = "pending";
-        existing.attempt = 0;
-        existing.attempts = 0;
+        existing.attempts += 1;
+        existing.attempt = existing.attempts;
         existing.ack = null;
         existing.expiresAt = record.expiresAt;
         existing.acknowledgedAt = null;
@@ -204,8 +203,6 @@ export class MemoryTransferStore implements TransferStore {
         record.status = "expired";
         continue;
       }
-      record.attempts += 1;
-      record.attempt = record.attempts;
       pending.push(structuredClone(record));
     }
     return pending.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
@@ -285,9 +282,9 @@ export class TransferService {
       players: sourcePlayers,
       sourcePlayers,
       expiresAt: new Date(now.getTime() + expiresInMs).toISOString(),
-      attempt: 0,
+      attempt: 1,
       status: "pending",
-      attempts: 0,
+      attempts: 1,
       ack: null,
       acknowledgedAt: null,
       createdAt: now.toISOString(),

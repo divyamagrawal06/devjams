@@ -1,6 +1,7 @@
 import { Elysia } from "elysia";
 import z from "zod";
 import { AuthService } from "../auth/service";
+import { ServerService } from "../servers/service";
 import { BackupModel } from "./model";
 import { BackupService } from "./service";
 
@@ -24,6 +25,19 @@ export const BackupModule = new Elysia({ prefix: "/backups" })
     async ({ params: { serverId }, userId }) => {
       const backups = await BackupService.getAllByServer(userId, serverId);
       return { success: true, data: backups };
+    },
+    { params: serverParams },
+  )
+
+  .get(
+    "/schedule",
+    async ({ params: { serverId }, userId, set }) => {
+      await ServerService.requireOwnership(userId, serverId);
+      set.status = 503;
+      return {
+        success: false,
+        error: "Backup scheduling is not configured for this server.",
+      };
     },
     { params: serverParams },
   )

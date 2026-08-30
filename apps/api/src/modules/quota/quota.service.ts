@@ -2,6 +2,10 @@ import { backups, gameServers, serverConfigs, userQuotas } from "@repo/db";
 import { and, eq, ne, sql } from "drizzle-orm";
 import { status } from "elysia";
 import { db, type TransactionType } from "../../db";
+import {
+  reconcileTimeBoundEntitlement,
+  reconcileTimeBoundEntitlementInTransaction,
+} from "../billing/reconciliation";
 import { headroomHeldByUser } from "./headroom";
 
 export type QuotaLimits = {
@@ -42,6 +46,30 @@ export function assertAllocationFits(limits: QuotaLimits, projected: ResourceAll
   if (first) allocationError(first, limits);
 }
 
+async function readBackupUsage(userId: string) {
+  const [result] = await db
+    .select({
+      backupsLimit: userQuotas.backupsLimit,
+      backupsUsed: sql`COUNT(DISTINCT ${backups.id})`.mapWith(Number),
+    })
+    .from(userQuotas)
+    .leftJoin(
+      gameServers,
+      and(eq(gameServers.userId, userQuotas.userId), ne(gameServers.currentState, "deleted")),
+    )
+    .leftJoin(
+      backups,
+      and(
+        eq(backups.serverId, gameServers.id),
+        ne(backups.status, "deleted"),
+        ne(backups.status, "failed"),
+      ),
+    )
+    .where(eq(userQuotas.userId, userId))
+    .groupBy(userQuotas.userId, userQuotas.backupsLimit);
+  return result ?? null;
+}
+
 export abstract class QuotaService {
   /**
    * Locks the owner's quota projection and measures every non-deleted workload.
@@ -49,6 +77,7 @@ export abstract class QuotaService {
    * cannot disappear from admission accounting.
    */
   static async getResourceLimits(userId: string, tx: TransactionType) {
+    await reconcileTimeBoundEntitlementInTransaction(userId, new Date(), tx);
     const [quota] = await tx
       .select()
       .from(userQuotas)
@@ -90,30 +119,12 @@ export abstract class QuotaService {
   }
 
   static async getBackupUsage(userId: string) {
-    const [result] = await db
-      .select({
-        backupsLimit: userQuotas.backupsLimit,
-        backupsUsed: sql`COUNT(DISTINCT ${backups.id})`.mapWith(Number),
-      })
-      .from(userQuotas)
-      .leftJoin(
-        gameServers,
-        and(eq(gameServers.userId, userQuotas.userId), ne(gameServers.currentState, "deleted")),
-      )
-      .leftJoin(
-        backups,
-        and(
-          eq(backups.serverId, gameServers.id),
-          ne(backups.status, "deleted"),
-          ne(backups.status, "failed"),
-        ),
-      )
-      .where(eq(userQuotas.userId, userId))
-      .groupBy(userQuotas.userId, userQuotas.backupsLimit);
-    return result ?? null;
+    await reconcileTimeBoundEntitlement(userId);
+    return readBackupUsage(userId);
   }
 
   static async getResourceUsage(userId: string) {
+    await reconcileTimeBoundEntitlement(userId);
     const [quota] = await db.select().from(userQuotas).where(eq(userQuotas.userId, userId));
     if (!quota) return null;
 
@@ -141,7 +152,7 @@ export abstract class QuotaService {
       ramLimitMb: quota.ramLimitMb,
       storageLimitGb: quota.storageLimitGb,
     };
-    const backupUsage = await this.getBackupUsage(userId);
+    const backupUsage = await readBackupUsage(userId);
 
     return {
       plan: quota.plan,

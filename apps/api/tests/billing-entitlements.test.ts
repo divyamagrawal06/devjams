@@ -9,7 +9,11 @@ import {
   quotaValuesForPlan,
   readBillingConfig,
 } from "../src/modules/billing/config";
-import { checkoutDisposition, webhookBindingValid } from "../src/modules/billing/policy";
+import {
+  checkoutDisposition,
+  subscriptionWebhookBindingValid,
+  webhookBindingValid,
+} from "../src/modules/billing/policy";
 import {
   decideSubscriptionProjection,
   effectivePlan,
@@ -21,6 +25,7 @@ import {
   ProviderDefinitiveError,
   ProviderUncertainError,
 } from "../src/modules/billing/provider";
+import { timeBoundEntitlementHasEnded } from "../src/modules/billing/reconciliation";
 import { verifyBillingWebhook } from "../src/modules/billing/webhook";
 
 const products = { standard: "prod_standard", pro: "prod_pro" } as const;
@@ -149,6 +154,44 @@ describe("checkout idempotency and provider boundary", () => {
     expect(
       webhookBindingValid({ ...base, checkout: { ...base.checkout, state: "uncertain" } }),
     ).toBe(true);
+  });
+
+  test("accepts portal plan changes only against the exact durable provider binding", () => {
+    const binding = {
+      userId: "owner",
+      suppliedUserId: "owner",
+      mappedPlan: "pro" as const,
+      providerSubscriptionId: "sub_owner",
+      providerCustomerId: "cus_owner",
+      subscription: {
+        userId: "owner",
+        providerSubscriptionId: "sub_owner",
+        providerCustomerId: "cus_owner",
+      },
+    };
+    expect(subscriptionWebhookBindingValid(binding)).toBe(true);
+    expect(subscriptionWebhookBindingValid({ ...binding, suppliedUserId: null })).toBe(true);
+    expect(subscriptionWebhookBindingValid({ ...binding, suppliedUserId: "attacker" })).toBe(false);
+    expect(
+      subscriptionWebhookBindingValid({ ...binding, providerSubscriptionId: "sub_attacker" }),
+    ).toBe(false);
+    expect(
+      subscriptionWebhookBindingValid({ ...binding, providerCustomerId: "cus_attacker" }),
+    ).toBe(false);
+
+    const prior = applied(eventBase);
+    expect(
+      decideSubscriptionProjection(
+        {
+          ...eventBase,
+          eventId: "evt_portal_upgrade",
+          occurredAt: new Date("2026-08-30T13:00:00.000Z"),
+          plan: "pro",
+          providerProductId: products.pro,
+        },
+        { alreadyProcessed: false, bindingValid: true, prior },
+      ),
+    ).toMatchObject({ outcome: "applied", projection: { plan: "pro" } });
   });
 
   test("sends owner metadata to hosted checkout and accepts only provider HTTPS redirects", async () => {
@@ -365,6 +408,43 @@ describe("signed webhook parsing and projection", () => {
       expect(projection.entitlementState).toBe("starter");
       expect(effectivePlan(projection, now)).toBe("starter");
     }
+  });
+
+  test("expires grace and scheduled cancellation at the admission boundary", () => {
+    const boundary = new Date("2026-09-01T00:00:00.000Z");
+    const grace = {
+      entitlementState: "grace",
+      status: "on_hold",
+      cancelAtNextBillingDate: false,
+      nextBillingDate: null,
+      graceUntil: boundary,
+    };
+    expect(timeBoundEntitlementHasEnded(grace, new Date(boundary.getTime() - 1))).toBe(false);
+    expect(timeBoundEntitlementHasEnded(grace, boundary)).toBe(true);
+
+    const cancellation = {
+      entitlementState: "active",
+      status: "cancelled",
+      cancelAtNextBillingDate: true,
+      nextBillingDate: boundary,
+      graceUntil: null,
+    };
+    expect(timeBoundEntitlementHasEnded(cancellation, new Date(boundary.getTime() - 1))).toBe(
+      false,
+    );
+    expect(timeBoundEntitlementHasEnded(cancellation, boundary)).toBe(true);
+
+    const quotaService = readFileSync(
+      join(import.meta.dir, "..", "src", "modules", "quota", "quota.service.ts"),
+      "utf8",
+    );
+    const backupService = readFileSync(
+      join(import.meta.dir, "..", "src", "modules", "backup", "service.ts"),
+      "utf8",
+    );
+    expect(quotaService).toContain("reconcileTimeBoundEntitlementInTransaction");
+    expect(quotaService).toContain("await reconcileTimeBoundEntitlement(userId)");
+    expect(backupService).toContain("reconcileTimeBoundEntitlementInTransaction(userId");
   });
 
   test("migration stores only a payload digest and protects owner-bound rows", () => {

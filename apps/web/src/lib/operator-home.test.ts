@@ -7,6 +7,7 @@ import {
   shouldClearPowerRequestKey,
 } from "../components/operator-home";
 import type { QuotaUsage } from "./api";
+import { operatorReceiptOutcome } from "./operator-receipts";
 
 const quota: QuotaUsage = {
   plan: "standard",
@@ -64,6 +65,14 @@ describe("Operator Home safety helpers", () => {
   test("retains an idempotency key until a control receipt is completed", () => {
     expect(shouldClearPowerRequestKey("accepted")).toBe(false);
     expect(shouldClearPowerRequestKey("failed")).toBe(false);
+    expect(shouldClearPowerRequestKey("refused")).toBe(false);
     expect(shouldClearPowerRequestKey("completed")).toBe(true);
+    expect(operatorReceiptOutcome("accepted")).toMatchObject({ pending: true, completed: false });
+    expect(operatorReceiptOutcome("failed")).toMatchObject({ retryable: true, completed: false });
+    expect(operatorReceiptOutcome("refused")).toMatchObject({ retryable: true, completed: false });
+    expect(operatorReceiptOutcome("completed")).toMatchObject({
+      clearRequestKey: true,
+      completed: true,
+    });
   });
 });

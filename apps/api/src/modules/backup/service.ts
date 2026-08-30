@@ -2,6 +2,7 @@ import { backupLogs, backups, gameServers, serverK8s, userQuotas } from "@repo/d
 import { and, count, desc, eq, inArray, ne, notInArray } from "drizzle-orm";
 import { status } from "elysia";
 import { db } from "../../db";
+import { reconcileTimeBoundEntitlementInTransaction } from "../billing/reconciliation";
 import { ServerService } from "../servers/service";
 import { resolveBackupStorageConfig } from "./config";
 import {
@@ -206,6 +207,7 @@ export abstract class BackupService {
         throw status(409, "Server must be running before creating a backup");
       }
 
+      await reconcileTimeBoundEntitlementInTransaction(userId, new Date(), tx);
       const [quota] = await tx
         .select({ backupsLimit: userQuotas.backupsLimit })
         .from(userQuotas)

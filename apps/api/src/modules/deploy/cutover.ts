@@ -164,10 +164,8 @@ function freezeJobBody(row: DeploymentRecord, saveOnOnly: boolean): k8s.V1Job {
                 },
                 { name: "WORLD_SYNC_PHASE", value: "delta" },
                 {
-                  name: "WORLD_SYNC_SINCE",
-                  value: saveOnOnly
-                    ? "1970-01-01T00:00:00.000Z"
-                    : checkpoint(row, "presyncCompletedAt"),
+                  name: "WORLD_SYNC_SINCE_FILE",
+                  value: saveOnOnly ? "/dev/null" : "/data/.farlands-presync-complete",
                 },
               ],
               resources: {

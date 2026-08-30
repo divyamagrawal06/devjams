@@ -1,3 +1,5 @@
+import { SESSION_INVALIDATED_EVENT } from "./session-lifecycle";
+
 export type LiveServer = {
   id: string;
   name: string;
@@ -269,6 +271,9 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     },
   });
   if (!response.ok) {
+    if (response.status === 401 && typeof window !== "undefined") {
+      window.dispatchEvent(new Event(SESSION_INVALIDATED_EVENT));
+    }
     throw await parseApiError(response);
   }
   if (response.status === 204) {

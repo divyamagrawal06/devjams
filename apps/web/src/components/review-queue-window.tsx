@@ -33,9 +33,13 @@ function timestamp(value: string) {
 }
 
 export function ReviewQueueWindow({
+  controlMessage,
+  controlsAvailable,
   onSelectChange,
   selectedChangeId,
 }: {
+  controlMessage: string;
+  controlsAvailable: boolean;
   onSelectChange: (id: string) => void;
   selectedChangeId: string | null;
 }) {
@@ -43,6 +47,12 @@ export function ReviewQueueWindow({
   const [reviewConfirmed, setReviewConfirmed] = useState(false);
   const [rejecting, setRejecting] = useState(false);
   const [rejectionReason, setRejectionReason] = useState("");
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const interval = window.setInterval(() => setNow(Date.now()), 5_000);
+    return () => window.clearInterval(interval);
+  }, []);
 
   const changes = useQuery<ChangeListResponse>({
     queryKey: ["changes"],
@@ -78,6 +88,11 @@ export function ReviewQueueWindow({
         : 15_000,
     retry: 1,
   });
+  const detailFresh = detail.dataUpdatedAt > 0 && now - detail.dataUpdatedAt <= 30_000;
+  const reviewControlsAvailable = controlsAvailable && detailFresh;
+  const reviewControlMessage = controlsAvailable
+    ? "Review evidence is stale — refresh the exact envelope before deciding."
+    : controlMessage;
 
   const refresh = async () => {
     await queryClient.invalidateQueries({ queryKey: ["changes"] });
@@ -195,6 +210,11 @@ export function ReviewQueueWindow({
       </aside>
 
       <section className="review-detail" aria-live="polite">
+        {!reviewControlsAvailable && selected ? (
+          <div className="control-truth-banner" role="status">
+            <CircleAlert aria-hidden="true" size={17} /> {reviewControlMessage}
+          </div>
+        ) : null}
         {detail.isPending ? (
           <div className="query-state" role="status">
             <FileJson2 aria-hidden="true" size={25} />
@@ -314,7 +334,9 @@ export function ReviewQueueWindow({
                       </button>
                       <button
                         className="operation-danger-action"
-                        disabled={!rejectionReason.trim() || reject.isPending}
+                        disabled={
+                          !reviewControlsAvailable || !rejectionReason.trim() || reject.isPending
+                        }
                         onClick={() =>
                           reject.mutate({ id: selected.id, reason: rejectionReason.trim() })
                         }
@@ -329,7 +351,7 @@ export function ReviewQueueWindow({
                   <div className="review-actions">
                     <button
                       className="operation-danger-action"
-                      disabled={approve.isPending}
+                      disabled={!reviewControlsAvailable || approve.isPending}
                       onClick={() => setRejecting(true)}
                       type="button"
                     >
@@ -337,7 +359,7 @@ export function ReviewQueueWindow({
                     </button>
                     <button
                       className="operation-primary-action"
-                      disabled={!reviewConfirmed || approve.isPending}
+                      disabled={!reviewControlsAvailable || !reviewConfirmed || approve.isPending}
                       onClick={() =>
                         approve.mutate({ id: selected.id, digest: selected.artifactDigest })
                       }

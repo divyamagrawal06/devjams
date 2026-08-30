@@ -19,7 +19,7 @@ import {
   ShieldCheck,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   api,
@@ -135,16 +135,64 @@ function Modal({
   label: string;
   onClose: () => void;
 }) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const onCloseRef = useRef(onClose);
+
   useEffect(() => {
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
+    onCloseRef.current = onClose;
   }, [onClose]);
+
+  useEffect(() => {
+    const previousFocus =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusable = () => [
+      ...(dialogRef.current?.querySelectorAll<HTMLElement>(
+        "button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href]",
+      ) ?? []),
+    ];
+    const animationFrame = window.requestAnimationFrame(() => {
+      (focusable()[0] ?? dialogRef.current)?.focus();
+    });
+    const handleKeys = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusable();
+      if (!items.length) {
+        event.preventDefault();
+        dialogRef.current?.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items.at(-1);
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", handleKeys);
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      window.removeEventListener("keydown", handleKeys);
+      previousFocus?.focus();
+    };
+  }, []);
   return (
     <div className="operator-modal-backdrop">
-      <section aria-label={label} aria-modal="true" className="operator-modal" role="dialog">
+      <section
+        aria-label={label}
+        aria-modal="true"
+        className="operator-modal"
+        ref={dialogRef}
+        role="dialog"
+        tabIndex={-1}
+      >
         <button
           aria-label={`Close ${label}`}
           className="operator-modal-close"
@@ -160,10 +208,12 @@ function Modal({
 }
 
 function OnboardingDialog({
+  controlsAvailable,
   onClose,
   onCreated,
   quota,
 }: {
+  controlsAvailable: boolean;
   onClose: () => void;
   onCreated: (message: string) => void;
   quota: QuotaUsage | null;
@@ -187,6 +237,7 @@ function OnboardingDialog({
   const selectedRuntime = kind?.runtimes.find((entry) => entry.id === runtime);
   const quotaIssues = projectedQuotaIssues(quota, { cpuCores, ramMb, storageGb });
   const invalid =
+    !controlsAvailable ||
     !kind?.available ||
     name.trim().length < 3 ||
     !/^\d{1,2}\.\d{1,2}(?:\.\d{1,2})?$/.test(version) ||
@@ -244,6 +295,14 @@ function OnboardingDialog({
         <div className="operator-inline-error" role="alert">
           <CircleAlert size={18} />
           <span>Capability catalogue unavailable. No workload can be submitted safely.</span>
+        </div>
+      ) : null}
+      {!controlsAvailable ? (
+        <div className="operator-inline-error" role="status">
+          <ShieldCheck size={18} />
+          <span>
+            Live control state is not fresh. Provisioning is locked until refresh succeeds.
+          </span>
         </div>
       ) : null}
 
@@ -410,7 +469,15 @@ function OnboardingDialog({
   );
 }
 
-function MaintenanceDialog({ onClose, server }: { onClose: () => void; server: LiveServer }) {
+function MaintenanceDialog({
+  controlsAvailable,
+  onClose,
+  server,
+}: {
+  controlsAvailable: boolean;
+  onClose: () => void;
+  server: LiveServer;
+}) {
   const queryClient = useQueryClient();
   const earliest = new Date(Date.now() + 6 * 60_000);
   earliest.setSeconds(0, 0);
@@ -447,11 +514,17 @@ function MaintenanceDialog({ onClose, server }: { onClose: () => void; server: L
           This creates a visible planning record. It does not execute or auto-approve any action.
         </p>
       </div>
+      {!controlsAvailable ? (
+        <div className="operator-inline-error" role="status">
+          <ShieldCheck size={18} />
+          <span>Live control state is not fresh. Scheduling is locked until refresh succeeds.</span>
+        </div>
+      ) : null}
       <form
         className="onboarding-form"
         onSubmit={(event) => {
           event.preventDefault();
-          schedule.mutate();
+          if (controlsAvailable) schedule.mutate();
         }}
       >
         <div className="onboarding-fields">
@@ -509,7 +582,7 @@ function MaintenanceDialog({ onClose, server }: { onClose: () => void; server: L
           </button>
           <button
             className="billing-primary-action"
-            disabled={reason.trim().length < 3 || schedule.isPending}
+            disabled={!controlsAvailable || reason.trim().length < 3 || schedule.isPending}
             type="submit"
           >
             Schedule window
@@ -520,7 +593,13 @@ function MaintenanceDialog({ onClose, server }: { onClose: () => void; server: L
   );
 }
 
-function NotificationSettings({ preferences }: { preferences: NotificationPreferences }) {
+function NotificationSettings({
+  controlsAvailable,
+  preferences,
+}: {
+  controlsAvailable: boolean;
+  preferences: NotificationPreferences;
+}) {
   const queryClient = useQueryClient();
   const [form, setForm] = useState(preferences);
   const save = useMutation({
@@ -542,6 +621,11 @@ function NotificationSettings({ preferences }: { preferences: NotificationPrefer
       <p>
         These preferences affect the in-app inbox only. Email and push delivery are not connected.
       </p>
+      {!controlsAvailable ? (
+        <p className="operator-muted" role="status">
+          Live control state is not fresh. Saving is locked until refresh succeeds.
+        </p>
+      ) : null}
       <div className="notification-grid">
         {toggles.map(([field, label]) => (
           <label key={field}>
@@ -568,8 +652,10 @@ function NotificationSettings({ preferences }: { preferences: NotificationPrefer
       </div>
       <button
         className="billing-secondary-action"
-        disabled={save.isPending}
-        onClick={() => save.mutate()}
+        disabled={!controlsAvailable || save.isPending}
+        onClick={() => {
+          if (controlsAvailable) save.mutate();
+        }}
         type="button"
       >
         {save.isPending ? "Saving…" : "Save preferences"}
@@ -705,6 +791,7 @@ export function OperatorHome({
           </button>
           <button
             className="billing-primary-action"
+            disabled={freshness.stale}
             onClick={() => setOnboardingOpen(true)}
             type="button"
           >
@@ -762,6 +849,7 @@ export function OperatorHome({
           </p>
           <button
             className="billing-primary-action"
+            disabled={freshness.stale}
             onClick={() => setOnboardingOpen(true)}
             type="button"
           >
@@ -842,6 +930,7 @@ export function OperatorHome({
                   </button>
                   <button
                     className="operator-control"
+                    disabled={controlsDisabled}
                     onClick={() => setMaintenanceServer(server)}
                     type="button"
                   >
@@ -889,7 +978,7 @@ export function OperatorHome({
                   </div>
                   <button
                     aria-label={`Cancel maintenance for ${serverNames.get(window.serverId) ?? "workload"}`}
-                    disabled={cancelMaintenance.isPending}
+                    disabled={controlsDisabled || cancelMaintenance.isPending}
                     onClick={() => cancelMaintenance.mutate(window.id)}
                     type="button"
                   >
@@ -962,6 +1051,7 @@ export function OperatorHome({
 
       {operator.data ? (
         <NotificationSettings
+          controlsAvailable={!freshness.stale}
           key={JSON.stringify(operator.data.data.notificationPreferences)}
           preferences={operator.data.data.notificationPreferences}
         />
@@ -969,13 +1059,18 @@ export function OperatorHome({
 
       {onboardingOpen ? (
         <OnboardingDialog
+          controlsAvailable={!freshness.stale}
           onClose={() => setOnboardingOpen(false)}
           onCreated={setNotice}
           quota={quota}
         />
       ) : null}
       {maintenanceServer ? (
-        <MaintenanceDialog onClose={() => setMaintenanceServer(null)} server={maintenanceServer} />
+        <MaintenanceDialog
+          controlsAvailable={!freshness.stale}
+          onClose={() => setMaintenanceServer(null)}
+          server={maintenanceServer}
+        />
       ) : null}
       {confirmation ? (
         <Modal
@@ -1002,9 +1097,12 @@ export function OperatorHome({
             </button>
             <button
               className="danger-action"
+              disabled={controlsDisabled}
               onClick={() => {
-                action.mutate(confirmation);
-                setConfirmation(null);
+                if (!controlsDisabled) {
+                  action.mutate(confirmation);
+                  setConfirmation(null);
+                }
               }}
               type="button"
             >

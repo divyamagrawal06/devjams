@@ -35,6 +35,8 @@ import {
 const RESTORE_CONFIRMATION = "RESTORE_BACKUP_DISCARDS_NEWER_DATA";
 
 type BackupsWindowProps = {
+  controlMessage: string;
+  controlsAvailable: boolean;
   onRetryServers: () => void;
   onSelectServer: (serverId: string) => void;
   selectedServerId: string | null;
@@ -72,6 +74,8 @@ function BackupLoadingRows() {
 }
 
 export function BackupsWindow({
+  controlMessage,
+  controlsAvailable,
   onRetryServers,
   onSelectServer,
   selectedServerId,
@@ -84,6 +88,12 @@ export function BackupsWindow({
   const [deleteBackupId, setDeleteBackupId] = useState<string | null>(null);
   const [restoreAcknowledged, setRestoreAcknowledged] = useState(false);
   const [announcement, setAnnouncement] = useState("");
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const interval = window.setInterval(() => setNow(Date.now()), 5_000);
+    return () => window.clearInterval(interval);
+  }, []);
 
   const selectedServer = useMemo(
     () => servers.find((server) => server.id === selectedServerId) ?? servers[0] ?? null,
@@ -125,6 +135,11 @@ export function BackupsWindow({
     refetchInterval: 60_000,
     retry: 1,
   });
+  const backupListFresh = backups.dataUpdatedAt > 0 && now - backups.dataUpdatedAt <= 35_000;
+  const recoveryControlsAvailable = controlsAvailable && backupListFresh;
+  const recoveryControlMessage = controlsAvailable
+    ? "Backup history is stale — refresh it before using recovery controls."
+    : controlMessage;
 
   const refreshBackups = async (changedServerId: string) => {
     await queryClient.invalidateQueries({ queryKey: ["backups", changedServerId] });
@@ -250,7 +265,11 @@ export function BackupsWindow({
   const serverCanStop = selectedServer.currentState === "running";
   const stopWasRequested = stopRealm.isSuccess && stopRealm.variables === selectedServer.id;
   const createDisabled =
-    !serverRunning || Boolean(busyBackup) || createBackup.isPending || stopRealm.isPending;
+    !recoveryControlsAvailable ||
+    !serverRunning ||
+    Boolean(busyBackup) ||
+    createBackup.isPending ||
+    stopRealm.isPending;
   const actionError =
     createBackup.error ?? stopRealm.error ?? restoreBackup.error ?? deleteBackup.error;
   const scheduleData = schedule.data?.data;
@@ -265,6 +284,12 @@ export function BackupsWindow({
           data only; live-rule rollback is a separate operation in the Trust Ledger.
         </p>
       </div>
+
+      {!recoveryControlsAvailable ? (
+        <div className="control-truth-banner" role="status">
+          <CircleAlert aria-hidden="true" size={17} /> {recoveryControlMessage}
+        </div>
+      ) : null}
 
       <div className="recovery-scope-grid">
         <article>
@@ -535,7 +560,11 @@ export function BackupsWindow({
                     <button
                       aria-label={`Restore ${backup.name}`}
                       className="backup-secondary-action"
-                      disabled={!completed || restoreMutationBusy(restoreBackup, deleteBackup)}
+                      disabled={
+                        !recoveryControlsAvailable ||
+                        !completed ||
+                        restoreMutationBusy(restoreBackup, deleteBackup)
+                      }
                       onClick={() => {
                         resetActionFeedback();
                         setDeleteBackupId(null);
@@ -549,7 +578,11 @@ export function BackupsWindow({
                     <button
                       aria-label={`Delete ${backup.name}`}
                       className="backup-secondary-action danger"
-                      disabled={busy || restoreMutationBusy(restoreBackup, deleteBackup)}
+                      disabled={
+                        !recoveryControlsAvailable ||
+                        busy ||
+                        restoreMutationBusy(restoreBackup, deleteBackup)
+                      }
                       onClick={() => {
                         resetActionFeedback();
                         setRestoreBackupId(null);
@@ -584,7 +617,12 @@ export function BackupsWindow({
                           </p>
                           <button
                             className="backup-stop-action"
-                            disabled={!serverCanStop || stopRealm.isPending || stopWasRequested}
+                            disabled={
+                              !recoveryControlsAvailable ||
+                              !serverCanStop ||
+                              stopRealm.isPending ||
+                              stopWasRequested
+                            }
                             onClick={() => {
                               resetActionFeedback();
                               setRestoreBackupId(backup.id);
@@ -617,7 +655,9 @@ export function BackupsWindow({
                           <div className="backup-confirmation-actions">
                             <button
                               className="backup-danger-action"
-                              disabled={!restoreAcknowledged || restorePending}
+                              disabled={
+                                !recoveryControlsAvailable || !restoreAcknowledged || restorePending
+                              }
                               onClick={() =>
                                 restoreBackup.mutate({
                                   backupId: backup.id,
@@ -663,7 +703,7 @@ export function BackupsWindow({
                       <div className="backup-confirmation-actions">
                         <button
                           className="backup-danger-action"
-                          disabled={deletePending}
+                          disabled={!recoveryControlsAvailable || deletePending}
                           onClick={() =>
                             deleteBackup.mutate({
                               backupId: backup.id,

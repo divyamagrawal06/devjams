@@ -20,7 +20,15 @@ function timestamp(value: string) {
   }).format(new Date(value));
 }
 
-export function TrustLedgerWindow({ servers }: { servers: LiveServer[] }) {
+export function TrustLedgerWindow({
+  controlMessage,
+  controlsAvailable,
+  servers,
+}: {
+  controlMessage: string;
+  controlsAvailable: boolean;
+  servers: LiveServer[];
+}) {
   const [serverId, setServerId] = useState(servers[0]?.id ?? "");
   const [events, setEvents] = useState<ControlPlaneEvent[]>([]);
   const [streamState, setStreamState] = useState<StreamState>("connecting");
@@ -36,7 +44,10 @@ export function TrustLedgerWindow({ servers }: { servers: LiveServer[] }) {
   }, [serverId, servers]);
 
   useEffect(() => {
-    if (!selectedId) return;
+    if (!selectedId || !controlsAvailable) {
+      setStreamState("reconnecting");
+      return;
+    }
     setEvents([]);
     setStreamState("connecting");
     const source = new EventSource(
@@ -54,7 +65,7 @@ export function TrustLedgerWindow({ servers }: { servers: LiveServer[] }) {
     source.onopen = () => setStreamState("live");
     source.onerror = () => setStreamState("reconnecting");
     return () => source.close();
-  }, [generation, selectedId]);
+  }, [controlsAvailable, generation, selectedId]);
 
   if (!selected) {
     return (
@@ -78,6 +89,13 @@ export function TrustLedgerWindow({ servers }: { servers: LiveServer[] }) {
           names, and world activity are not part of this stream.
         </p>
       </div>
+
+      {!controlsAvailable ? (
+        <div className="control-truth-banner" role="status">
+          <CircleAlert aria-hidden="true" size={17} /> {controlMessage} Showing replayed receipts
+          only.
+        </div>
+      ) : null}
 
       <div className="ledger-toolbar">
         <label>

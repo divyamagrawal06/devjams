@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import localFont from "next/font/local";
 import { headers } from "next/headers";
 import type { ReactNode } from "react";
 
@@ -7,6 +8,13 @@ import { getAuth } from "@/lib/auth";
 
 import "./globals.css";
 import { Providers } from "./providers";
+
+const monocraft = localFont({
+  display: "swap",
+  preload: true,
+  src: "../../public/fonts/Monocraft.ttf",
+  variable: "--font-monocraft",
+});
 
 export const dynamic = "force-dynamic";
 
@@ -28,7 +36,7 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
   }
 
   return (
-    <html lang="en">
+    <html className={monocraft.variable} lang="en">
       <body>{session ? <Providers>{children}</Providers> : <LoginScreen />}</body>
     </html>
   );

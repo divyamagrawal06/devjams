@@ -36,8 +36,29 @@ export type AllayIntent =
   | { kind: "status" }
   | { kind: "copy" }
   | { kind: "power"; action: AllayPowerAction }
+  | { kind: "negated" }
   | AllayCreateIntent
   | { kind: "unknown" };
+
+type WorkloadCatalogue = {
+  workloadKinds: Array<{
+    id: string;
+    label: string;
+    available: boolean;
+    unavailableReason?: string;
+    defaultVersion?: string;
+    runtimes: Array<{ id: string; label: string }>;
+  }>;
+  constraints: {
+    cpuCores: { min: number; max: number };
+    ramMb: { min: number; max: number; step: number };
+    storageGb: { min: number; max: number };
+  };
+};
+
+export type AllayCreateCapability =
+  | { available: true; intent: AllayCreateIntent }
+  | { available: false; reason: string };
 
 type NamedServer = {
   id: string;
@@ -247,6 +268,37 @@ const CREATE_PHRASES = [
   "new",
 ];
 
+const MUTATING_PHRASES = [
+  ...CREATE_PHRASES,
+  "restart",
+  "reboot",
+  "cycle",
+  "stop",
+  "sleep",
+  "shut down",
+  "shutdown",
+  "turn off",
+  "start",
+  "wake",
+  "boot",
+  "turn on",
+];
+
+const NEGATION_PHRASES = ["do not", "don t", "dont", "never", "no need to", "avoid"];
+
+const TEMPLATE_CAPABILITY: Record<AllayCreateTemplate, { kindId: string; runtimeId: string }> = {
+  minecraft_paper: { kindId: "minecraft", runtimeId: "paper" },
+  minecraft_vanilla: { kindId: "minecraft", runtimeId: "vanilla" },
+  minecraft_bedrock: { kindId: "dedicated_game", runtimeId: "minecraft_bedrock" },
+  rust: { kindId: "dedicated_game", runtimeId: "rust" },
+  cs2: { kindId: "dedicated_game", runtimeId: "cs2" },
+  valheim: { kindId: "dedicated_game", runtimeId: "valheim" },
+  terraria: { kindId: "dedicated_game", runtimeId: "terraria" },
+  factorio: { kindId: "dedicated_game", runtimeId: "factorio" },
+  project_zomboid: { kindId: "dedicated_game", runtimeId: "project_zomboid" },
+  node_static: { kindId: "node_service", runtimeId: "static" },
+};
+
 function normalize(value: string) {
   return value
     .toLocaleLowerCase()
@@ -291,10 +343,104 @@ export function createTemplateLabel(template: AllayCreateTemplate): string {
   return CREATE_TEMPLATES.find((candidate) => candidate.id === template)?.label ?? "workload";
 }
 
+function bounded(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+export function resolveCreateCapability(
+  intent: AllayCreateIntent,
+  catalogue: WorkloadCatalogue | null | undefined,
+): AllayCreateCapability {
+  if (!catalogue) {
+    return {
+      available: false,
+      reason: "The live capability catalogue is unavailable, so no create request can be sent.",
+    };
+  }
+
+  const mapping = TEMPLATE_CAPABILITY[intent.template];
+  const kind = catalogue.workloadKinds.find((candidate) => candidate.id === mapping.kindId);
+  if (!kind?.available) {
+    return {
+      available: false,
+      reason:
+        kind?.unavailableReason ??
+        `${kind?.label ?? createTemplateLabel(intent.template)} provisioning is unavailable.`,
+    };
+  }
+
+  const runtime = kind.runtimes.find((candidate) => candidate.id === mapping.runtimeId);
+  if (!runtime || !kind.defaultVersion) {
+    return {
+      available: false,
+      reason: `${createTemplateLabel(intent.template)} is not offered by the active connector.`,
+    };
+  }
+
+  const ramStep = Math.max(1, catalogue.constraints.ramMb.step);
+  const normalizedRam =
+    Math.ceil(
+      bounded(intent.body.ramMb, catalogue.constraints.ramMb.min, catalogue.constraints.ramMb.max) /
+        ramStep,
+    ) * ramStep;
+
+  return {
+    available: true,
+    intent: {
+      ...intent,
+      body: {
+        ...intent.body,
+        game: kind.id,
+        type: runtime.id,
+        version: kind.defaultVersion,
+        cpuCores: bounded(
+          intent.body.cpuCores,
+          catalogue.constraints.cpuCores.min,
+          catalogue.constraints.cpuCores.max,
+        ),
+        ramMb: bounded(
+          normalizedRam,
+          catalogue.constraints.ramMb.min,
+          catalogue.constraints.ramMb.max,
+        ),
+        storageGb: bounded(
+          intent.body.storageGb,
+          catalogue.constraints.storageGb.min,
+          catalogue.constraints.storageGb.max,
+        ),
+      },
+    },
+  };
+}
+
+export function confirmationDecision(value: string): "confirm" | "cancel" | "unclear" {
+  const input = normalize(value);
+  if (!input) return "unclear";
+  if (
+    ["no", "nope", "cancel", "never mind", "nevermind", "leave it", "do not", "don t"].some(
+      (phrase) => input === phrase || input.startsWith(`${phrase} `),
+    )
+  ) {
+    return "cancel";
+  }
+  if (
+    ["yes", "yes please", "yep", "confirm", "continue", "do it", "please do", "create it"].includes(
+      input,
+    )
+  ) {
+    return "confirm";
+  }
+  return "unclear";
+}
+
 export function parseAllayIntent(value: string): AllayIntent {
   const input = normalize(value);
 
   if (!input) return { kind: "unknown" };
+
+  if (containsPhrase(input, NEGATION_PHRASES) && containsPhrase(input, MUTATING_PHRASES)) {
+    return { kind: "negated" };
+  }
 
   const createIntent = parseCreateIntent(value, input);
   if (createIntent) return createIntent;

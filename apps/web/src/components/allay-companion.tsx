@@ -1,27 +1,20 @@
 "use client";
 
+import { useQuery } from "@tanstack/react-query";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
-import {
-  Check,
-  CircleAlert,
-  Copy,
-  HelpCircle,
-  Power,
-  RefreshCw,
-  Send,
-  Server,
-  X,
-} from "lucide-react";
+import { Check, CircleAlert, Copy, Power, RefreshCw, Send, Server, X } from "lucide-react";
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   type AllayCreateIntent,
   type AllayIntent,
   type AllayPowerAction,
+  confirmationDecision,
   createTemplateLabel,
   findMentionedServer,
   parseAllayIntent,
+  resolveCreateCapability,
 } from "@/lib/allay-intent";
-import { api, joinAddress, type LiveServer } from "@/lib/api";
+import { api, joinAddress, type LiveServer, type WorkloadCatalogueResponse } from "@/lib/api";
 
 type ConnectorState = "checking" | "connected" | "unavailable";
 type TargetIntent = Extract<AllayIntent, { kind: "status" | "copy" | "power" }>;
@@ -39,6 +32,10 @@ type PowerActionResponse = {
     success: boolean;
     action: AllayPowerAction;
     status: string;
+    receipt: {
+      receiptId: string;
+      status: "accepted" | "completed" | "refused" | "failed";
+    };
   };
 };
 
@@ -52,13 +49,15 @@ type CreateServerResponse = {
 
 type PendingConfirmation = {
   action: "stop" | "restart";
+  observedState: string;
   serverId: string;
 };
 
 type AllayCompanionProps = {
   connectorState: ConnectorState;
+  controlMessage: string;
   operatorName: string;
-  refreshServers: () => Promise<unknown>;
+  refreshServers: () => Promise<LiveServer[] | undefined>;
   servers: LiveServer[] | undefined;
   serversLoading: boolean;
 };
@@ -178,19 +177,20 @@ function AllaySprite({ busy }: { busy: boolean }) {
 
 export function AllayCompanion({
   connectorState,
+  controlMessage,
   operatorName,
   refreshServers,
   servers,
   serversLoading,
 }: AllayCompanionProps) {
   const reducedMotion = useReducedMotion();
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<AllayMessage[]>([
     {
       id: 1,
       from: "allay",
-      text: `Hi ${operatorName}. I can create game servers and Node sites, then check, start, stop, restart, or copy access details for your workloads.`,
+      text: `Hi ${operatorName}. I can inspect and manage your workloads. I only offer create options the live control plane reports as available.`,
     },
   ]);
   const [activeServerId, setActiveServerId] = useState<string | null>(null);
@@ -204,6 +204,12 @@ export function AllayCompanion({
   const [busyCreate, setBusyCreate] = useState<AllayCreateIntent | null>(null);
   const messageId = useRef(2);
   const transcriptRef = useRef<HTMLDivElement>(null);
+  const catalogue = useQuery<WorkloadCatalogueResponse>({
+    queryKey: ["workload-catalogue"],
+    queryFn: () => api<WorkloadCatalogueResponse>("/api/servers/templates"),
+    retry: 1,
+    staleTime: 30_000,
+  });
 
   const availableServers = servers ?? [];
   const busyServer = busyAction
@@ -245,19 +251,21 @@ export function AllayCompanion({
     }
     commands.push({ label: "Workload status", prompt: "Show my workloads", icon: Server });
     if (!running && !stopped) {
-      commands.push({
-        label: "New Valheim server",
-        prompt: "Create a Valheim server named vikings",
-        icon: Power,
-      });
-      commands.push({
-        label: "Host a Node site",
-        prompt: "Host a Node website called portfolio",
-        icon: HelpCircle,
-      });
+      const paperIntent = parseAllayIntent("create a paper realm named new realm");
+      const paperCapability =
+        paperIntent.kind === "create"
+          ? resolveCreateCapability(paperIntent, catalogue.data?.data)
+          : { available: false as const };
+      if (paperCapability.available) {
+        commands.push({
+          label: "New Paper realm",
+          prompt: "Create a Paper realm named new realm",
+          icon: Power,
+        });
+      }
     }
     return commands.slice(0, 3);
-  }, [availableServers]);
+  }, [availableServers, catalogue.data?.data]);
 
   useEffect(() => {
     void transcriptRevision;
@@ -325,17 +333,25 @@ export function AllayCompanion({
   }
 
   function requestCreate(intent: AllayCreateIntent) {
+    const capability = resolveCreateCapability(intent, catalogue.data?.data);
+    if (!capability.available) {
+      appendMessage(
+        "allay",
+        `${createTemplateLabel(intent.template)} is unavailable. ${capability.reason}`,
+      );
+      return;
+    }
     setPendingSelection(null);
     setPendingConfirmation(null);
-    setPendingCreate(intent);
+    setPendingCreate(capability.intent);
     appendMessage(
       "allay",
-      `Please confirm this create request before I send it. ${createSummary(intent)}`,
+      `Please confirm this create request before I send it. ${createSummary(capability.intent)}`,
     );
   }
 
   async function runCreate(intent: AllayCreateIntent) {
-    if (connectorState === "unavailable") {
+    if (connectorState !== "connected") {
       appendMessage(
         "allay",
         "I can’t create that workload while the control-plane connector is unavailable.",
@@ -344,25 +360,44 @@ export function AllayCompanion({
       return;
     }
 
-    setBusyCreate(intent);
-    appendMessage("allay", `Creating ${intent.body.name}. I’ll wait for the control plane.`);
+    const catalogueResult = await catalogue.refetch().catch(() => undefined);
+    if (!catalogueResult || catalogueResult.isError || catalogueResult.fetchStatus === "paused") {
+      appendMessage(
+        "allay",
+        "The request was not sent because I could not freshly verify the capability catalogue.",
+        "error",
+      );
+      return;
+    }
+    const capability = resolveCreateCapability(intent, catalogueResult.data?.data);
+    if (!capability.available) {
+      appendMessage("allay", `The request was not sent. ${capability.reason}`, "error");
+      return;
+    }
+    const verifiedIntent = capability.intent;
+
+    setBusyCreate(verifiedIntent);
+    appendMessage(
+      "allay",
+      `Creating ${verifiedIntent.body.name}. I’ll wait for the control plane.`,
+    );
 
     try {
       const result = await api<CreateServerResponse>("/api/servers/create", {
         method: "POST",
-        body: JSON.stringify(intent.body),
+        body: JSON.stringify(verifiedIntent.body),
       });
       await refreshServers().catch(() => undefined);
       const reference = result.data?.id ? ` Its workload ID is ${result.data.id}.` : "";
       appendMessage(
         "allay",
-        `${intent.body.name} was accepted and is provisioning.${reference}`,
+        `${verifiedIntent.body.name} was accepted and is provisioning.${reference}`,
         "success",
       );
     } catch (error) {
       appendMessage(
         "allay",
-        `I couldn’t create ${intent.body.name}. ${controlErrorMessage(error)}`,
+        `I couldn’t create ${verifiedIntent.body.name}. ${controlErrorMessage(error)}`,
         "error",
       );
       await refreshServers().catch(() => undefined);
@@ -372,7 +407,7 @@ export function AllayCompanion({
   }
 
   async function runPowerAction(server: LiveServer, action: AllayPowerAction) {
-    if (connectorState === "unavailable") {
+    if (connectorState !== "connected") {
       appendMessage(
         "allay",
         "I can’t send that command while the control-plane connector is unavailable.",
@@ -390,13 +425,20 @@ export function AllayCompanion({
     );
 
     try {
+      const storageKey = `indexd:allay-power:${server.id}:${action}`;
+      const requestKey =
+        window.sessionStorage.getItem(storageKey) ?? `allay-power:${crypto.randomUUID()}`;
+      window.sessionStorage.setItem(storageKey, requestKey);
       const result = await api<PowerActionResponse>(
         `/api/servers/${encodeURIComponent(server.id)}/action`,
         {
           method: "POST",
-          body: JSON.stringify({ action }),
+          body: JSON.stringify({ action, requestKey }),
         },
       );
+      if (result.data.receipt.status === "completed") {
+        window.sessionStorage.removeItem(storageKey);
+      }
       await refreshServers();
       const finalState = humanize(result.data.status).toLocaleLowerCase();
       const address =
@@ -405,7 +447,9 @@ export function AllayCompanion({
           : "";
       appendMessage(
         "allay",
-        `${server.name} is ${finalState}. The control plane confirmed the change.${address}`,
+        result.data.receipt.status === "completed"
+          ? `${server.name} is ${finalState}. The control plane confirmed the change.${address}`
+          : `${server.name} is ${finalState}. Receipt ${result.data.receipt.receiptId.slice(0, 12)}… is ${result.data.receipt.status}; the same request key is retained for a safe retry.`,
         "success",
       );
     } catch (error) {
@@ -418,6 +462,33 @@ export function AllayCompanion({
     } finally {
       setBusyAction(null);
     }
+  }
+
+  async function runFreshPowerAction(expectedServer: LiveServer, action: AllayPowerAction) {
+    if (connectorState !== "connected") {
+      appendMessage("allay", `The command was not sent. ${controlMessage}`, "error");
+      return;
+    }
+
+    const refreshed = await refreshServers().catch(() => undefined);
+    const server = refreshed?.find((candidate) => candidate.id === expectedServer.id);
+    if (!server) {
+      appendMessage(
+        "allay",
+        "The command was not sent because I could not freshly verify the target workload.",
+        "error",
+      );
+      return;
+    }
+    if (server.currentState !== expectedServer.currentState) {
+      appendMessage(
+        "allay",
+        `${server.name} changed from ${humanize(expectedServer.currentState)} to ${humanize(server.currentState)} while awaiting confirmation. Review the current state and ask again.`,
+        "error",
+      );
+      return;
+    }
+    await runPowerAction(server, action);
   }
 
   async function copyServerAddress(server: LiveServer) {
@@ -454,7 +525,11 @@ export function AllayCompanion({
 
     if (!validatePowerAction(server, intent.action)) return;
     if (intent.action === "stop" || intent.action === "restart") {
-      setPendingConfirmation({ action: intent.action, serverId: server.id });
+      setPendingConfirmation({
+        action: intent.action,
+        observedState: server.currentState,
+        serverId: server.id,
+      });
       appendMessage(
         "allay",
         intent.action === "stop"
@@ -464,7 +539,7 @@ export function AllayCompanion({
       return;
     }
 
-    void runPowerAction(server, intent.action);
+    void runFreshPowerAction(server, intent.action);
   }
 
   function resolveTarget(intent: TargetIntent, value: string) {
@@ -489,13 +564,14 @@ export function AllayCompanion({
     const normalized = value.trim().toLocaleLowerCase();
 
     if (pendingCreate) {
-      if (/^(yes|yep|confirm|continue|create it|do it|please do)\b/.test(normalized)) {
+      const decision = confirmationDecision(normalized);
+      if (decision === "confirm") {
         const intent = pendingCreate;
         setPendingCreate(null);
         void runCreate(intent);
         return;
       }
-      if (/^(no|nope|cancel|never mind|nevermind|leave it)\b/.test(normalized)) {
+      if (decision === "cancel") {
         const name = pendingCreate.body.name;
         setPendingCreate(null);
         appendMessage("allay", `${name} will not be created.`);
@@ -506,15 +582,19 @@ export function AllayCompanion({
     }
 
     if (pendingConfirmation) {
-      if (/^(yes|yep|confirm|continue|do it|please do)\b/.test(normalized)) {
+      const decision = confirmationDecision(normalized);
+      if (decision === "confirm") {
         const server = selectedServer(pendingConfirmation.serverId);
         const action = pendingConfirmation.action;
+        const expectedServer = server
+          ? { ...server, currentState: pendingConfirmation.observedState }
+          : null;
         setPendingConfirmation(null);
-        if (server) void runPowerAction(server, action);
+        if (expectedServer) void runFreshPowerAction(expectedServer, action);
         else explainNoServers();
         return;
       }
-      if (/^(no|nope|cancel|never mind|nevermind|leave it)\b/.test(normalized)) {
+      if (decision === "cancel") {
         const server = selectedServer(pendingConfirmation.serverId);
         setPendingConfirmation(null);
         appendMessage("allay", `${server?.name ?? "The workload"} will stay as it is.`);
@@ -536,10 +616,24 @@ export function AllayCompanion({
       return;
     }
     if (intent.kind === "help") {
+      const availableKinds =
+        catalogue.data?.data.workloadKinds.filter((kind) => kind.available) ?? [];
+      const createHelp = availableKinds.length
+        ? `The live catalogue currently offers ${availableKinds
+            .map(
+              (kind) =>
+                `${kind.label} (${kind.runtimes.map((runtime) => runtime.label).join(", ")})`,
+            )
+            .join("; ")}.`
+        : "No create connector is currently verified as available.";
       appendMessage(
         "allay",
-        "I can create Minecraft Paper, Vanilla, or Bedrock realms; Rust, CS2, Valheim, Terraria, Factorio, or Project Zomboid servers; and Node static sites. I can also list workloads, report state, start, stop, restart, and copy an address or site URL. Try “create a Valheim server named vikings” or “host a Node website called portfolio”.",
+        `${createHelp} I can also list workloads, report state, start, stop, restart, and copy access details. Create requests are normalized against that catalogue before confirmation and again before submission.`,
       );
+      return;
+    }
+    if (intent.kind === "negated") {
+      appendMessage("allay", "Understood. Nothing was changed and no control request was sent.");
       return;
     }
     if (intent.kind === "create") {
@@ -573,7 +667,7 @@ export function AllayCompanion({
 
     appendMessage(
       "allay",
-      "I didn’t catch a workload command there. Ask me to create a supported game server or Node site, or to list, inspect, start, stop, restart, or copy access details for a workload.",
+      "I didn’t catch a workload command there. Ask for help to see live-supported create options, or ask me to list, inspect, start, stop, restart, or copy access details for a workload.",
     );
   }
 
@@ -600,9 +694,12 @@ export function AllayCompanion({
     if (!pendingConfirmation) return;
     const server = selectedServer(pendingConfirmation.serverId);
     const action = pendingConfirmation.action;
+    const expectedServer = server
+      ? { ...server, currentState: pendingConfirmation.observedState }
+      : null;
     setPendingConfirmation(null);
     appendMessage("operator", `Yes, ${actionLabel(action)} ${server?.name ?? "the workload"}.`);
-    if (server) void runPowerAction(server, action);
+    if (expectedServer) void runFreshPowerAction(expectedServer, action);
     else explainNoServers();
   }
 
@@ -749,11 +846,7 @@ export function AllayCompanion({
                 id="allay-command"
                 maxLength={180}
                 onChange={(event) => setDraft(event.target.value)}
-                placeholder={
-                  busy
-                    ? "Waiting for the control plane…"
-                    : "Try “create a Valheim server named vikings”"
-                }
+                placeholder={busy ? "Waiting for the control plane…" : "Try “show my workloads”"}
                 value={draft}
               />
               <button aria-label="Send command" disabled={!draft.trim() || busy} type="submit">

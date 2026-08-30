@@ -128,9 +128,18 @@ public final class TransferSyncTask implements Runnable {
                     .toList());
         }
 
-        List<String> moved = new ArrayList<>();
-        List<AckFailure> failures = new ArrayList<>();
+        Map<String, String> currentRoutes = new LinkedHashMap<>();
         for (String username : requested) {
+            proxy.getPlayer(username).flatMap(Player::getCurrentServer).ifPresent(connection ->
+                    currentRoutes.put(username, connection.getServerInfo().getName()));
+        }
+        TransferScope.Plan plan = TransferScope.plan(
+                requested, transfer.fromRoute, transfer.toRoute, currentRoutes);
+        List<String> moved = new ArrayList<>(plan.alreadyMoved());
+        List<AckFailure> failures = new ArrayList<>(plan.failures().stream()
+                .map(item -> failure(item.player(), item.reason()))
+                .toList());
+        for (String username : plan.eligible()) {
             Optional<Player> selected = proxy.getPlayer(username);
             if (selected.isEmpty()) {
                 failures.add(failure(username, "player disconnected before transfer"));
@@ -140,7 +149,11 @@ public final class TransferSyncTask implements Runnable {
             Player player = selected.get();
             Optional<String> currentRoute = player.getCurrentServer()
                     .map(connection -> connection.getServerInfo().getName());
-            if (currentRoute.isEmpty() || !currentRoute.get().equals(transfer.fromRoute)) {
+            if (transfer.toRoute.equals(currentRoute.orElse(null))) {
+                moved.add(player.getUsername());
+                continue;
+            }
+            if (!TransferScope.matchesSource(transfer.fromRoute, currentRoute.orElse(null))) {
                 failures.add(failure(username, "player is no longer in source route"));
                 continue;
             }

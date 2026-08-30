@@ -50,37 +50,70 @@ function toRecord(row: TransferRow): TransferRecord {
   };
 }
 
+function assertSameTransfer(existing: TransferRecord, requested: TransferRecord): void {
+  if (
+    existing.deploymentId !== requested.deploymentId ||
+    existing.fromRoute !== requested.fromRoute ||
+    existing.toRoute !== requested.toRoute ||
+    existing.message !== requested.message ||
+    contentDigest(existing.sourcePlayers) !== contentDigest(requested.sourcePlayers)
+  ) {
+    throw new Error("Transfer idempotency key conflicts with different transfer content");
+  }
+}
+
+function canRetry(record: TransferRecord): boolean {
+  return (
+    record.status === "expired" || (record.status === "acked" && !!record.ack?.failures.length)
+  );
+}
+
 export class DrizzleTransferStore implements TransferStore {
   async insert(record: TransferRecord): Promise<TransferRecord> {
-    await db
-      .insert(velocityTransfers)
-      .values({
-        id: record.transferId,
-        deploymentId: record.deploymentId,
-        fromRoute: record.fromRoute,
-        toRoute: record.toRoute,
-        message: record.message,
-        sourcePlayers: record.sourcePlayers,
-        status: record.status,
-        attempts: record.attempts,
-        ack: record.ack,
-        expiresAt: new Date(record.expiresAt),
-        acknowledgedAt: record.acknowledgedAt ? new Date(record.acknowledgedAt) : null,
-        createdAt: new Date(record.createdAt),
-      })
-      .onConflictDoNothing();
-    const stored = await this.find(record.transferId);
-    if (!stored) throw new Error("Transfer insert did not return a durable row");
-    if (
-      stored.deploymentId !== record.deploymentId ||
-      stored.fromRoute !== record.fromRoute ||
-      stored.toRoute !== record.toRoute ||
-      stored.message !== record.message ||
-      contentDigest(stored.sourcePlayers) !== contentDigest(record.sourcePlayers)
-    ) {
-      throw new Error("Transfer idempotency key conflicts with different transfer content");
-    }
-    return stored;
+    return db.transaction(async (tx) => {
+      await tx
+        .insert(velocityTransfers)
+        .values({
+          id: record.transferId,
+          deploymentId: record.deploymentId,
+          fromRoute: record.fromRoute,
+          toRoute: record.toRoute,
+          message: record.message,
+          sourcePlayers: record.sourcePlayers,
+          status: record.status,
+          attempts: record.attempts,
+          ack: record.ack,
+          expiresAt: new Date(record.expiresAt),
+          acknowledgedAt: record.acknowledgedAt ? new Date(record.acknowledgedAt) : null,
+          createdAt: new Date(record.createdAt),
+        })
+        .onConflictDoNothing();
+      const [storedRow] = await tx
+        .select()
+        .from(velocityTransfers)
+        .where(eq(velocityTransfers.id, record.transferId))
+        .for("update");
+      if (!storedRow) throw new Error("Transfer insert did not return a durable row");
+      const stored = toRecord(storedRow);
+      assertSameTransfer(stored, record);
+      if (!canRetry(stored)) return stored;
+
+      const [rearmed] = await tx
+        .update(velocityTransfers)
+        .set({
+          status: "pending",
+          attempts: 0,
+          ack: null,
+          expiresAt: new Date(record.expiresAt),
+          acknowledgedAt: null,
+          createdAt: new Date(record.createdAt),
+          updatedAt: sql`now()`,
+        })
+        .where(eq(velocityTransfers.id, record.transferId))
+        .returning();
+      if (!rearmed) throw new Error("Transfer retry could not be persisted");
+      return toRecord(rearmed);
+    });
   }
 
   async listPending(now: Date): Promise<TransferRecord[]> {
@@ -147,14 +180,15 @@ export class MemoryTransferStore implements TransferStore {
   async insert(record: TransferRecord): Promise<TransferRecord> {
     const existing = this.records.get(record.transferId);
     if (existing) {
-      if (
-        existing.deploymentId !== record.deploymentId ||
-        existing.fromRoute !== record.fromRoute ||
-        existing.toRoute !== record.toRoute ||
-        existing.message !== record.message ||
-        contentDigest(existing.sourcePlayers) !== contentDigest(record.sourcePlayers)
-      ) {
-        throw new Error("Transfer idempotency key conflicts with different transfer content");
+      assertSameTransfer(existing, record);
+      if (canRetry(existing)) {
+        existing.status = "pending";
+        existing.attempt = 0;
+        existing.attempts = 0;
+        existing.ack = null;
+        existing.expiresAt = record.expiresAt;
+        existing.acknowledgedAt = null;
+        existing.createdAt = record.createdAt;
       }
       return { ...existing };
     }

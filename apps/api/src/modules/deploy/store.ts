@@ -1,8 +1,4 @@
-import {
-  type DeploymentState,
-  type DeploymentView,
-  PRE_CUTOVER_STATES,
-} from "@farlands/contracts";
+import { type DeploymentState, type DeploymentView, PRE_CUTOVER_STATES } from "@farlands/contracts";
 import { deploymentStateEvents, deployments, serverRuleHeads } from "@repo/db";
 import { and, asc, count, eq, inArray, isNull, lt, notInArray, sql } from "drizzle-orm";
 
@@ -91,12 +87,7 @@ export interface DeploymentStore {
   queuePosition(id: string): Promise<number | null>;
   claimNext(workerId: string, maxConcurrent: number, leaseMs: number): Promise<string | null>;
   renewLease(id: string, workerId: string, leaseMs: number): Promise<boolean>;
-  takeoverExpiredLease(
-    id: string,
-    workerId: string,
-    leaseMs: number,
-    now: Date,
-  ): Promise<boolean>;
+  takeoverExpiredLease(id: string, workerId: string, leaseMs: number, now: Date): Promise<boolean>;
   completeQueue(id: string): Promise<void>;
   listRecoverable(): Promise<DeploymentRecord[]>;
   findRuleHead(serverId: string): Promise<RuleHead | null>;
@@ -106,6 +97,12 @@ export interface DeploymentStore {
     version: string;
     digest: string;
   }): Promise<void>;
+  commitCutover(input: {
+    serverId: string;
+    deploymentId: string;
+    version: string;
+    digest: string;
+  }): Promise<DeploymentRecord>;
 }
 
 type DeploymentRow = typeof deployments.$inferSelect;
@@ -208,15 +205,11 @@ function updateValues(patch: DeploymentPatch) {
       : {}),
     ...(patch.presyncCompletedAt !== undefined
       ? {
-          presyncCompletedAt: patch.presyncCompletedAt
-            ? new Date(patch.presyncCompletedAt)
-            : null,
+          presyncCompletedAt: patch.presyncCompletedAt ? new Date(patch.presyncCompletedAt) : null,
         }
       : {}),
     ...(patch.savesDisabled !== undefined ? { savesDisabled: patch.savesDisabled } : {}),
-    ...(patch.candidateHealthy !== undefined
-      ? { candidateHealthy: patch.candidateHealthy }
-      : {}),
+    ...(patch.candidateHealthy !== undefined ? { candidateHealthy: patch.candidateHealthy } : {}),
     ...(patch.routeSwitched !== undefined ? { routeSwitched: patch.routeSwitched } : {}),
     ...(patch.abortRequestedAt !== undefined
       ? {
@@ -466,6 +459,70 @@ export class DrizzleDeploymentStore implements DeploymentStore {
       WHERE ${serverRuleHeads.currentDeploymentId} IS DISTINCT FROM excluded.current_deployment_id
     `);
   }
+
+  async commitCutover(input: {
+    serverId: string;
+    deploymentId: string;
+    version: string;
+    digest: string;
+  }): Promise<DeploymentRecord> {
+    return db.transaction(async (tx) => {
+      const [current] = await tx
+        .select()
+        .from(deployments)
+        .where(eq(deployments.id, input.deploymentId))
+        .for("update");
+      if (!current) throw new Error(`Unknown deployment ${input.deploymentId}`);
+      if (current.serverId !== input.serverId) {
+        throw new Error("Cutover server does not match the deployment target");
+      }
+      if (
+        current.toVersion !== input.version ||
+        current.approvedContentDigest.toLowerCase() !== input.digest.toLowerCase() ||
+        current.artifactDigest?.toLowerCase() !== input.digest.toLowerCase()
+      ) {
+        throw new Error("Cutover head must match the deployment's verified artifact exactly");
+      }
+      if (current.state === "draining" || current.state === "idle") return toRecord(current);
+      if (
+        current.state !== "cutover" ||
+        !current.routeSwitched ||
+        current.lobbyPlayers.length > 0
+      ) {
+        throw new Error("Cutover cannot commit before route and roster handoff complete");
+      }
+
+      await tx.execute(sql`
+        INSERT INTO ${serverRuleHeads} (
+          server_id, current_version, current_digest, previous_version,
+          previous_digest, current_deployment_id, updated_at
+        ) VALUES (
+          ${input.serverId}, ${input.version}, ${input.digest}, NULL,
+          NULL, ${input.deploymentId}, now()
+        )
+        ON CONFLICT (server_id) DO UPDATE SET
+          previous_version = ${serverRuleHeads.currentVersion},
+          previous_digest = ${serverRuleHeads.currentDigest},
+          current_version = excluded.current_version,
+          current_digest = excluded.current_digest,
+          current_deployment_id = excluded.current_deployment_id,
+          updated_at = now()
+        WHERE ${serverRuleHeads.currentDeploymentId} IS DISTINCT FROM excluded.current_deployment_id
+      `);
+      const [updated] = await tx
+        .update(deployments)
+        .set({ state: "draining", updatedAt: sql`now()` })
+        .where(eq(deployments.id, input.deploymentId))
+        .returning();
+      if (!updated) throw new Error("Cutover transition could not be persisted");
+      await tx.insert(deploymentStateEvents).values({
+        deploymentId: input.deploymentId,
+        state: "draining",
+        detail: "candidate B is authoritative; retaining A for rollback",
+      });
+      return toRecord(updated);
+    });
+  }
 }
 
 export class MemoryDeploymentStore implements DeploymentStore {
@@ -626,6 +683,38 @@ export class MemoryDeploymentStore implements DeploymentStore {
       previousDigest: current?.currentDigest ?? null,
     });
     this.headDeploymentIds.set(input.serverId, input.deploymentId);
+  }
+
+  async commitCutover(input: {
+    serverId: string;
+    deploymentId: string;
+    version: string;
+    digest: string;
+  }): Promise<DeploymentRecord> {
+    const record = this.records.get(input.deploymentId);
+    if (!record) throw new Error(`Unknown deployment ${input.deploymentId}`);
+    if (record.serverId !== input.serverId) {
+      throw new Error("Cutover server does not match the deployment target");
+    }
+    if (
+      record.toVersion !== input.version ||
+      record.approvedContentDigest.toLowerCase() !== input.digest.toLowerCase() ||
+      record.artifactDigest?.toLowerCase() !== input.digest.toLowerCase()
+    ) {
+      throw new Error("Cutover head must match the deployment's verified artifact exactly");
+    }
+    if (record.state === "draining" || record.state === "idle") return { ...record };
+    if (record.state !== "cutover" || !record.routeSwitched || record.lobbyPlayers.length > 0) {
+      throw new Error("Cutover cannot commit before route and roster handoff complete");
+    }
+    await this.recordCutover(input);
+    record.state = "draining";
+    this.events.push({
+      deploymentId: input.deploymentId,
+      state: "draining",
+      detail: "candidate B is authoritative; retaining A for rollback",
+    });
+    return { ...record };
   }
 }
 

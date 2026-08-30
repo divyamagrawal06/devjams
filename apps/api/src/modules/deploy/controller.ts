@@ -1,9 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type {
-  DeploymentState,
-  DeploymentView,
-  VelocityTransferAck,
-} from "@farlands/contracts";
+import type { DeploymentState, DeploymentView, VelocityTransferAck } from "@farlands/contracts";
 import { digestsEqual, PRE_CUTOVER_STATES } from "@farlands/contracts";
 
 import {
@@ -13,6 +9,7 @@ import {
   stopCandidateForDelta,
   verifyCandidateHealth,
 } from "../provisioning/candidate";
+import { tenantNamespace } from "../provisioning/tenancy";
 import { releaseDeploymentHeadroom, reserveDeploymentHeadroom } from "../quota/headroom";
 import { type DeploymentArtifact, RulesService } from "../rules/service";
 import { type RouteRoster, routeRosterService } from "../velocity/roster";
@@ -39,10 +36,7 @@ import {
 const nowIso = () => new Date().toISOString();
 const LOBBY_ROUTE = "lobby";
 
-export function assertApprovedArtifactDigest(
-  approvedDigest: string,
-  builtDigest: string,
-): void {
+export function assertApprovedArtifactDigest(approvedDigest: string, builtDigest: string): void {
   if (!digestsEqual(approvedDigest, builtDigest)) {
     throw new Error("Built rule artifact digest does not match the human-approved content digest");
   }
@@ -62,6 +56,7 @@ function view(row: DeploymentRecord): DeploymentView {
     fromVersion: row.fromVersion,
     toVersion: row.toVersion,
     error: row.error,
+    abortRequestedAt: row.abortRequestedAt,
     startedAt: row.startedAt,
     finishedAt: row.finishedAt,
   };
@@ -108,7 +103,9 @@ export function validateTransferOutcome(
     reported.length !== expected.length ||
     reported.some((player, index) => player !== expected[index])
   ) {
-    throw new Error("Velocity transfer acknowledgement does not exactly account for the source roster");
+    throw new Error(
+      "Velocity transfer acknowledgement does not exactly account for the source roster",
+    );
   }
   return { movedPlayers: moved, failures };
 }
@@ -150,7 +147,6 @@ export interface DeploymentMachineRuntime {
   restoreLive(row: DeploymentRecord): Promise<void>;
   retireLive(row: DeploymentRecord): Promise<string>;
   removeCandidate(row: DeploymentRecord): Promise<void>;
-  completeQueue(deploymentId: string): Promise<void>;
   now(): Date;
 }
 
@@ -188,13 +184,11 @@ const productionRuntime: DeploymentMachineRuntime = {
     const transferId = await issueTransfer(input);
     return waitForAck(transferId, 90_000);
   },
-  stopCandidate: (row) =>
-    stopCandidateForDelta(row.namespace ?? "", row.candidatePod ?? ""),
+  stopCandidate: (row) => stopCandidateForDelta(row.namespace ?? "", row.candidatePod ?? ""),
   freezeDelta: (row) => freezeAndSyncDelta(row),
   ensureSaveOn: (row) => ensureLiveSavesEnabled(row),
   cleanupCutover: (row) => cleanupCutoverResources(row),
-  startCandidate: (row) =>
-    startPaperOnCandidate(row.namespace ?? "", row.candidatePod ?? ""),
+  startCandidate: (row) => startPaperOnCandidate(row.namespace ?? "", row.candidatePod ?? ""),
   async verifyCandidate(row) {
     if (!row.artifactDigest) throw new Error("Deployment is missing artifact digest");
     await verifyCandidateHealth({
@@ -205,14 +199,12 @@ const productionRuntime: DeploymentMachineRuntime = {
     });
   },
   switchRoute(row, target) {
-    const proxyTarget =
-      target === "candidate" ? candidateProxyTarget(row) : row.liveProxyTarget;
+    const proxyTarget = target === "candidate" ? candidateProxyTarget(row) : row.liveProxyTarget;
     if (!proxyTarget) throw new Error("Deployment is missing a route target");
     return switchServerRoute(row.serverId, proxyTarget);
   },
   async waitForRoute(row, target, after) {
-    const targetHost =
-      target === "candidate" ? candidateProxyTarget(row) : row.liveProxyTarget;
+    const targetHost = target === "candidate" ? candidateProxyTarget(row) : row.liveProxyTarget;
     if (!targetHost) throw new Error("Deployment is missing a route target");
     await routeRosterService.waitForTarget({
       route: row.serverId,
@@ -226,15 +218,13 @@ const productionRuntime: DeploymentMachineRuntime = {
   restoreLive: (row) => restoreLiveDeployment(row),
   retireLive: (row) => retireLiveAndPromoteCandidate(row),
   async removeCandidate(row) {
-    if (!row.candidatePod || !row.namespace) return;
     await deleteCandidate({
-      namespace: row.namespace,
-      deploymentName: row.candidatePod,
+      namespace: row.namespace ?? tenantNamespace(row.userId),
+      deploymentName: row.candidatePod ?? "candidate-not-yet-checkpointed",
       liveServerId: row.serverId,
       deploymentId: row.id,
     });
   },
-  completeQueue: (id) => deploymentQueue.complete(id),
   now: () => new Date(),
 };
 
@@ -247,14 +237,7 @@ async function machineTransition(
   expectedStates: readonly DeploymentState[],
   allowAbortRequested = false,
 ): Promise<DeploymentRecord> {
-  return store.transition(
-    id,
-    state,
-    patch,
-    detail,
-    expectedStates,
-    allowAbortRequested,
-  );
+  return store.transition(id, state, patch, detail, expectedStates, allowAbortRequested);
 }
 
 async function moveAndCheckpointLobby(
@@ -327,20 +310,12 @@ async function runPostCutover(
     );
 
     if (!row.toVersion) throw new Error("Deployment is missing the target version");
-    await store.recordCutover({
+    row = await store.commitCutover({
       serverId: row.serverId,
       deploymentId: row.id,
       version: row.toVersion,
       digest: row.approvedContentDigest,
     });
-    row = await machineTransition(
-      store,
-      id,
-      "draining",
-      {},
-      "candidate B is authoritative; retaining A for rollback",
-      ["cutover"],
-    );
   }
 
   if (row.state !== "draining") {
@@ -358,7 +333,6 @@ async function runPostCutover(
     ["draining"],
   );
   await runtime.cleanupCutover(row);
-  await runtime.completeQueue(id);
   await runtime.releaseHeadroom(id);
   await machineTransition(
     store,
@@ -392,7 +366,9 @@ export async function executeDeploymentMachine(
   }
   if (row.queueStatus !== "running" || row.state !== "queued") return;
 
-  row = await machineTransition(store, id, "building", {}, "building reviewed artifact", ["queued"]);
+  row = await machineTransition(store, id, "building", {}, "building reviewed artifact", [
+    "queued",
+  ]);
   const artifact = await runtime.resolveArtifact(row);
   assertApprovedArtifactDigest(row.approvedContentDigest, artifact.artifactDigest);
   await runtime.verifyArtifact(artifact);
@@ -409,9 +385,14 @@ export async function executeDeploymentMachine(
     ["building"],
   );
 
-  row = await machineTransition(store, id, "staging", {}, "reserving candidate headroom", [
-    "building",
-  ]);
+  row = await machineTransition(
+    store,
+    id,
+    "staging",
+    { presyncCompletedAt: runtime.now().toISOString() },
+    "recorded the pre-sync lower bound and reserved candidate headroom",
+    ["building"],
+  );
   await runtime.reserveHeadroom(row);
   const candidate = await runtime.provision(row, artifact);
   row = await machineTransition(
@@ -436,8 +417,8 @@ export async function executeDeploymentMachine(
     store,
     id,
     "presync",
-    { presyncCompletedAt: runtime.now().toISOString() },
-    "candidate pre-sync completed; A remains authoritative",
+    {},
+    "candidate pre-sync completed from the durable lower bound; A remains authoritative",
     ["staging"],
   );
 
@@ -562,7 +543,6 @@ async function compensatePreCutover(
   await runtime.cleanupCutover(row);
   await runtime.removeCandidate(row);
   await runtime.releaseHeadroom(id);
-  await runtime.completeQueue(id);
   return machineTransition(
     store,
     id,
@@ -633,25 +613,31 @@ async function withLeaseHeartbeat<T>(id: string, operation: () => Promise<T>): P
   }
 }
 
+const activeMachines = new Set<string>();
+
 function startMachine(id: string): void {
+  if (activeMachines.has(id)) return;
+  activeMachines.add(id);
   void withLeaseHeartbeat(id, () => executeDeploymentMachine(id))
-    .then(() => startNext())
+    .then(() => {
+      activeMachines.delete(id);
+      return startNext();
+    })
     .catch(async (error) => {
+      activeMachines.delete(id);
       console.error("[deploy " + id + "] machine failed", error);
       const row = await deploymentStore.find(id);
       if (!row) return;
       if (PRE_CUTOVER_STATES.includes(row.state as (typeof PRE_CUTOVER_STATES)[number])) {
         try {
-          await requestAndCompensate(
-            id,
-            error instanceof Error ? error.message : String(error),
-          );
+          await requestAndCompensate(id, error instanceof Error ? error.message : String(error));
           await startNext();
         } catch (abortError) {
           console.error(
             "[deploy " + id + "] compensation failed; reconciliation will retry",
             abortError,
           );
+          scheduleReconcileAt(Date.now() + 15_000);
         }
         return;
       }
@@ -664,8 +650,10 @@ function startMachine(id: string): void {
           [row.state],
           true,
         );
+        scheduleReconcileAt(Date.now() + 15_000);
       } catch (recordError) {
         console.error("[deploy " + id + "] failed to persist reconciliation error", recordError);
+        scheduleReconcileAt(Date.now() + 15_000);
       }
     });
 }
@@ -733,6 +721,18 @@ export async function enqueueDeploy(input: {
 }
 
 export async function abortDeployment(id: string, error?: string): Promise<DeploymentView> {
+  const requested = await deploymentStore.requestAbort(id, new Date());
+  if (!requested) throw new Error("Deployment not found");
+  if (
+    PRE_CUTOVER_STATES.includes(requested.state as (typeof PRE_CUTOVER_STATES)[number]) &&
+    requested.queueStatus === "running" &&
+    requested.workerId
+  ) {
+    // The active worker owns any in-flight external operation. It observes the
+    // durable request at its next checkpoint and compensates after that
+    // operation settles, avoiding delete/recreate races with candidate B.
+    return view(requested);
+  }
   const result = await requestAndCompensate(id, error ?? "aborted by operator");
   if (result.state === "aborted") await startNext();
   return view(result);
@@ -793,11 +793,28 @@ export function restartDisposition(
 }
 
 let scheduledReconcile: ReturnType<typeof setTimeout> | null = null;
+let scheduledReconcileAt = 0;
+
+function scheduleReconcileAt(timestamp: number): void {
+  if (scheduledReconcile && scheduledReconcileAt <= timestamp) return;
+  if (scheduledReconcile) clearTimeout(scheduledReconcile);
+  scheduledReconcileAt = timestamp;
+  scheduledReconcile = setTimeout(
+    () => {
+      scheduledReconcile = null;
+      scheduledReconcileAt = 0;
+      void reconcileInFlight();
+    },
+    Math.max(1, timestamp - Date.now()),
+  );
+  scheduledReconcile.unref?.();
+}
 
 export async function reconcileInFlight(): Promise<void> {
   if (scheduledReconcile) {
     clearTimeout(scheduledReconcile);
     scheduledReconcile = null;
+    scheduledReconcileAt = 0;
   }
   const recoverable = await deploymentStore.listRecoverable();
   let nextLeaseExpiry: number | null = null;
@@ -805,7 +822,8 @@ export async function reconcileInFlight(): Promise<void> {
   for (const row of recoverable) {
     if (row.queueStatus === "waiting" && row.state === "queued") continue;
 
-    let owned = row.workerId === deploymentQueue.workerId;
+    const leaseExpiresAt = row.leaseExpiresAt ? new Date(row.leaseExpiresAt).getTime() : 0;
+    let owned = row.workerId === deploymentQueue.workerId && leaseExpiresAt > Date.now();
     if (!owned) owned = await deploymentQueue.takeoverExpired(row.id);
     if (!owned) {
       const expiry = row.leaseExpiresAt ? new Date(row.leaseExpiresAt).getTime() : Date.now();
@@ -815,13 +833,11 @@ export async function reconcileInFlight(): Promise<void> {
 
     const disposition = restartDisposition(row);
     if (disposition === "abort_pre_cutover") {
-      void requestAndCompensate(
-        row.id,
-        "reconciled after backend restart before cutover",
-      )
+      void requestAndCompensate(row.id, "reconciled after backend restart before cutover")
         .then(() => startNext())
         .catch((error) => {
           console.error("[deploy " + row.id + "] restart compensation failed", error);
+          scheduleReconcileAt(Date.now() + 15_000);
         });
     } else if (disposition === "preserve_post_cutover") {
       startMachine(row.id);
@@ -831,10 +847,6 @@ export async function reconcileInFlight(): Promise<void> {
   await startNext();
 
   if (nextLeaseExpiry !== null) {
-    const delay = Math.max(1, nextLeaseExpiry - Date.now() + 50);
-    scheduledReconcile = setTimeout(() => {
-      void reconcileInFlight();
-    }, delay);
-    scheduledReconcile.unref?.();
+    scheduleReconcileAt(nextLeaseExpiry + 50);
   }
 }

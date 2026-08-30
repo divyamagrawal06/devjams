@@ -6,8 +6,13 @@ import {
   makeKubernetesClients,
   waitForDeploymentReplicasReady,
 } from "./kubernetes";
-import { ensureTenantNamespace, WORLD_SYNC_PORT } from "./tenancy";
-import { calculateContainerMemory, MinecraftUtils } from "./utils";
+import {
+  ensureTenantNamespace,
+  WORLD_SYNC_NAMES,
+  WORLD_SYNC_PORT,
+  WORLD_SYNC_ROOT,
+} from "./tenancy";
+import { calculateContainerMemory, MinecraftUtils, requiredPinnedImage } from "./utils";
 
 const SERVER_PORT = 25565;
 
@@ -154,7 +159,8 @@ export async function provisionCandidate(input: {
                 command: ["sh", "-c", "python3 /sync/receiver.py --once"],
                 env: [
                   { name: "WORLD_SYNC_PORT", value: String(WORLD_SYNC_PORT) },
-                  { name: "WORLD_ROOT", value: "/data/world" },
+                  { name: "WORLD_ROOT", value: WORLD_SYNC_ROOT },
+                  { name: "WORLD_NAMES", value: WORLD_SYNC_NAMES },
                   {
                     name: "SOURCE_SYNC_URL",
                     value: `http://${k8sRow.serviceName}.${namespace}.svc.cluster.local:${WORLD_SYNC_PORT}/stream`,
@@ -163,9 +169,17 @@ export async function provisionCandidate(input: {
                   { name: "WORLD_SYNC_PHASE", value: "presync" },
                   { name: "WORLD_SYNC_MARKER", value: "/data/.farlands-presync-complete" },
                 ],
+                securityContext: {
+                  allowPrivilegeEscalation: false,
+                  capabilities: { drop: ["ALL"] },
+                  readOnlyRootFilesystem: true,
+                  runAsNonRoot: true,
+                  runAsUser: 1000,
+                  runAsGroup: 1000,
+                },
                 volumeMounts: [
                   { name: "server-data", mountPath: "/data" },
-                  { name: "world-sync", mountPath: "/sync" },
+                  { name: "world-sync", mountPath: "/sync", readOnly: true },
                 ],
               },
             ],
@@ -307,15 +321,6 @@ export function buildArtifactLoader(input: CandidateArtifactInput) {
   };
 }
 
-export function requiredPinnedImage(environmentName: string): string {
-  const image = process.env[environmentName]?.trim();
-  if (!image) throw new Error(`${environmentName} must pin a reviewed image`);
-  if (!/@sha256:[0-9a-f]{64}$/.test(image)) {
-    throw new Error(`${environmentName} must use an immutable sha256 image digest`);
-  }
-  return image;
-}
-
 export async function deleteCandidate(input: {
   namespace: string;
   deploymentName: string;
@@ -354,12 +359,16 @@ export async function deleteCandidate(input: {
       }),
   ];
 
+  const failures: unknown[] = [];
   for (const del of deletions) {
     try {
       await del();
     } catch (error) {
-      if (getKubernetesStatusCode(error) !== 404) throw error;
+      if (getKubernetesStatusCode(error) !== 404) failures.push(error);
     }
+  }
+  if (failures.length) {
+    throw new AggregateError(failures, "Candidate cleanup left one or more resources behind");
   }
 }
 
@@ -485,7 +494,11 @@ export async function verifyCandidateHealth(input: {
         tailLines: 1_000,
         timestamps: true,
       });
-      if (/\b(?:SEVERE|FATAL)\b|Exception in server tick loop|Could not load ['\"]?FarlandsPlugin/i.test(logs)) {
+      if (
+        /\b(?:SEVERE|FATAL)\b|Exception in server tick loop|Could not load ['"]?FarlandsPlugin/i.test(
+          logs,
+        )
+      ) {
         throw new Error("Candidate logs contain a fatal startup or plugin-load error");
       }
       const pluginEnabled = logs.includes("Farlands Plugin Enabled");

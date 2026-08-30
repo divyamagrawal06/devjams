@@ -180,6 +180,8 @@ export type DeploymentView = {
   fromVersion: string | null;
   toVersion: string | null;
   error: string | null;
+  /** Durable operator request; the active worker owns compensation until terminal. */
+  abortRequestedAt: string | null;
   startedAt: string;
   finishedAt: string | null;
 };

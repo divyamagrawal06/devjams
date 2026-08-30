@@ -18,7 +18,11 @@ export interface RouteRosterStore {
 
 function normalizeToken(value: string, field: string): string {
   const normalized = value.trim();
-  if (!normalized || normalized.length > 253 || /[\u0000-\u001f\u007f]/.test(normalized)) {
+  const hasControlCharacter = [...normalized].some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint < 32 || codePoint === 127;
+  });
+  if (!normalized || normalized.length > 253 || hasControlCharacter) {
     throw new Error(`Invalid Velocity ${field}`);
   }
   return normalized;
@@ -107,13 +111,22 @@ export class RouteRosterService {
   ): Promise<{ accepted: number; observedAt: string }> {
     if (routes.length > 2_000) throw new Error("Velocity route report exceeds the safety limit");
     const observedAt = this.now().toISOString();
-    const normalized = routes.map((route) => ({
-      route: normalizeToken(route.route, "route"),
-      targetHost: normalizeToken(route.targetHost, "target host").toLowerCase(),
-      targetPort: route.targetPort,
-      players: normalizePlayers(route.players),
-      observedAt,
-    }));
+    const normalized = routes.map((route) => {
+      if (
+        !Number.isInteger(route.targetPort) ||
+        route.targetPort < 1 ||
+        route.targetPort > 65_535
+      ) {
+        throw new Error("Invalid Velocity target port");
+      }
+      return {
+        route: normalizeToken(route.route, "route"),
+        targetHost: normalizeToken(route.targetHost, "target host").toLowerCase(),
+        targetPort: route.targetPort,
+        players: normalizePlayers(route.players),
+        observedAt,
+      };
+    });
     if (new Set(normalized.map((record) => record.route)).size !== normalized.length) {
       throw new Error("Velocity route report contains a duplicate route");
     }
@@ -140,8 +153,7 @@ export class RouteRosterService {
       timeoutMs?: number;
       intervalMs?: number;
     },
-    wait: (ms: number) => Promise<void> = (ms) =>
-      new Promise((resolve) => setTimeout(resolve, ms)),
+    wait: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   ): Promise<RouteRoster> {
     const timeoutMs = input.timeoutMs ?? 45_000;
     const intervalMs = input.intervalMs ?? 250;

@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import * as k8s from "@kubernetes/client-node";
+import type * as k8s from "@kubernetes/client-node";
 import { serverK8s, serverRoutes } from "@repo/db";
 import { eq } from "drizzle-orm";
 
@@ -10,19 +10,24 @@ import {
   makeKubernetesClients,
   waitForDeploymentReplicasReady,
 } from "../provisioning/kubernetes";
-import { requiredPinnedImage } from "../provisioning/candidate";
 import {
   RCON_PASSWORD_FILE,
   RCON_PORT,
   RCON_SECRET_NAME,
+  WORLD_SYNC_NAMES,
   WORLD_SYNC_PORT,
+  WORLD_SYNC_ROOT,
 } from "../provisioning/tenancy";
+import { requiredPinnedImage } from "../provisioning/utils";
 import type { DeploymentRecord } from "./store";
 
 const SERVER_PORT = 25565;
 
 function resourceSuffix(deploymentId: string): string {
-  return deploymentId.replace(/[^a-z0-9]/gi, "").slice(0, 20).toLowerCase();
+  return deploymentId
+    .replace(/[^a-z0-9]/gi, "")
+    .slice(0, 20)
+    .toLowerCase();
 }
 
 function cutoverNames(deploymentId: string) {
@@ -144,7 +149,8 @@ function freezeJobBody(row: DeploymentRecord, saveOnOnly: boolean): k8s.V1Job {
                 { name: "RCON_PASSWORD_FILE", value: RCON_PASSWORD_FILE },
                 { name: "SAVE_ON_ONLY", value: String(saveOnOnly) },
                 { name: "WORLD_SYNC_PORT", value: String(WORLD_SYNC_PORT) },
-                { name: "WORLD_ROOT", value: "/data/world" },
+                { name: "WORLD_ROOT", value: WORLD_SYNC_ROOT },
+                { name: "WORLD_NAMES", value: WORLD_SYNC_NAMES },
                 {
                   name: "SOURCE_SYNC_URL",
                   value:
@@ -159,7 +165,9 @@ function freezeJobBody(row: DeploymentRecord, saveOnOnly: boolean): k8s.V1Job {
                 { name: "WORLD_SYNC_PHASE", value: "delta" },
                 {
                   name: "WORLD_SYNC_SINCE",
-                  value: saveOnOnly ? "1970-01-01T00:00:00.000Z" : checkpoint(row, "presyncCompletedAt"),
+                  value: saveOnOnly
+                    ? "1970-01-01T00:00:00.000Z"
+                    : checkpoint(row, "presyncCompletedAt"),
                 },
               ],
               resources: {
@@ -207,9 +215,7 @@ async function waitForJob(namespace: string, name: string, timeoutMs: number): P
             tailLines: 200,
           })
         : "";
-      throw new Error(
-        "Cutover job " + name + " failed" + (logs ? ": " + logs.slice(-2_000) : ""),
-      );
+      throw new Error("Cutover job " + name + " failed" + (logs ? ": " + logs.slice(-2_000) : ""));
     }
     await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
@@ -256,6 +262,22 @@ export async function cleanupCutoverResources(row: DeploymentRecord): Promise<vo
     } catch (error) {
       if (getKubernetesStatusCode(error) !== 404) throw error;
     }
+  }
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    const pods = await core.listNamespacedPod({
+      namespace: row.namespace,
+      labelSelector: "farlands.dev/deployment-id=" + row.id + ",farlands.dev/component=cutover",
+    });
+    if (!pods.items.length) break;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  const remaining = await core.listNamespacedPod({
+    namespace: row.namespace,
+    labelSelector: "farlands.dev/deployment-id=" + row.id + ",farlands.dev/component=cutover",
+  });
+  if (remaining.items.length) {
+    throw new Error("Timed out waiting for cutover job pods to release the candidate volume");
   }
   try {
     await core.deleteNamespacedConfigMap({
@@ -324,9 +346,8 @@ export async function retireLiveAndPromoteCandidate(row: DeploymentRecord): Prom
     namespace,
     labelSelector: "farlands.dev/deployment-id=" + row.id,
   });
-  const candidatePod = pods.items.find(
-    (pod) => pod.metadata?.deletionTimestamp === undefined,
-  )?.metadata?.name;
+  const candidatePod = pods.items.find((pod) => pod.metadata?.deletionTimestamp === undefined)
+    ?.metadata?.name;
 
   const [updated] = await db
     .update(serverK8s)

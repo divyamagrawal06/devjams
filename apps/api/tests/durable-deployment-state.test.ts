@@ -185,7 +185,7 @@ describe("scoped durable Velocity transfers", () => {
     await expect(restartedService.acknowledge(id, ack)).resolves.toEqual(ack);
   });
 
-  test("expires unacknowledged transfers and never redelivers them", async () => {
+  test("does not redeliver an expired transfer until the controller explicitly retries", async () => {
     let now = new Date("2026-08-30T12:00:00.000Z");
     const store = new MemoryTransferStore();
     const service = new TransferService(store, () => now);
@@ -203,6 +203,38 @@ describe("scoped durable Velocity transfers", () => {
       service.acknowledge(id, { movedPlayers: ["Alice"], failures: [] }),
     ).rejects.toThrow(/expired/);
     expect((await store.find(id))?.status).toBe("expired");
+
+    const retriedId = await service.issue({
+      deploymentId: "dep_change",
+      fromRoute: "realm-a",
+      toRoute: "lobby",
+      message: "Brief safety move",
+      sourcePlayers: ["Alice"],
+      expiresInMs: 1_000,
+    });
+    expect(retriedId).toBe(id);
+    expect((await service.listPending())[0]).toMatchObject({ transferId: id, attempt: 1 });
+  });
+
+  test("retries a partially failed acknowledgement with the same idempotency key", async () => {
+    const now = new Date("2026-08-30T12:00:00.000Z");
+    const store = new MemoryTransferStore();
+    const service = new TransferService(store, () => now);
+    const input = {
+      deploymentId: "dep_retry",
+      fromRoute: "lobby",
+      toRoute: "realm-b",
+      message: "Joining the verified replacement server",
+      sourcePlayers: ["Alice", "Bob"],
+    };
+    const id = await service.issue(input);
+    await service.acknowledge(id, {
+      movedPlayers: ["Alice"],
+      failures: [{ player: "Bob", reason: "connection failed" }],
+    });
+
+    await expect(service.issue(input)).resolves.toBe(id);
+    expect(await store.find(id)).toMatchObject({ status: "pending", ack: null, attempts: 0 });
   });
 });
 

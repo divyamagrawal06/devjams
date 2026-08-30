@@ -600,6 +600,8 @@ export function AllayCompanion({
         appendMessage("allay", `${server?.name ?? "The workload"} will stay as it is.`);
         return;
       }
+      appendMessage("allay", "Please confirm or cancel the pending power request first.");
+      return;
     }
 
     if (pendingSelection) {

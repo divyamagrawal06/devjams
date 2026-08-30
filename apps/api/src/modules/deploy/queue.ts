@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { type DeploymentStore, deploymentStore } from "./store";
+import { type DeploymentRecord, type DeploymentStore, deploymentStore } from "./store";
 
 const DEFAULT_MAX_CONCURRENT = 1;
 const DEFAULT_LEASE_MS = 15 * 60 * 1000;
@@ -31,8 +31,25 @@ export class DurableDeploymentQueue {
     return this.store.queuePosition(id);
   }
 
+  get heartbeatIntervalMs(): number {
+    return Math.max(250, Math.floor(this.leaseMs / 3));
+  }
+
   claimNext(): Promise<string | null> {
     return this.store.claimNext(this.workerId, this.maxConcurrent, this.leaseMs);
+  }
+
+  claimExpired(): Promise<DeploymentRecord | null> {
+    return this.store.claimExpired(`recovery_${this.workerId}`, this.leaseMs);
+  }
+
+  async claimAvailable(): Promise<string[]> {
+    const claimed: string[] = [];
+    while (true) {
+      const deploymentId = await this.claimNext();
+      if (!deploymentId) return claimed;
+      claimed.push(deploymentId);
+    }
   }
 
   renew(id: string): Promise<boolean> {

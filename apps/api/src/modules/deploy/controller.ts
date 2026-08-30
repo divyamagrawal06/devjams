@@ -6,10 +6,37 @@ import { releaseDeploymentHeadroom, reserveDeploymentHeadroom } from "../quota/h
 import { RulesService } from "../rules/service";
 import { issueTransfer, waitForAck } from "../velocity/transfers";
 import { AuthClient } from "./invariant";
-import { deploymentQueue } from "./queue";
-import { type DeploymentPatch, type DeploymentRecord, deploymentStore } from "./store";
+import { type DurableDeploymentQueue, deploymentQueue } from "./queue";
+import {
+  type DeploymentPatch,
+  type DeploymentRecord,
+  type DeploymentStore,
+  deploymentStore,
+  type RuleHead,
+} from "./store";
 
 const nowIso = () => new Date().toISOString();
+
+type RollbackTargetLookup = (serverId: string) => RuleHead | null | Promise<RuleHead | null>;
+
+export async function rollbackTargetError(
+  serverId: string,
+  targetVersion: string,
+  approvedContentDigest: string,
+  lookup: RollbackTargetLookup = (id) => deploymentStore.findRuleHead(id),
+): Promise<string | null> {
+  const head = await lookup(serverId);
+  if (!head?.previousVersion || !head.previousDigest) {
+    return "No rollback target recorded for this server";
+  }
+  if (head.previousVersion !== targetVersion) {
+    return "Rollback target does not match the recorded previous version";
+  }
+  if (!digestsEqual(head.previousDigest, approvedContentDigest)) {
+    return "Rollback digest does not match the recorded previous artifact";
+  }
+  return null;
+}
 
 export function assertApprovedArtifactDigest(approvedDigest: string, builtDigest: string): void {
   if (!digestsEqual(approvedDigest, builtDigest)) {
@@ -53,11 +80,12 @@ async function transition(
   patch: DeploymentPatch = {},
   detail: string | null = null,
 ): Promise<DeploymentRecord> {
-  const row = await deploymentStore.transition(id, state, patch, detail);
-  if (row.queueStatus === "running") {
+  const current = await deploymentStore.find(id);
+  if (current?.queueStatus === "running") {
     const renewed = await deploymentQueue.renew(id);
     if (!renewed) throw new Error(`Deployment ${id} lost its durable queue lease`);
   }
+  const row = await deploymentStore.transition(id, state, patch, detail);
   row.queuePosition = state === "queued" ? await deploymentQueue.position(id) : null;
   return row;
 }
@@ -101,17 +129,31 @@ export async function enqueueDeploy(input: {
     workerId: null,
     leaseExpiresAt: null,
   });
-  const admitted = await deploymentQueue.claimNext();
-  if (admitted) startMachine(admitted);
+  await startAvailable();
   const current = (await deploymentStore.find(id)) ?? created;
   return view(current);
 }
 
 function startMachine(id: string): void {
-  void runMachine(id).catch(async (error) => {
-    console.error(`[deploy ${id}] machine failed`, error);
-    await failAndAbort(id, error);
-  });
+  const heartbeat = setInterval(() => {
+    void deploymentQueue
+      .renew(id)
+      .then((renewed) => {
+        if (!renewed) clearInterval(heartbeat);
+      })
+      .catch((error) => {
+        clearInterval(heartbeat);
+        console.error(`[deploy ${id}] lease heartbeat failed`, error);
+      });
+  }, deploymentQueue.heartbeatIntervalMs);
+  heartbeat.unref?.();
+
+  void runMachine(id)
+    .catch(async (error) => {
+      console.error(`[deploy ${id}] machine failed`, error);
+      await failAndAbort(id, error);
+    })
+    .finally(() => clearInterval(heartbeat));
 }
 
 async function runMachine(id: string): Promise<void> {
@@ -138,7 +180,7 @@ async function runMachine(id: string): Promise<void> {
   );
 
   await transition(id, "staging");
-  let candidate;
+  let candidate: Awaited<ReturnType<typeof provisionCandidate>>;
   try {
     await reserveDeploymentHeadroom(row.userId, row.serverId, id);
     candidate = await provisionCandidate({
@@ -148,6 +190,36 @@ async function runMachine(id: string): Promise<void> {
       artifactDigest: artifact.artifactDigest,
       artifactRuntimeVersion: artifact.runtimeMinecraftVersion,
     });
+    const leaseRetained = await fenceProvisionedCandidate({
+      renew: () => deploymentQueue.renew(id),
+      cleanup: () =>
+        deleteCandidate({
+          namespace: candidate.namespace,
+          deploymentName: candidate.deploymentName,
+          liveServerId: row.serverId,
+          deploymentId: id,
+        }),
+      recordCleanupRetry: async (error) => {
+        const current = await deploymentStore.find(id);
+        const state = current?.state === "failed" ? "failed" : "aborted";
+        await deploymentStore.transition(
+          id,
+          state,
+          {
+            candidatePod: candidate.deploymentName,
+            namespace: candidate.namespace,
+            error: `candidate cleanup pending: ${errorMessage(error)}`,
+            finishedAt: nowIso(),
+            queueStatus: "complete",
+            workerId: null,
+            leaseExpiresAt: null,
+          },
+          "candidate cleanup persisted for retry after lease loss",
+        );
+      },
+      releaseHeadroom: () => releaseDeploymentHeadroom(id),
+    });
+    if (!leaseRetained) return;
     await transition(id, "staging", {
       candidatePod: candidate.deploymentName,
       namespace: candidate.namespace,
@@ -168,52 +240,174 @@ async function runMachine(id: string): Promise<void> {
 }
 
 async function failAndAbort(id: string, error: unknown): Promise<void> {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = errorMessage(error);
   const row = await deploymentStore.find(id);
   if (!row) return;
   await abortDeployment(id, message);
 }
 
-async function startNext(): Promise<void> {
-  const admitted = await deploymentQueue.claimNext();
-  if (admitted) startMachine(admitted);
+type ExpiredRecoveryActions = {
+  abort(id: string, reason: string): Promise<void>;
+  releaseHeadroom(id: string): Promise<void>;
+};
+
+type ProvisionedCandidateFence = {
+  renew(): Promise<boolean>;
+  cleanup(): Promise<void>;
+  recordCleanupRetry(error: unknown): Promise<void>;
+  releaseHeadroom(): Promise<void>;
+};
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
-export async function abortDeployment(id: string, error?: string): Promise<DeploymentView> {
+export async function fenceProvisionedCandidate(
+  actions: ProvisionedCandidateFence,
+): Promise<boolean> {
+  if (await actions.renew()) return true;
+  try {
+    try {
+      await actions.cleanup();
+    } catch (error) {
+      await actions.recordCleanupRetry(error);
+    }
+  } finally {
+    await actions.releaseHeadroom();
+  }
+  return false;
+}
+
+export async function reconcilePendingCandidateCleanup(
+  store: DeploymentStore = deploymentStore,
+  cleanup: (row: DeploymentRecord) => Promise<void> = async (row) => {
+    if (!row.namespace || !row.candidatePod) return;
+    await deleteCandidate({
+      namespace: row.namespace,
+      deploymentName: row.candidatePod,
+      liveServerId: row.serverId,
+      deploymentId: row.id,
+    });
+  },
+  reportError: (row: DeploymentRecord, error: unknown) => void = (row, error) => {
+    console.error(`[deploy ${row.id}] candidate cleanup retry failed`, error);
+  },
+): Promise<string[]> {
+  const cleaned: string[] = [];
+  for (const row of await store.listPendingCandidateCleanup()) {
+    try {
+      await cleanup(row);
+      await store.transition(
+        row.id,
+        row.state,
+        {
+          candidatePod: null,
+          namespace: null,
+          error: "candidate resources cleaned after lease loss",
+        },
+        "completed durable candidate cleanup retry",
+      );
+      cleaned.push(row.id);
+    } catch (error) {
+      reportError(row, error);
+    }
+  }
+  return cleaned;
+}
+
+export async function reconcileExpiredDeployments(
+  claimer: Pick<DurableDeploymentQueue, "claimExpired"> = deploymentQueue,
+  store: DeploymentStore = deploymentStore,
+  actions: ExpiredRecoveryActions = {
+    abort: async (id, reason) => {
+      await abortDeployment(id, reason, { admitWaiting: false });
+    },
+    releaseHeadroom: releaseDeploymentHeadroom,
+  },
+): Promise<string[]> {
+  const reclaimed: string[] = [];
+  while (true) {
+    const row = await claimer.claimExpired();
+    if (!row) break;
+    const disposition = restartDisposition(row);
+    if (disposition === "abort_pre_cutover") {
+      await actions.abort(row.id, "deployment worker lease expired before cutover");
+      reclaimed.push(row.id);
+      continue;
+    }
+    if (row.state === "draining") {
+      await store.transition(
+        row.id,
+        "idle",
+        {
+          finishedAt: nowIso(),
+          queueStatus: "complete",
+          workerId: null,
+          leaseExpiresAt: null,
+        },
+        "finished committed cutover after worker lease expiry",
+      );
+      await actions.releaseHeadroom(row.id);
+      reclaimed.push(row.id);
+    }
+  }
+  return reclaimed;
+}
+
+async function startAvailable(): Promise<void> {
+  await reconcileExpiredDeployments();
+  await reconcilePendingCandidateCleanup();
+  const admitted = await deploymentQueue.claimAvailable();
+  for (const deploymentId of admitted) startMachine(deploymentId);
+}
+
+export function startDeploymentLeaseReaper(intervalMs = 30_000): () => void {
+  const timer = setInterval(() => {
+    void startAvailable().catch((error) => {
+      console.error("Deployment lease reconciliation failed", error);
+    });
+  }, intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
+export async function abortDeployment(
+  id: string,
+  error?: string,
+  options: { admitWaiting?: boolean } = {},
+): Promise<DeploymentView> {
   const row = await deploymentStore.find(id);
   if (!row) throw new Error("Deployment not found");
-  if (row.state === "aborted" || row.state === "failed" || row.state === "idle") {
+  if (row.state === "aborted" || row.state === "failed") {
+    await reconcilePendingCandidateCleanup();
+    return view((await deploymentStore.find(id)) ?? row);
+  }
+  if (row.state === "idle") {
     return view(row);
   }
   if (row.state === "draining" || row.state === "cutover") {
     return view(row);
   }
   assertPreCutover(row);
-  if (row.candidatePod && row.namespace) {
-    await deleteCandidate({
-      namespace: row.namespace,
-      deploymentName: row.candidatePod,
-      liveServerId: row.serverId,
-      deploymentId: id,
-    });
-  }
-  await releaseDeploymentHeadroom(id);
-  await deploymentQueue.complete(id);
-  const next = await transition(
+  // Terminalize before external cleanup. Candidate identity is deliberately
+  // preserved: an expired worker may publish it concurrently after returning
+  // from a blocked provisioning call, and cleanup is retried from durable state.
+  const next = await deploymentStore.transition(
     id,
     "aborted",
     {
       error: error ?? "aborted",
       finishedAt: nowIso(),
-      candidatePod: null,
       queueStatus: "complete",
       workerId: null,
       leaseExpiresAt: null,
     },
     error ?? "aborted by operator",
   );
-  await startNext();
-  return view(next);
+  await releaseDeploymentHeadroom(id);
+  await reconcilePendingCandidateCleanup();
+  if (options.admitWaiting !== false) await startAvailable();
+  return view((await deploymentStore.find(id)) ?? next);
 }
 
 export async function rollbackServer(input: {
@@ -223,19 +417,15 @@ export async function rollbackServer(input: {
   initiatedBy: string;
   userId: string;
 }): Promise<DeploymentView> {
-  const head = await deploymentStore.findRuleHead(input.serverId);
-  if (!head?.previousVersion || !head.previousDigest) {
-    throw new Error("No rollback target recorded for this server");
-  }
-  if (head.previousVersion !== input.targetVersion) {
-    throw new Error("Rollback target does not match the recorded previous version");
-  }
-  if (!digestsEqual(head.previousDigest, input.approvedContentDigest)) {
-    throw new Error("Rollback digest does not match the recorded previous artifact");
-  }
+  const targetError = await rollbackTargetError(
+    input.serverId,
+    input.targetVersion,
+    input.approvedContentDigest,
+  );
+  if (targetError) throw new Error(targetError);
   return enqueueDeploy({
     serverId: input.serverId,
-    ruleSetVersion: head.previousVersion,
+    ruleSetVersion: input.targetVersion,
     approvedContentDigest: input.approvedContentDigest,
     initiatedBy: input.initiatedBy,
     userId: input.userId,
@@ -265,10 +455,27 @@ export async function reconcileInFlight(): Promise<void> {
     const disposition = restartDisposition(row);
     if (disposition === "resume_queue") continue;
     if (disposition === "abort_pre_cutover") {
-      await abortDeployment(row.id, "reconciled after backend restart before cutover");
+      await abortDeployment(row.id, "reconciled after backend restart before cutover", {
+        admitWaiting: false,
+      });
+      continue;
+    }
+    if (row.state === "draining") {
+      await deploymentStore.transition(
+        row.id,
+        "idle",
+        {
+          finishedAt: nowIso(),
+          queueStatus: "complete",
+          workerId: null,
+          leaseExpiresAt: null,
+        },
+        "finished committed cutover during startup reconciliation",
+      );
+      await releaseDeploymentHeadroom(row.id);
     }
   }
-  await startNext();
+  await startAvailable();
 }
 
 export async function completeCutover(id: string): Promise<void> {
@@ -290,20 +497,19 @@ export async function completeCutover(id: string): Promise<void> {
   await waitForAck(transferId);
   const draining = new AuthClient("draining");
   draining.assertCanRetireA();
-  await deploymentStore.recordCutover({
+  await deploymentStore.commitCutover({
     serverId: row.serverId,
     deploymentId: id,
     version: row.toVersion,
     digest: row.approvedContentDigest,
+    workerId: deploymentQueue.workerId,
   });
-  await transition(id, "draining");
   await transition(id, "idle", {
     finishedAt: nowIso(),
     queueStatus: "complete",
     workerId: null,
     leaseExpiresAt: null,
   });
-  await deploymentQueue.complete(id);
   await releaseDeploymentHeadroom(id);
-  await startNext();
+  await startAvailable();
 }

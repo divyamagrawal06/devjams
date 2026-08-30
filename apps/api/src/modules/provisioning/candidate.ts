@@ -333,12 +333,16 @@ export async function deleteCandidate(input: {
       }),
   ];
 
+  const failures: unknown[] = [];
   for (const del of deletions) {
     try {
       await del();
     } catch (error) {
-      if (getKubernetesStatusCode(error) !== 404) throw error;
+      if (getKubernetesStatusCode(error) !== 404) failures.push(error);
     }
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "Candidate cleanup did not delete every resource");
   }
 }
 

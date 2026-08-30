@@ -1,5 +1,7 @@
 import importlib.util
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import threading
 import unittest
 
 
@@ -64,6 +66,46 @@ class CandidateReadinessIdentityTests(unittest.TestCase):
                 self.deployment_id,
                 self.artifact_digest,
             )
+
+    def test_readiness_redirect_is_rejected_before_following_target(self):
+        requested_paths = []
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requested_paths.append(self.path)
+                if self.path == "/ready":
+                    self.send_response(302)
+                    self.send_header("Location", "/unrelated")
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(
+                    (
+                        '{"status":"ready","deployment_id":"dep_expected",'
+                        '"artifact_digest":"sha256:' + ("a" * 64) + '"}'
+                    ).encode("utf-8")
+                )
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "redirects are not allowed"):
+                with MEASURE.READINESS_OPENER.open(
+                    f"http://127.0.0.1:{server.server_port}/ready", timeout=1
+                ):
+                    pass
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+
+        self.assertEqual(requested_paths, ["/ready"])
 
 
 if __name__ == "__main__":

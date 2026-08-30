@@ -19,6 +19,6 @@ test("M1 candidate readiness identity regressions pass in the Python harness", a
     new Response(child.stdout).text(),
     new Response(child.stderr).text(),
   ]);
-  expect(`${stdout}\n${stderr}`).toContain("Ran 3 tests");
+  expect(`${stdout}\n${stderr}`).toContain("Ran 4 tests");
   expect(exitCode).toBe(0);
 });

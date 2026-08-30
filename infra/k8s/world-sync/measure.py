@@ -21,6 +21,16 @@ import urllib.parse
 import urllib.request
 
 
+class RejectReadinessRedirects(urllib.request.HTTPRedirectHandler):
+    """Keep candidate identity checks bound to the configured service endpoint."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RuntimeError("candidate readiness redirects are not allowed")
+
+
+READINESS_OPENER = urllib.request.build_opener(RejectReadinessRedirects())
+
+
 def env(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
@@ -134,7 +144,7 @@ def wait_ready(
     last_error = "not ready"
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=5) as response:
+            with READINESS_OPENER.open(url, timeout=5) as response:
                 if response.status != 200:
                     last_error = f"HTTP {response.status}"
                 elif response.headers.get_content_type() != "application/json":

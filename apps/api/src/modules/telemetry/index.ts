@@ -12,6 +12,7 @@ export {
   type AggregatorOptions,
   DEFAULT_STORE_TIMEOUT_MS,
   DEFAULT_WINDOW_SECONDS,
+  type DurableIngestInput,
   type IngestOutcome,
   TelemetryAggregator,
 } from "./aggregator.ts";
@@ -39,9 +40,15 @@ export {
 } from "./plugin.ts";
 export { DEFAULT_MAX_SESSION_SECONDS, SessionLedger } from "./sessions.ts";
 export {
+  type CommitTelemetryBatchInput,
   DrizzleRollupStore,
+  type DurableIngestResult,
+  type DurableRollupStore,
   InMemoryRollupStore,
+  isDurableRollupStore,
   type RollupListOptions,
   type RollupStore,
+  TelemetryBatchConflictError,
+  TelemetrySequenceError,
 } from "./store.ts";
 export { WindowAccumulator } from "./window.ts";

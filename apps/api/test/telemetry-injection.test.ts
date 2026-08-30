@@ -126,6 +126,8 @@ describe("hostile names are counted and never interpreted", () => {
         headers: {
           "content-type": "application/x-ndjson",
           "x-internal-key": INTERNAL_KEY,
+          "x-telemetry-emitter-id": "00000000-0000-4000-8000-000000000003",
+          "x-telemetry-sequence": "1",
         },
         body: `${JSON.stringify({
           kind: "join",

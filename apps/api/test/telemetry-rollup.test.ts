@@ -46,6 +46,7 @@ async function replayOverHttp(text: string, windowSeconds: number, batchSize = 2
   const app = telemetryPlugin({ store, aggregator, internalKey: INTERNAL_KEY });
 
   const lines = text.trim().split("\n");
+  let sequence = 0;
   for (let i = 0; i < lines.length; i += batchSize) {
     const body = `${lines.slice(i, i + batchSize).join("\n")}\n`;
     const response = await app.handle(
@@ -54,6 +55,8 @@ async function replayOverHttp(text: string, windowSeconds: number, batchSize = 2
         headers: {
           "content-type": "application/x-ndjson",
           "x-internal-key": INTERNAL_KEY,
+          "x-telemetry-emitter-id": "00000000-0000-4000-8000-000000000002",
+          "x-telemetry-sequence": String(++sequence),
         },
         body,
       }),

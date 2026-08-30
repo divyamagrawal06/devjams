@@ -335,6 +335,7 @@ export const agentCompatibilityModule = new Elysia({ name: "agent-v1-compatibili
         const rows = await listRuleVersions(identity.userId, params.id);
         const version = rows.find((row) => row.id === change.ruleVersionId);
         if (!version) throw new Error("Created rule version could not be read back");
+        const previous = rows.find((row) => row.version === change.ruleVersion - 1);
         set.status = 201;
         return {
           version,
@@ -342,7 +343,7 @@ export const agentCompatibilityModule = new Elysia({ name: "agent-v1-compatibili
             params.id,
             change.ruleVersion > 1 ? change.ruleVersion - 1 : null,
             change.ruleVersion,
-            null,
+            previous?.document ?? null,
             change.document,
           ),
           attempts: authored.attempts,

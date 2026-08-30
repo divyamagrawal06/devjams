@@ -11,6 +11,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -37,15 +38,19 @@ public final class TelemetryEmitter implements AutoCloseable {
         double value
     ) {}
 
+    private record Batch(long sequence, List<WorldEvent> events) {}
+
     private final ArrayBlockingQueue<WorldEvent> queue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
     private final Object bufferLock = new Object();
     private final AtomicBoolean requestInFlight = new AtomicBoolean(false);
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final AtomicLong dropped = new AtomicLong();
     /** Failed delivery stays ahead of newer queued windows. Guarded by bufferLock. */
-    private List<WorldEvent> retryBatch = List.of();
+    private Batch retryBatch;
     /** Queue, retry, and in-flight events share one hard memory budget. Guarded by bufferLock. */
     private int buffered;
+    private final UUID emitterId = UUID.randomUUID();
+    private long nextSequence = 1;
     private final HttpClient client;
     private final URI endpoint;
     private final String internalKey;
@@ -122,8 +127,8 @@ public final class TelemetryEmitter implements AutoCloseable {
             requestInFlight.set(false);
             return;
         }
-        List<WorldEvent> batch = nextBatch();
-        if (batch.isEmpty()) {
+        Batch batch = nextBatch();
+        if (batch == null) {
             requestInFlight.set(false);
             reportDrops();
             return;
@@ -131,19 +136,25 @@ public final class TelemetryEmitter implements AutoCloseable {
 
         HttpRequest request = requestFor(batch);
 
-        client.sendAsync(request, HttpResponse.BodyHandlers.discarding())
-            .whenComplete((response, error) -> {
-                boolean accepted = error == null && response != null
-                    && response.statusCode() >= 200 && response.statusCode() < 300;
-                completeBatch(batch, accepted);
-                requestInFlight.set(false);
-                reportDrops();
-            });
+        try {
+            client.sendAsync(request, HttpResponse.BodyHandlers.discarding())
+                .whenComplete((response, error) -> {
+                    boolean accepted = error == null && response != null
+                        && response.statusCode() >= 200 && response.statusCode() < 300;
+                    completeBatch(batch, accepted);
+                    requestInFlight.set(false);
+                    reportDrops();
+                });
+        } catch (RuntimeException error) {
+            completeBatch(batch, false);
+            requestInFlight.set(false);
+            throw error;
+        }
     }
 
-    private HttpRequest requestFor(List<WorldEvent> batch) {
+    private HttpRequest requestFor(Batch batch) {
         StringBuilder body = new StringBuilder();
-        for (WorldEvent event : batch) {
+        for (WorldEvent event : batch.events()) {
             if (!body.isEmpty()) body.append('\n');
             body.append(toJson(event));
         }
@@ -151,45 +162,48 @@ public final class TelemetryEmitter implements AutoCloseable {
             .timeout(REQUEST_TIMEOUT)
             .header("content-type", "application/x-ndjson")
             .header("x-internal-key", internalKey)
+            .header("x-telemetry-emitter-id", emitterId.toString())
+            .header("x-telemetry-sequence", Long.toString(batch.sequence()))
             .POST(HttpRequest.BodyPublishers.ofString(body.toString(), StandardCharsets.UTF_8))
             .build();
     }
 
-    private List<WorldEvent> nextBatch() {
+    private Batch nextBatch() {
         synchronized (bufferLock) {
-            if (!retryBatch.isEmpty()) {
-                List<WorldEvent> batch = retryBatch;
-                retryBatch = List.of();
+            if (retryBatch != null) {
+                Batch batch = retryBatch;
+                retryBatch = null;
                 return batch;
             }
-            List<WorldEvent> batch = new ArrayList<>(BATCH_SIZE);
-            queue.drainTo(batch, BATCH_SIZE);
-            return batch;
+            List<WorldEvent> events = new ArrayList<>(BATCH_SIZE);
+            queue.drainTo(events, BATCH_SIZE);
+            if (events.isEmpty()) return null;
+            return new Batch(nextSequence++, List.copyOf(events));
         }
     }
 
-    private void completeBatch(List<WorldEvent> batch, boolean accepted) {
+    private void completeBatch(Batch batch, boolean accepted) {
         synchronized (bufferLock) {
             if (accepted) {
-                buffered -= batch.size();
+                buffered -= batch.events().size();
                 return;
             }
             if (closed.get()) {
-                buffered -= batch.size();
-                dropped.addAndGet(batch.size());
+                buffered -= batch.events().size();
+                dropped.addAndGet(batch.events().size());
                 return;
             }
             // This batch is older than everything still in queue. Keeping it
             // separate makes the next attempt preserve event-time order.
-            retryBatch = List.copyOf(batch);
+            retryBatch = batch;
         }
     }
 
     private void discardWaiting() {
         synchronized (bufferLock) {
-            int waiting = queue.size() + retryBatch.size();
+            int waiting = queue.size() + (retryBatch == null ? 0 : retryBatch.events().size());
             queue.clear();
-            retryBatch = List.of();
+            retryBatch = null;
             buffered -= waiting;
             if (waiting > 0) dropped.addAndGet(waiting);
         }
@@ -240,31 +254,9 @@ public final class TelemetryEmitter implements AutoCloseable {
     public void close() {
         if (!closed.compareAndSet(false, true)) return;
         scheduler.shutdownNow();
-
-        if (requestInFlight.get()) {
-            // The HTTP callback owns the in-flight batch and will account for
-            // it. Everything waiting behind it is bounded and dropped now.
-            discardWaiting();
-            reportDrops();
-            return;
-        }
-
-        List<WorldEvent> finalBatch = nextBatch();
-        boolean accepted = false;
-        if (!finalBatch.isEmpty()) {
-            try {
-                HttpResponse<Void> response = client.send(
-                    requestFor(finalBatch),
-                    HttpResponse.BodyHandlers.discarding()
-                );
-                accepted = response.statusCode() >= 200 && response.statusCode() < 300;
-            } catch (InterruptedException error) {
-                Thread.currentThread().interrupt();
-            } catch (Exception error) {
-                // Accounted below without logging credentials or payloads.
-            }
-        }
-        completeBatch(finalBatch, accepted);
+        // Plugin disable runs on the game thread. Never perform synchronous I/O
+        // here; the in-flight callback accounts for its own batch and all
+        // waiting data is dropped within the fixed memory bound.
         discardWaiting();
         reportDrops();
     }

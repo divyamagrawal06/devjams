@@ -24,17 +24,39 @@ import {
   routePort,
   switchServerRoute,
 } from "./cutover";
-import { deploymentQueue } from "./queue";
+import { type DurableDeploymentQueue, deploymentQueue } from "./queue";
 import {
   DeploymentInterruptedError,
   type DeploymentPatch,
   type DeploymentRecord,
   type DeploymentStore,
   deploymentStore,
+  type RuleHead,
 } from "./store";
 
 const nowIso = () => new Date().toISOString();
 const LOBBY_ROUTE = "lobby";
+
+type RollbackTargetLookup = (serverId: string) => RuleHead | null | Promise<RuleHead | null>;
+
+export async function rollbackTargetError(
+  serverId: string,
+  targetVersion: string,
+  approvedContentDigest: string,
+  lookup: RollbackTargetLookup = (id) => deploymentStore.findRuleHead(id),
+): Promise<string | null> {
+  const head = await lookup(serverId);
+  if (!head?.previousVersion || !head.previousDigest) {
+    return "No rollback target recorded for this server";
+  }
+  if (head.previousVersion !== targetVersion) {
+    return "Rollback target does not match the recorded previous version";
+  }
+  if (!digestsEqual(head.previousDigest, approvedContentDigest)) {
+    return "Rollback digest does not match the recorded previous artifact";
+  }
+  return null;
+}
 
 export function assertApprovedArtifactDigest(approvedDigest: string, builtDigest: string): void {
   if (!digestsEqual(approvedDigest, builtDigest)) {
@@ -237,6 +259,14 @@ async function machineTransition(
   expectedStates: readonly DeploymentState[],
   allowAbortRequested = false,
 ): Promise<DeploymentRecord> {
+  if (store === deploymentStore) {
+    const current = await store.find(id);
+    if (current?.queueStatus === "running") {
+      if (current.workerId !== deploymentQueue.workerId || !(await deploymentQueue.renew(id))) {
+        throw new LeaseLostError(id);
+      }
+    }
+  }
   return store.transition(id, state, patch, detail, expectedStates, allowAbortRequested);
 }
 
@@ -245,17 +275,25 @@ async function moveAndCheckpointLobby(
   runtime: DeploymentMachineRuntime,
   store: DeploymentStore,
 ): Promise<DeploymentRecord> {
-  const ack = await runtime.movePlayers({
-    deploymentId: row.id,
-    fromRoute: row.serverId,
-    toRoute: LOBBY_ROUTE,
-    message: "Brief safety move while the reviewed world change is prepared",
-    sourcePlayers: row.sourcePlayers,
-  });
-  const outcome = validateTransferOutcome(row.sourcePlayers, ack);
-  const checkpointed = await machineTransition(
+  const liability = await machineTransition(
     store,
     row.id,
+    "freezing",
+    { lobbyPlayers: row.sourcePlayers },
+    "source roster durably marked as a lobby-transfer recovery liability",
+    ["freezing"],
+  );
+  const ack = await runtime.movePlayers({
+    deploymentId: liability.id,
+    fromRoute: liability.serverId,
+    toRoute: LOBBY_ROUTE,
+    message: "Brief safety move while the reviewed world change is prepared",
+    sourcePlayers: liability.sourcePlayers,
+  });
+  const outcome = validateTransferOutcome(liability.sourcePlayers, ack);
+  const checkpointed = await machineTransition(
+    store,
+    liability.id,
     "freezing",
     { lobbyPlayers: outcome.movedPlayers },
     "source roster moved to lobby; usernames retained only for recovery",
@@ -263,7 +301,7 @@ async function moveAndCheckpointLobby(
     true,
   );
   if (checkpointed.abortRequestedAt) {
-    throw new DeploymentInterruptedError(row.id, checkpointed.state);
+    throw new DeploymentInterruptedError(liability.id, checkpointed.state);
   }
   requireSuccessfulTransfer(outcome);
   return checkpointed;
@@ -273,6 +311,7 @@ async function runPostCutover(
   id: string,
   runtime: DeploymentMachineRuntime,
   store: DeploymentStore,
+  workerId: string,
 ): Promise<void> {
   let row = await store.find(id);
   if (!row) throw new Error("Deployment not found");
@@ -315,6 +354,7 @@ async function runPostCutover(
       deploymentId: row.id,
       version: row.toVersion,
       digest: row.approvedContentDigest,
+      workerId,
     });
   }
 
@@ -357,11 +397,15 @@ export async function executeDeploymentMachine(
   id: string,
   runtime: DeploymentMachineRuntime = productionRuntime,
   store: DeploymentStore = deploymentStore,
+  workerId?: string,
+  renewLease?: () => Promise<boolean>,
 ): Promise<void> {
   let row = await store.find(id);
   if (!row) throw new Error("Deployment not found");
+  const leaseOwner = workerId ?? row.workerId;
+  if (!leaseOwner) throw new Error("Deployment is missing its durable queue owner");
   if (row.state === "cutover" || row.state === "draining") {
-    await runPostCutover(id, runtime, store);
+    await runPostCutover(id, runtime, store, leaseOwner);
     return;
   }
   if (row.queueStatus !== "running" || row.state !== "queued") return;
@@ -395,6 +439,43 @@ export async function executeDeploymentMachine(
   );
   await runtime.reserveHeadroom(row);
   const candidate = await runtime.provision(row, artifact);
+  const provisionedRow: DeploymentRecord = {
+    ...row,
+    candidatePod: candidate.deploymentName,
+    candidateService: candidate.serviceName,
+    candidatePvc: candidate.pvcName,
+    namespace: candidate.namespace,
+    liveDeployment: candidate.liveDeploymentName,
+    liveService: candidate.liveServiceName,
+    livePvc: candidate.livePvcName,
+    liveProxyTarget: candidate.liveProxyTarget,
+  };
+  if (renewLease) {
+    const retained = await fenceProvisionedCandidate({
+      renew: renewLease,
+      cleanup: () => runtime.removeCandidate(provisionedRow),
+      recordCleanupRetry: async (error) => {
+        const current = await store.find(id);
+        if (!current) return;
+        await store.transition(
+          id,
+          current.state,
+          {
+            candidatePod: candidate.deploymentName,
+            candidateService: candidate.serviceName,
+            candidatePvc: candidate.pvcName,
+            namespace: candidate.namespace,
+            error: `candidate cleanup pending: ${errorMessage(error)}`,
+          },
+          "candidate cleanup persisted for retry after lease loss",
+          [current.state],
+          true,
+        );
+      },
+      releaseHeadroom: () => runtime.releaseHeadroom(id),
+    });
+    if (!retained) return;
+  }
   row = await machineTransition(
     store,
     id,
@@ -478,7 +559,7 @@ export async function executeDeploymentMachine(
     "candidate verified; entering non-abortable route cutover",
     ["verifying"],
   );
-  await runPostCutover(row.id, runtime, store);
+  await runPostCutover(row.id, runtime, store, leaseOwner);
 }
 
 async function compensatePreCutover(
@@ -521,6 +602,26 @@ async function compensatePreCutover(
   }
 
   if (row.lobbyPlayers.length) {
+    const pendingAck = await runtime.movePlayers({
+      deploymentId: row.id,
+      fromRoute: row.serverId,
+      toRoute: LOBBY_ROUTE,
+      message: "Brief safety move while the reviewed world change is prepared",
+      sourcePlayers: row.sourcePlayers,
+    });
+    const pendingOutcome = validateTransferOutcome(row.sourcePlayers, pendingAck);
+    row = await machineTransition(
+      store,
+      id,
+      row.state,
+      { lobbyPlayers: pendingOutcome.movedPlayers },
+      "settled the durable source-to-lobby instruction before compensation",
+      [row.state],
+      true,
+    );
+  }
+
+  if (row.lobbyPlayers.length) {
     const ack = await runtime.movePlayers({
       deploymentId: row.id,
       fromRoute: LOBBY_ROUTE,
@@ -528,16 +629,17 @@ async function compensatePreCutover(
       message: "Returning to the unchanged server after a safe abort",
       sourcePlayers: row.lobbyPlayers,
     });
-    validateTransferOutcome(row.lobbyPlayers, ack);
+    const outcome = validateTransferOutcome(row.lobbyPlayers, ack);
     row = await machineTransition(
       store,
       id,
       row.state,
-      { lobbyPlayers: [] },
+      { lobbyPlayers: outcome.failures.map((failure) => failure.player) },
       "all still-connected recovery players accounted for",
       [row.state],
       true,
     );
+    requireSuccessfulTransfer(outcome);
   }
 
   await runtime.cleanupCutover(row);
@@ -586,27 +688,165 @@ async function requestAndCompensate(
   return compensatePreCutover(id, error, runtime, store);
 }
 
-async function withLeaseHeartbeat<T>(id: string, operation: () => Promise<T>): Promise<T> {
+type ExpiredRecoveryActions = {
+  abort(id: string, reason: string): Promise<void>;
+  releaseHeadroom(id: string): Promise<void>;
+};
+
+type ProvisionedCandidateFence = {
+  renew(): Promise<boolean>;
+  cleanup(): Promise<void>;
+  recordCleanupRetry(error: unknown): Promise<void>;
+  releaseHeadroom(): Promise<void>;
+};
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export async function fenceProvisionedCandidate(
+  actions: ProvisionedCandidateFence,
+): Promise<boolean> {
+  if (await actions.renew()) return true;
+  try {
+    try {
+      await actions.cleanup();
+    } catch (error) {
+      await actions.recordCleanupRetry(error);
+    }
+  } finally {
+    await actions.releaseHeadroom();
+  }
+  return false;
+}
+
+export async function reconcilePendingCandidateCleanup(
+  store: DeploymentStore = deploymentStore,
+  cleanup: (row: DeploymentRecord) => Promise<void> = async (row) => {
+    if (!row.namespace || !row.candidatePod) return;
+    await deleteCandidate({
+      namespace: row.namespace,
+      deploymentName: row.candidatePod,
+      liveServerId: row.serverId,
+      deploymentId: row.id,
+    });
+  },
+  reportError: (row: DeploymentRecord, error: unknown) => void = (row, error) => {
+    console.error(`[deploy ${row.id}] candidate cleanup retry failed`, error);
+  },
+): Promise<string[]> {
+  const cleaned: string[] = [];
+  for (const row of await store.listPendingCandidateCleanup()) {
+    try {
+      await cleanup(row);
+      await store.transition(
+        row.id,
+        row.state,
+        {
+          candidatePod: null,
+          candidateService: null,
+          candidatePvc: null,
+          namespace: null,
+          error: "candidate resources cleaned after lease loss",
+        },
+        "completed durable candidate cleanup retry",
+        [row.state],
+        true,
+      );
+      cleaned.push(row.id);
+    } catch (error) {
+      reportError(row, error);
+    }
+  }
+  return cleaned;
+}
+
+export async function reconcileExpiredDeployments(
+  claimer: Pick<DurableDeploymentQueue, "claimExpired"> = deploymentQueue,
+  store: DeploymentStore = deploymentStore,
+  actions: ExpiredRecoveryActions = {
+    abort: async (id, reason) => {
+      await requestAndCompensate(id, reason, productionRuntime, store);
+    },
+    releaseHeadroom: releaseDeploymentHeadroom,
+  },
+): Promise<string[]> {
+  const reclaimed: string[] = [];
+  while (true) {
+    const row = await claimer.claimExpired();
+    if (!row) break;
+    const disposition = restartDisposition(row);
+    if (disposition === "abort_pre_cutover") {
+      await actions.abort(row.id, "deployment worker lease expired before cutover");
+      reclaimed.push(row.id);
+      continue;
+    }
+    if (row.state === "draining") {
+      await store.transition(
+        row.id,
+        "idle",
+        {
+          finishedAt: nowIso(),
+          queueStatus: "complete",
+          workerId: null,
+          leaseExpiresAt: null,
+        },
+        "finished committed cutover after worker lease expiry",
+        ["draining"],
+        true,
+      );
+      await actions.releaseHeadroom(row.id);
+      reclaimed.push(row.id);
+    }
+  }
+  return reclaimed;
+}
+
+class LeaseLostError extends Error {
+  constructor(
+    readonly deploymentId: string,
+    cause?: unknown,
+  ) {
+    super(`Deployment ${deploymentId} lost its durable queue lease`, { cause });
+    this.name = "LeaseLostError";
+  }
+}
+
+export async function withLeaseHeartbeat<T>(
+  id: string,
+  operation: () => Promise<T>,
+  queue: Pick<DurableDeploymentQueue, "renew" | "heartbeatIntervalMs"> = deploymentQueue,
+): Promise<T> {
   let leaseLost = false;
+  let leaseFailure: unknown;
   let renewing = false;
   const renew = async () => {
     if (renewing) return;
     renewing = true;
     try {
-      if (!(await deploymentQueue.renew(id))) leaseLost = true;
+      if (!(await queue.renew(id))) leaseLost = true;
+    } catch (error) {
+      leaseLost = true;
+      leaseFailure = error;
     } finally {
       renewing = false;
     }
   };
   await renew();
-  if (leaseLost) throw new Error("Deployment lost its durable queue lease");
+  if (leaseLost) throw new LeaseLostError(id, leaseFailure);
   const timer = setInterval(() => {
     void renew();
-  }, 20_000);
+  }, queue.heartbeatIntervalMs);
   timer.unref?.();
   try {
-    const result = await operation();
-    if (leaseLost) throw new Error("Deployment lost its durable queue lease");
+    let result: T;
+    try {
+      result = await operation();
+    } catch (error) {
+      if (leaseLost) throw new LeaseLostError(id, leaseFailure ?? error);
+      throw error;
+    }
+    if (leaseLost) throw new LeaseLostError(id, leaseFailure);
     return result;
   } finally {
     clearInterval(timer);
@@ -618,21 +858,34 @@ const activeMachines = new Set<string>();
 function startMachine(id: string): void {
   if (activeMachines.has(id)) return;
   activeMachines.add(id);
-  void withLeaseHeartbeat(id, () => executeDeploymentMachine(id))
+  void withLeaseHeartbeat(id, () =>
+    executeDeploymentMachine(id, productionRuntime, deploymentStore, deploymentQueue.workerId, () =>
+      deploymentQueue.renew(id),
+    ),
+  )
     .then(() => {
       activeMachines.delete(id);
       return startNext();
     })
     .catch(async (error) => {
-      activeMachines.delete(id);
       console.error("[deploy " + id + "] machine failed", error);
+      if (error instanceof LeaseLostError) {
+        activeMachines.delete(id);
+        scheduleReconcileAt(Date.now() + 1_000);
+        return;
+      }
       const row = await deploymentStore.find(id);
-      if (!row) return;
+      if (!row) {
+        activeMachines.delete(id);
+        return;
+      }
       if (PRE_CUTOVER_STATES.includes(row.state as (typeof PRE_CUTOVER_STATES)[number])) {
         try {
           await requestAndCompensate(id, error instanceof Error ? error.message : String(error));
+          activeMachines.delete(id);
           await startNext();
         } catch (abortError) {
+          activeMachines.delete(id);
           console.error(
             "[deploy " + id + "] compensation failed; reconciliation will retry",
             abortError,
@@ -654,13 +907,14 @@ function startMachine(id: string): void {
       } catch (recordError) {
         console.error("[deploy " + id + "] failed to persist reconciliation error", recordError);
         scheduleReconcileAt(Date.now() + 15_000);
+      } finally {
+        activeMachines.delete(id);
       }
     });
 }
 
 async function startNext(): Promise<void> {
-  const admitted = await deploymentQueue.claimNext();
-  if (admitted) startMachine(admitted);
+  for (const admitted of await deploymentQueue.claimAvailable()) startMachine(admitted);
 }
 
 export async function getDeployment(id: string): Promise<DeploymentView | null> {
@@ -741,8 +995,7 @@ export async function enqueueDeploy(input: DeploymentEnqueueInput): Promise<Depl
     ) {
       throw new Error("Deployment id is already bound to a different reviewed operation");
     }
-    const admitted = await deploymentQueue.claimNext();
-    if (admitted) startMachine(admitted);
+    await admitQueuedDeployments();
     return view((await deploymentStore.find(id)) ?? existing);
   }
   const head = await deploymentStore.findRuleHead(input.serverId);
@@ -754,7 +1007,11 @@ export async function enqueueDeploy(input: DeploymentEnqueueInput): Promise<Depl
   return view(current);
 }
 
-export async function abortDeployment(id: string, error?: string): Promise<DeploymentView> {
+export async function abortDeployment(
+  id: string,
+  error?: string,
+  options: { admitWaiting?: boolean } = {},
+): Promise<DeploymentView> {
   const requested = await deploymentStore.requestAbort(id, new Date());
   if (!requested) throw new Error("Deployment not found");
   if (
@@ -768,7 +1025,7 @@ export async function abortDeployment(id: string, error?: string): Promise<Deplo
     return view(requested);
   }
   const result = await requestAndCompensate(id, error ?? "aborted by operator");
-  if (result.state === "aborted") await startNext();
+  if (result.state === "aborted" && options.admitWaiting !== false) await startNext();
   return view(result);
 }
 
@@ -787,7 +1044,9 @@ export async function completeCutover(id: string): Promise<void> {
   if (row.state !== "cutover" && row.state !== "draining" && row.state !== "idle") {
     throw new Error("Cutover is automatic and has not reached the post-cutover boundary");
   }
-  if (row.state !== "idle") await runPostCutover(id, productionRuntime, deploymentStore);
+  if (row.state !== "idle") {
+    await runPostCutover(id, productionRuntime, deploymentStore, deploymentQueue.workerId);
+  }
 }
 
 export async function rollbackServer(input: {
@@ -797,19 +1056,15 @@ export async function rollbackServer(input: {
   initiatedBy: string;
   userId: string;
 }): Promise<DeploymentView> {
-  const head = await deploymentStore.findRuleHead(input.serverId);
-  if (!head?.previousVersion || !head.previousDigest) {
-    throw new Error("No rollback target recorded for this server");
-  }
-  if (head.previousVersion !== input.targetVersion) {
-    throw new Error("Rollback target does not match the recorded previous version");
-  }
-  if (!digestsEqual(head.previousDigest, input.approvedContentDigest)) {
-    throw new Error("Rollback digest does not match the recorded previous artifact");
-  }
+  const targetError = await rollbackTargetError(
+    input.serverId,
+    input.targetVersion,
+    input.approvedContentDigest,
+  );
+  if (targetError) throw new Error(targetError);
   return enqueueDeploy({
     serverId: input.serverId,
-    ruleSetVersion: head.previousVersion,
+    ruleSetVersion: input.targetVersion,
     approvedContentDigest: input.approvedContentDigest,
     initiatedBy: input.initiatedBy,
     userId: input.userId,
@@ -850,11 +1105,13 @@ export async function reconcileInFlight(): Promise<void> {
     scheduledReconcile = null;
     scheduledReconcileAt = 0;
   }
+  await reconcilePendingCandidateCleanup();
   const recoverable = await deploymentStore.listRecoverable();
   let nextLeaseExpiry: number | null = null;
 
   for (const row of recoverable) {
     if (row.queueStatus === "waiting" && row.state === "queued") continue;
+    if (activeMachines.has(row.id)) continue;
 
     const leaseExpiresAt = row.leaseExpiresAt ? new Date(row.leaseExpiresAt).getTime() : 0;
     let owned = row.workerId === deploymentQueue.workerId && leaseExpiresAt > Date.now();
@@ -867,9 +1124,15 @@ export async function reconcileInFlight(): Promise<void> {
 
     const disposition = restartDisposition(row);
     if (disposition === "abort_pre_cutover") {
+      if (activeMachines.has(row.id)) continue;
+      activeMachines.add(row.id);
       void requestAndCompensate(row.id, "reconciled after backend restart before cutover")
-        .then(() => startNext())
+        .then(() => {
+          activeMachines.delete(row.id);
+          return startNext();
+        })
         .catch((error) => {
+          activeMachines.delete(row.id);
           console.error("[deploy " + row.id + "] restart compensation failed", error);
           scheduleReconcileAt(Date.now() + 15_000);
         });
@@ -883,4 +1146,14 @@ export async function reconcileInFlight(): Promise<void> {
   if (nextLeaseExpiry !== null) {
     scheduleReconcileAt(nextLeaseExpiry + 50);
   }
+}
+
+export function startDeploymentLeaseReaper(intervalMs = 30_000): () => void {
+  const timer = setInterval(() => {
+    void reconcileInFlight().catch((error) => {
+      console.error("Deployment lease reconciliation failed", error);
+    });
+  }, intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
 }

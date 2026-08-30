@@ -15,7 +15,11 @@ import {
 import { and, asc, desc, eq, inArray, lt, sql } from "drizzle-orm";
 
 import { db } from "../../db";
-import { deployRulesApprovalClaim, operationApprovalService } from "../agent/approvals";
+import {
+  deployRulesApprovalClaim,
+  operationApprovalService,
+  redeemOperationApprovalInTransaction,
+} from "../agent/approvals";
 import { admitQueuedDeployments, queuedDeploymentRecord } from "../deploy/controller";
 import { createDeploymentRecordInTransaction } from "../deploy/store";
 import { RulesService } from "../rules/service";
@@ -157,28 +161,20 @@ export abstract class ChangeService {
           .limit(1)
       : [];
 
+    const timelineIdentity = result.envelope.deploymentId
+      ? sql`(${controlPlaneEvents.data}->>'change_id' = ${result.envelope.id} OR ${controlPlaneEvents.data}->>'deployment_id' = ${result.envelope.deploymentId})`
+      : sql`${controlPlaneEvents.data}->>'change_id' = ${result.envelope.id}`;
     const events = await db
       .select()
       .from(controlPlaneEvents)
-      .where(eq(controlPlaneEvents.serverId, result.envelope.serverId))
-      .orderBy(desc(controlPlaneEvents.id))
-      .limit(500);
-    const timeline = events
-      .reverse()
-      .filter((event) => {
-        const change = event.data.change_id;
-        const deployment = event.data.deployment_id;
-        return (
-          change === result.envelope.id ||
-          (result.envelope.deploymentId !== null && deployment === result.envelope.deploymentId)
-        );
-      })
-      .map((event) => ({
-        id: String(event.id),
-        type: event.type,
-        data: event.data,
-        createdAt: event.createdAt.toISOString(),
-      }));
+      .where(and(eq(controlPlaneEvents.serverId, result.envelope.serverId), timelineIdentity))
+      .orderBy(asc(controlPlaneEvents.id));
+    const timeline = events.map((event) => ({
+      id: String(event.id),
+      type: event.type,
+      data: event.data,
+      createdAt: event.createdAt.toISOString(),
+    }));
 
     return {
       ...publicEnvelope(result.envelope, result),
@@ -394,13 +390,6 @@ export abstract class ChangeService {
       issuedBy: userId,
       claim,
     });
-    const refusal = await operationApprovalService.redeem({
-      token: approval.token,
-      issuedTo: userId,
-      claim,
-    });
-    if (refusal) throw new ChangeOperationError(403, `Approval could not be redeemed: ${refusal}`);
-
     await db.transaction(async (tx) => {
       await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`review:${id}`}))`);
       const [locked] = await tx
@@ -418,6 +407,15 @@ export abstract class ChangeService {
           412,
           "The reviewed artifact changed; reload before approving.",
         );
+      }
+
+      const refusal = await redeemOperationApprovalInTransaction(tx, {
+        token: approval.token,
+        issuedTo: userId,
+        claim,
+      });
+      if (refusal) {
+        throw new ChangeOperationError(403, `Approval could not be redeemed: ${refusal}`);
       }
 
       const deploymentId = deterministicDeploymentId(id);

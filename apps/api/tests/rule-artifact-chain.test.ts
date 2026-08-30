@@ -6,6 +6,10 @@ import {
   assertCandidateArtifactCompatibility,
   buildArtifactLoader,
 } from "../src/modules/provisioning/candidate";
+import {
+  artifactServiceAccountName,
+  buildArtifactServiceAccount,
+} from "../src/modules/provisioning/tenancy";
 
 const originalLoaderImage = process.env.FARLANDS_ARTIFACT_FETCH_IMAGE;
 
@@ -51,6 +55,21 @@ describe("candidate artifact loading", () => {
       assertCandidateArtifactCompatibility({ ...artifact, serverRuntimeVersion: "1.21.1" }),
     ).toThrow(/incompatible/);
   });
+
+  test("uses a concrete tenant ServiceAccount for immutable artifact access", () => {
+    const account = buildArtifactServiceAccount(
+      "fl-owner",
+      artifactServiceAccountName("artifact-reader"),
+      "arn:aws:iam::123456789012:role/farlands-artifacts",
+    );
+    expect(account.metadata?.name).toBe("artifact-reader");
+    expect(account.metadata?.namespace).toBe("fl-owner");
+    expect(account.metadata?.annotations?.["eks.amazonaws.com/role-arn"]).toBe(
+      "arn:aws:iam::123456789012:role/farlands-artifacts",
+    );
+    expect(account.automountServiceAccountToken).toBe(false);
+    expect(() => artifactServiceAccountName("Not_Valid")).toThrow(/DNS-1123/);
+  });
 });
 
 test("rule versions and artifacts are database-enforced append-only records", () => {
@@ -94,4 +113,6 @@ test("M1 harness uses the corrected HTTP tar protocol and exact freeze order", (
   );
   expect(measurement).toContain('"status": "unmeasured"');
   expect(measurement).toContain("MIN_REALISTIC_WORLD_BYTES");
+  expect(measurement).toContain("readiness deployment identity mismatch");
+  expect(measurement).toContain("CANDIDATE_ARTIFACT_DIGEST");
 });

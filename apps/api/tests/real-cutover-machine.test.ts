@@ -67,6 +67,7 @@ class TestRuntime implements DeploymentMachineRuntime {
   }> = [];
   waitRouteFailures = 0;
   lobbyMoveFailures = 0;
+  sourceMoveThrows = 0;
 
   constructor(private readonly artifactDigest = DIGEST) {}
 
@@ -132,6 +133,10 @@ class TestRuntime implements DeploymentMachineRuntime {
       toRoute: input.toRoute,
       sourcePlayers: [...input.sourcePlayers],
     });
+    if (input.fromRoute === "srv_alpha" && this.sourceMoveThrows > 0) {
+      this.sourceMoveThrows -= 1;
+      throw new Error("backend restarted while the durable transfer was pending");
+    }
     if (input.fromRoute === "lobby" && this.lobbyMoveFailures > 0) {
       this.lobbyMoveFailures -= 1;
       const failed = input.sourcePlayers.at(-1);
@@ -355,11 +360,21 @@ describe("real cutover state machine", () => {
 
   test("runs an immutable prior artifact through the same safe path as a rollback", async () => {
     const store = new MemoryDeploymentStore();
-    await store.recordCutover({
+    await store.create(
+      deployment("dep_seed", "cutover", {
+        fromVersion: null,
+        toVersion: "6",
+        approvedContentDigest: OLD_DIGEST,
+        artifactDigest: OLD_DIGEST,
+        routeSwitched: true,
+      }),
+    );
+    await store.commitCutover({
       serverId: "srv_alpha",
       deploymentId: "dep_seed",
       version: "6",
       digest: OLD_DIGEST,
+      workerId: "worker_test",
     });
     await store.create(deployment("dep_forward"));
     await executeDeploymentMachine("dep_forward", new TestRuntime(), store);
@@ -388,6 +403,37 @@ describe("real cutover state machine", () => {
 });
 
 describe("abort and transfer invariants", () => {
+  test("restart compensation retains and settles a pending source-to-lobby liability", async () => {
+    const store = new MemoryDeploymentStore();
+    await store.create(deployment("dep_pending_lobby"));
+    const runtime = new TestRuntime();
+    runtime.sourceMoveThrows = 1;
+
+    await expect(executeDeploymentMachine("dep_pending_lobby", runtime, store)).rejects.toThrow(
+      /durable transfer was pending/,
+    );
+    expect(await store.find("dep_pending_lobby")).toMatchObject({
+      state: "freezing",
+      sourcePlayers: ["Alice", "Bob"],
+      lobbyPlayers: ["Alice", "Bob"],
+    });
+
+    await abortDeploymentWithRuntime(
+      "dep_pending_lobby",
+      runtime,
+      store,
+      "reconciled after backend restart",
+    );
+    expect(await store.find("dep_pending_lobby")).toMatchObject({
+      state: "aborted",
+      sourcePlayers: [],
+      lobbyPlayers: [],
+    });
+    expect(
+      runtime.transfers.map((transfer) => `${transfer.fromRoute}->${transfer.toRoute}`),
+    ).toEqual(["srv_alpha->lobby", "srv_alpha->lobby", "lobby->srv_alpha"]);
+  });
+
   test("refuses to advance the rule head to anything except the verified deployment artifact", async () => {
     const store = new MemoryDeploymentStore();
     await store.create(
@@ -403,6 +449,7 @@ describe("abort and transfer invariants", () => {
         deploymentId: "dep_tamper",
         version: "7",
         digest: OLD_DIGEST,
+        workerId: "worker_test",
       }),
     ).rejects.toThrow(/verified artifact exactly/);
     expect(await store.findRuleHead("srv_alpha")).toBeNull();

@@ -3,7 +3,7 @@ import { contentDigest, digestsEqual, TOKEN_PREFIX } from "@farlands/contracts";
 import { operationApprovals } from "@repo/db";
 import { and, eq, gt, isNull, sql } from "drizzle-orm";
 
-import { db } from "../../db";
+import { db, type TransactionType } from "../../db";
 import { generateOpaqueToken, hashOpaqueToken, isOpaqueToken } from "../auth/tokens";
 import type { CreateServerInput } from "../servers/model";
 
@@ -47,6 +47,74 @@ export type ApprovalRepository = {
   }): Promise<boolean>;
   find(tokenHash: string): Promise<StoredApproval | null>;
 };
+
+type ApprovalRedemptionInput = {
+  token?: string;
+  issuedTo: string;
+  claim: ApprovalClaim;
+};
+
+function redemptionIdentity(input: ApprovalRedemptionInput) {
+  if (!input.token || !isOpaqueToken(input.token, TOKEN_PREFIX.approval)) return null;
+  return {
+    tokenHash: hashOpaqueToken(input.token),
+    digest: canonicalApprovalDigest(input.claim),
+  };
+}
+
+function redemptionRefusal(
+  stored: StoredApproval | null,
+  input: ApprovalRedemptionInput,
+  digest: string,
+  now: Date,
+): ApprovalRefusalReason {
+  if (!stored) return "missing";
+  if (stored.issuedTo !== input.issuedTo) return "principal_mismatch";
+  if (stored.consumedAt) return "consumed";
+  if (stored.expiresAt <= now) return "expired";
+  if (
+    stored.operation !== input.claim.operation ||
+    stored.subject !== input.claim.subject ||
+    !digestsEqual(stored.contentDigest, digest)
+  ) {
+    return "digest_mismatch";
+  }
+  return "missing";
+}
+
+/** Consume a grant on the caller's transaction so its protected write and receipt roll back together. */
+export async function redeemOperationApprovalInTransaction(
+  tx: TransactionType,
+  input: ApprovalRedemptionInput,
+  now = new Date(),
+): Promise<ApprovalRefusalReason | null> {
+  const identity = redemptionIdentity(input);
+  if (!identity) return "missing";
+
+  const consumed = await tx
+    .update(operationApprovals)
+    .set({ consumedAt: now })
+    .where(
+      and(
+        eq(operationApprovals.tokenHash, identity.tokenHash),
+        eq(operationApprovals.issuedTo, input.issuedTo),
+        eq(operationApprovals.operation, input.claim.operation),
+        eq(operationApprovals.subject, input.claim.subject),
+        eq(operationApprovals.contentDigest, identity.digest),
+        gt(operationApprovals.expiresAt, now),
+        isNull(operationApprovals.consumedAt),
+      ),
+    )
+    .returning({ tokenHash: operationApprovals.tokenHash });
+  if (consumed.length === 1) return null;
+
+  const [stored] = await tx
+    .select()
+    .from(operationApprovals)
+    .where(eq(operationApprovals.tokenHash, identity.tokenHash))
+    .limit(1);
+  return redemptionRefusal(stored ?? null, input, identity.digest, now);
+}
 
 export function createServerApprovalClaim(userId: string, input: CreateServerInput): ApprovalClaim {
   return {
@@ -183,34 +251,21 @@ export class OperationApprovalService {
     issuedTo: string;
     claim: ApprovalClaim;
   }): Promise<ApprovalRefusalReason | null> {
-    if (!input.token || !isOpaqueToken(input.token, TOKEN_PREFIX.approval)) return "missing";
-
+    const identity = redemptionIdentity(input);
+    if (!identity) return "missing";
     const now = this.dependencies.now();
-    const tokenHash = hashOpaqueToken(input.token);
-    const digest = canonicalApprovalDigest(input.claim);
     const consumed = await this.repository.consume({
-      tokenHash,
+      tokenHash: identity.tokenHash,
       issuedTo: input.issuedTo,
       operation: input.claim.operation,
       subject: input.claim.subject,
-      contentDigest: digest,
+      contentDigest: identity.digest,
       now,
     });
     if (consumed) return null;
 
-    const stored = await this.repository.find(tokenHash);
-    if (!stored) return "missing";
-    if (stored.issuedTo !== input.issuedTo) return "principal_mismatch";
-    if (stored.consumedAt) return "consumed";
-    if (stored.expiresAt <= now) return "expired";
-    if (
-      stored.operation !== input.claim.operation ||
-      stored.subject !== input.claim.subject ||
-      !digestsEqual(stored.contentDigest, digest)
-    ) {
-      return "digest_mismatch";
-    }
-    return "missing";
+    const stored = await this.repository.find(identity.tokenHash);
+    return redemptionRefusal(stored, input, identity.digest, now);
   }
 }
 

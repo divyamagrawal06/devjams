@@ -25,9 +25,12 @@ export type DeploymentStatusReader = {
   }>;
 };
 
+type KubeconfigProfileReader = Pick<k8s.KubeConfig, "getUser">;
+type KubeconfigProfileContext = Pick<k8s.Context, "user">;
+
 export function resolveKubeconfigAwsProfile(
-  kubeConfig: k8s.KubeConfig,
-  context: k8s.Context,
+  kubeConfig: KubeconfigProfileReader,
+  context: KubeconfigProfileContext,
   explicitProfile = process.env.AWS_PROFILE,
 ): string | undefined {
   const explicit = explicitProfile?.trim();

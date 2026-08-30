@@ -1,5 +1,4 @@
 import { expect, test } from "bun:test";
-import { KubeConfig } from "@kubernetes/client-node";
 
 import {
   type DeploymentStatusReader,
@@ -49,25 +48,25 @@ test("waits for all replicas to disappear when scaling down", async () => {
 });
 
 test("preserves the selected kubeconfig AWS profile unless explicitly overridden", () => {
-  const kubeConfig = new KubeConfig();
-  kubeConfig.loadFromOptions({
-    clusters: [{ name: "farlands", server: "https://example.test" }],
-    users: [
-      {
-        name: "maintainer",
-        exec: {
-          apiVersion: "client.authentication.k8s.io/v1beta1",
-          command: "aws",
-          args: ["eks", "get-token"],
-          env: [{ name: "AWS_PROFILE", value: "maintainer" }],
-        },
-      },
-    ],
-    contexts: [{ name: "farlands", cluster: "farlands", user: "maintainer" }],
-    currentContext: "farlands",
-  });
-  const context = kubeConfig.getContexts().find((candidate) => candidate.name === "farlands");
-  if (!context) throw new Error("test kubeconfig did not load its context");
+  // Use the resolver's structural boundary instead of constructing the SDK
+  // class. Bun mocks are process-wide, so a different test file replacing the
+  // Kubernetes module must not make this unit test depend on file order.
+  const kubeConfig = {
+    getUser(name: string) {
+      return name === "maintainer"
+        ? {
+            name,
+            exec: {
+              apiVersion: "client.authentication.k8s.io/v1beta1",
+              command: "aws",
+              args: ["eks", "get-token"],
+              env: [{ name: "AWS_PROFILE", value: "maintainer" }],
+            },
+          }
+        : null;
+    },
+  };
+  const context = { user: "maintainer" };
 
   expect(resolveKubeconfigAwsProfile(kubeConfig, context, "")).toBe("maintainer");
   expect(resolveKubeconfigAwsProfile(kubeConfig, context, "release-bot")).toBe("release-bot");

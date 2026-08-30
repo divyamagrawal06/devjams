@@ -31,6 +31,10 @@ export class DurableDeploymentQueue {
     return this.store.queuePosition(id);
   }
 
+  get heartbeatIntervalMs(): number {
+    return Math.max(250, Math.floor(this.leaseMs / 3));
+  }
+
   claimNext(): Promise<string | null> {
     return this.store.claimNext(this.workerId, this.maxConcurrent, this.leaseMs);
   }

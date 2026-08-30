@@ -56,6 +56,7 @@ export interface DeploymentStore {
   renewLease(id: string, workerId: string, leaseMs: number): Promise<boolean>;
   completeQueue(id: string): Promise<void>;
   listRecoverable(): Promise<DeploymentRecord[]>;
+  listExpiredRunning(): Promise<DeploymentRecord[]>;
   findRuleHead(serverId: string): Promise<RuleHead | null>;
   commitCutover(input: {
     serverId: string;
@@ -274,6 +275,20 @@ export class DrizzleDeploymentStore implements DeploymentStore {
     return rows.map(toRecord);
   }
 
+  async listExpiredRunning(): Promise<DeploymentRecord[]> {
+    const rows = await db
+      .select()
+      .from(deployments)
+      .where(
+        and(
+          eq(deployments.queueStatus, "running"),
+          sql`(${deployments.leaseExpiresAt} IS NULL OR ${deployments.leaseExpiresAt} <= now())`,
+        ),
+      )
+      .orderBy(asc(deployments.queueSequence));
+    return rows.map(toRecord);
+  }
+
   async findRuleHead(serverId: string): Promise<RuleHead | null> {
     const row = await db.query.serverRuleHeads.findFirst({
       where: eq(serverRuleHeads.serverId, serverId),
@@ -433,6 +448,18 @@ export class MemoryDeploymentStore implements DeploymentStore {
         (row) =>
           !(["idle", "aborted", "failed"] as DeploymentState[]).includes(row.state) &&
           row.queueStatus !== "complete",
+      )
+      .sort((a, b) => a.queueSequence - b.queueSequence)
+      .map((row) => ({ ...row }));
+  }
+
+  async listExpiredRunning(): Promise<DeploymentRecord[]> {
+    const now = this.now();
+    return [...this.records.values()]
+      .filter(
+        (row) =>
+          row.queueStatus === "running" &&
+          (row.leaseExpiresAt === null || new Date(row.leaseExpiresAt) <= now),
       )
       .sort((a, b) => a.queueSequence - b.queueSequence)
       .map((row) => ({ ...row }));

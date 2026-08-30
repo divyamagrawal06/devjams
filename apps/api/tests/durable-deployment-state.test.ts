@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { restartDisposition } from "../src/modules/deploy/controller";
+import { reconcileExpiredDeployments, restartDisposition } from "../src/modules/deploy/controller";
 import { DurableDeploymentQueue } from "../src/modules/deploy/queue";
 import { type DeploymentRecord, MemoryDeploymentStore } from "../src/modules/deploy/store";
 import { MemoryHeadroomStore } from "../src/modules/quota/headroom";
@@ -85,6 +85,38 @@ describe("durable deployment queue and reconciliation", () => {
     await expect(queue.claimAvailable()).resolves.toEqual(["dep_first", "dep_second"]);
     await queue.complete("dep_first");
     await expect(queue.claimAvailable()).resolves.toEqual(["dep_third"]);
+  });
+
+  test("reclaims an abandoned lease before admitting queued work", async () => {
+    let now = new Date("2026-08-30T12:00:00.000Z");
+    const store = new MemoryDeploymentStore(() => now);
+    await store.create(deployment("dep_abandoned"));
+    await store.create(deployment("dep_waiting"));
+    const queue = new DurableDeploymentQueue(store, {
+      workerId: "worker_recovery",
+      maxConcurrent: 1,
+      leaseMs: 1_000,
+    });
+    await expect(queue.claimNext()).resolves.toBe("dep_abandoned");
+    await store.transition("dep_abandoned", "staging");
+
+    now = new Date("2026-08-30T12:00:01.001Z");
+    const aborted: string[] = [];
+    await expect(
+      reconcileExpiredDeployments(store, {
+        abort: async (id) => {
+          aborted.push(id);
+          await store.transition(id, "aborted", {
+            queueStatus: "complete",
+            workerId: null,
+            leaseExpiresAt: null,
+          });
+        },
+        releaseHeadroom: async () => undefined,
+      }),
+    ).resolves.toEqual(["dep_abandoned"]);
+    expect(aborted).toEqual(["dep_abandoned"]);
+    await expect(queue.claimAvailable()).resolves.toEqual(["dep_waiting"]);
   });
 
   test("defines conservative restart actions for every in-flight boundary", () => {

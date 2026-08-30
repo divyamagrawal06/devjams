@@ -10,6 +10,7 @@ import { deploymentQueue } from "./queue";
 import {
   type DeploymentPatch,
   type DeploymentRecord,
+  type DeploymentStore,
   deploymentStore,
   type RuleHead,
 } from "./store";
@@ -128,10 +129,25 @@ export async function enqueueDeploy(input: {
 }
 
 function startMachine(id: string): void {
-  void runMachine(id).catch(async (error) => {
-    console.error(`[deploy ${id}] machine failed`, error);
-    await failAndAbort(id, error);
-  });
+  const heartbeat = setInterval(() => {
+    void deploymentQueue
+      .renew(id)
+      .then((renewed) => {
+        if (!renewed) clearInterval(heartbeat);
+      })
+      .catch((error) => {
+        clearInterval(heartbeat);
+        console.error(`[deploy ${id}] lease heartbeat failed`, error);
+      });
+  }, deploymentQueue.heartbeatIntervalMs);
+  heartbeat.unref?.();
+
+  void runMachine(id)
+    .catch(async (error) => {
+      console.error(`[deploy ${id}] machine failed`, error);
+      await failAndAbort(id, error);
+    })
+    .finally(() => clearInterval(heartbeat));
 }
 
 async function runMachine(id: string): Promise<void> {
@@ -177,12 +193,68 @@ async function failAndAbort(id: string, error: unknown): Promise<void> {
   await abortDeployment(id, message);
 }
 
+type ExpiredRecoveryActions = {
+  abort(id: string, reason: string): Promise<void>;
+  releaseHeadroom(id: string): Promise<void>;
+};
+
+export async function reconcileExpiredDeployments(
+  store: DeploymentStore = deploymentStore,
+  actions: ExpiredRecoveryActions = {
+    abort: async (id, reason) => {
+      await abortDeployment(id, reason, { admitWaiting: false });
+    },
+    releaseHeadroom: releaseDeploymentHeadroom,
+  },
+): Promise<string[]> {
+  const reclaimed: string[] = [];
+  for (const row of await store.listExpiredRunning()) {
+    const disposition = restartDisposition(row);
+    if (disposition === "abort_pre_cutover") {
+      await actions.abort(row.id, "deployment worker lease expired before cutover");
+      reclaimed.push(row.id);
+      continue;
+    }
+    if (row.state === "draining") {
+      await store.transition(
+        row.id,
+        "idle",
+        {
+          finishedAt: nowIso(),
+          queueStatus: "complete",
+          workerId: null,
+          leaseExpiresAt: null,
+        },
+        "finished committed cutover after worker lease expiry",
+      );
+      await actions.releaseHeadroom(row.id);
+      reclaimed.push(row.id);
+    }
+  }
+  return reclaimed;
+}
+
 async function startAvailable(): Promise<void> {
+  await reconcileExpiredDeployments();
   const admitted = await deploymentQueue.claimAvailable();
   for (const deploymentId of admitted) startMachine(deploymentId);
 }
 
-export async function abortDeployment(id: string, error?: string): Promise<DeploymentView> {
+export function startDeploymentLeaseReaper(intervalMs = 30_000): () => void {
+  const timer = setInterval(() => {
+    void startAvailable().catch((error) => {
+      console.error("Deployment lease reconciliation failed", error);
+    });
+  }, intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
+export async function abortDeployment(
+  id: string,
+  error?: string,
+  options: { admitWaiting?: boolean } = {},
+): Promise<DeploymentView> {
   const row = await deploymentStore.find(id);
   if (!row) throw new Error("Deployment not found");
   if (row.state === "aborted" || row.state === "failed" || row.state === "idle") {
@@ -214,7 +286,7 @@ export async function abortDeployment(id: string, error?: string): Promise<Deplo
     },
     error ?? "aborted by operator",
   );
-  await startAvailable();
+  if (options.admitWaiting !== false) await startAvailable();
   return view(next);
 }
 
@@ -263,7 +335,24 @@ export async function reconcileInFlight(): Promise<void> {
     const disposition = restartDisposition(row);
     if (disposition === "resume_queue") continue;
     if (disposition === "abort_pre_cutover") {
-      await abortDeployment(row.id, "reconciled after backend restart before cutover");
+      await abortDeployment(row.id, "reconciled after backend restart before cutover", {
+        admitWaiting: false,
+      });
+      continue;
+    }
+    if (row.state === "draining") {
+      await deploymentStore.transition(
+        row.id,
+        "idle",
+        {
+          finishedAt: nowIso(),
+          queueStatus: "complete",
+          workerId: null,
+          leaseExpiresAt: null,
+        },
+        "finished committed cutover during startup reconciliation",
+      );
+      await releaseDeploymentHeadroom(row.id);
     }
   }
   await startAvailable();

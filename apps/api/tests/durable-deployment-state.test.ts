@@ -188,6 +188,24 @@ describe("durable deployment queue and reconciliation", () => {
     expect((await store.find("dep_cleanup"))?.namespace).toBeNull();
   });
 
+  test("terminalization never erases a concurrently published cleanup marker", async () => {
+    const store = new MemoryDeploymentStore();
+    await store.create(deployment("dep_race", { state: "staging", queueStatus: "running" }));
+    await store.transition("dep_race", "aborted", {
+      candidatePod: "candidate-late",
+      namespace: "fl-owner",
+      queueStatus: "complete",
+    });
+    await store.transition("dep_race", "aborted", {
+      error: "deployment worker lease expired before cutover",
+      queueStatus: "complete",
+      workerId: null,
+      leaseExpiresAt: null,
+    });
+    expect((await store.find("dep_race"))?.candidatePod).toBe("candidate-late");
+    expect((await store.find("dep_race"))?.namespace).toBe("fl-owner");
+  });
+
   test("defines conservative restart actions for every in-flight boundary", () => {
     expect(restartDisposition({ state: "queued", queueStatus: "waiting" })).toBe("resume_queue");
     for (const state of ["building", "staging", "presync", "freezing", "verifying"] as const) {

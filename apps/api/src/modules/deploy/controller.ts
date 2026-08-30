@@ -355,37 +355,36 @@ export async function abortDeployment(
 ): Promise<DeploymentView> {
   const row = await deploymentStore.find(id);
   if (!row) throw new Error("Deployment not found");
-  if (row.state === "aborted" || row.state === "failed" || row.state === "idle") {
+  if (row.state === "aborted" || row.state === "failed") {
+    await reconcilePendingCandidateCleanup();
+    return view((await deploymentStore.find(id)) ?? row);
+  }
+  if (row.state === "idle") {
     return view(row);
   }
   if (row.state === "draining" || row.state === "cutover") {
     return view(row);
   }
   assertPreCutover(row);
-  if (row.candidatePod && row.namespace) {
-    await deleteCandidate({
-      namespace: row.namespace,
-      deploymentName: row.candidatePod,
-      liveServerId: row.serverId,
-      deploymentId: id,
-    });
-  }
-  await releaseDeploymentHeadroom(id);
+  // Terminalize before external cleanup. Candidate identity is deliberately
+  // preserved: an expired worker may publish it concurrently after returning
+  // from a blocked provisioning call, and cleanup is retried from durable state.
   const next = await deploymentStore.transition(
     id,
     "aborted",
     {
       error: error ?? "aborted",
       finishedAt: nowIso(),
-      candidatePod: null,
       queueStatus: "complete",
       workerId: null,
       leaseExpiresAt: null,
     },
     error ?? "aborted by operator",
   );
+  await releaseDeploymentHeadroom(id);
+  await reconcilePendingCandidateCleanup();
   if (options.admitWaiting !== false) await startAvailable();
-  return view(next);
+  return view((await deploymentStore.find(id)) ?? next);
 }
 
 export async function rollbackServer(input: {

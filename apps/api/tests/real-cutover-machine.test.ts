@@ -12,6 +12,11 @@ import { MemoryDeploymentStore } from "../src/modules/deploy/store";
 
 const DIGEST = "sha256:" + "a".repeat(64);
 const OLD_DIGEST = "sha256:" + "c".repeat(64);
+const STORE_NOW = "2026-08-30T12:00:05.000Z";
+
+function deploymentStore(): MemoryDeploymentStore {
+  return new MemoryDeploymentStore(() => new Date(STORE_NOW));
+}
 
 function deployment(
   id: string,
@@ -214,7 +219,7 @@ function expectOrdered(values: string[], expected: string[]): void {
 
 describe("real cutover state machine", () => {
   test("runs A to lobby to verified B, retains A, and records rollback head", async () => {
-    const store = new MemoryDeploymentStore();
+    const store = deploymentStore();
     await store.create(deployment("dep_happy"));
     const runtime = new TestRuntime();
 
@@ -283,7 +288,7 @@ describe("real cutover state machine", () => {
   });
 
   test("resumes safely after a route observation failure without claiming cutover", async () => {
-    const store = new MemoryDeploymentStore();
+    const store = deploymentStore();
     await store.create(deployment("dep_resume"));
     const runtime = new TestRuntime();
     runtime.waitRouteFailures = 1;
@@ -307,7 +312,7 @@ describe("real cutover state machine", () => {
   });
 
   test("resumes draining idempotently after a backend restart", async () => {
-    const store = new MemoryDeploymentStore();
+    const store = deploymentStore();
     await store.create(
       deployment("dep_draining", "draining", {
         namespace: "fl-owner",
@@ -335,7 +340,7 @@ describe("real cutover state machine", () => {
   });
 
   test("retries a partially acknowledged lobby handoff without advancing the rule head", async () => {
-    const store = new MemoryDeploymentStore();
+    const store = deploymentStore();
     await store.create(deployment("dep_partial"));
     const runtime = new TestRuntime();
     runtime.lobbyMoveFailures = 1;
@@ -359,7 +364,7 @@ describe("real cutover state machine", () => {
   });
 
   test("runs an immutable prior artifact through the same safe path as a rollback", async () => {
-    const store = new MemoryDeploymentStore();
+    const store = deploymentStore();
     await store.create(
       deployment("dep_seed", "cutover", {
         fromVersion: null,
@@ -404,7 +409,7 @@ describe("real cutover state machine", () => {
 
 describe("abort and transfer invariants", () => {
   test("restart compensation retains and settles a pending source-to-lobby liability", async () => {
-    const store = new MemoryDeploymentStore();
+    const store = deploymentStore();
     await store.create(deployment("dep_pending_lobby"));
     const runtime = new TestRuntime();
     runtime.sourceMoveThrows = 1;
@@ -435,7 +440,7 @@ describe("abort and transfer invariants", () => {
   });
 
   test("refuses to advance the rule head to anything except the verified deployment artifact", async () => {
-    const store = new MemoryDeploymentStore();
+    const store = deploymentStore();
     await store.create(
       deployment("dep_tamper", "cutover", {
         artifactDigest: DIGEST,
@@ -466,7 +471,7 @@ describe("abort and transfer invariants", () => {
     test("compensates an abort from " + state, async () => {
       const hasCandidate = ["staging", "presync", "freezing", "verifying"].includes(state);
       const playersInLobby = ["freezing", "verifying"].includes(state);
-      const store = new MemoryDeploymentStore();
+      const store = deploymentStore();
       await store.create(
         deployment("dep_abort_" + state, state, {
           namespace: hasCandidate ? "fl-owner" : null,
@@ -515,7 +520,7 @@ describe("abort and transfer invariants", () => {
   }
 
   test("post-cutover abort is a no-op and never deletes B or retires A", async () => {
-    const store = new MemoryDeploymentStore();
+    const store = deploymentStore();
     await store.create(deployment("dep_noop", "cutover", { routeSwitched: true }));
     const runtime = new TestRuntime();
 

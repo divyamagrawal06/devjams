@@ -4,7 +4,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { Check, CircleAlert, CreditCard, ExternalLink, RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { api } from "@/lib/api";
+import { ApiError, api } from "@/lib/api";
 
 type BillingPlan = "starter" | "standard" | "pro";
 type PaidBillingPlan = Exclude<BillingPlan, "starter">;
@@ -27,6 +27,9 @@ type BillingSummaryResponse = {
   provider: "dodo_payments";
   enabled: boolean;
   current_plan: BillingPlan;
+  configuration_state: "ready" | "not_configured" | "invalid_configuration";
+  entitlement_state: "active" | "grace" | "starter";
+  grace_until: string | null;
   plans: BillingPlanSummary[];
   subscription: {
     plan: PaidBillingPlan;
@@ -35,6 +38,17 @@ type BillingSummaryResponse = {
     next_billing_date: string | null;
   } | null;
   can_manage_billing: boolean;
+  quota_reconciliation: {
+    state: "in_sync" | "needs_reconciliation";
+    over_quota: boolean;
+  };
+  checkout_reconciliation: {
+    id: string;
+    plan: PaidBillingPlan;
+    state: "creating" | "created" | "uncertain" | "failed";
+    error_code: string | null;
+    updated_at: string;
+  } | null;
 };
 
 type BillingCheckoutResponse = {
@@ -102,10 +116,17 @@ export function BillingPanel() {
         method: "POST",
         body: JSON.stringify({
           plan,
-          request_key: `${plan}:${crypto.randomUUID()}`,
+          request_key: stableCheckoutKey(plan),
         }),
       }),
     onSuccess: ({ checkout_url: checkoutUrl }) => window.location.assign(checkoutUrl),
+    onError: (error, plan) => {
+      if (!(error instanceof ApiError) || !error.body || typeof error.body !== "object") return;
+      const code = error.body.code;
+      if (code === "checkout_refused" || code === "checkout_expired") {
+        window.sessionStorage.removeItem(`indexd:billing-checkout:${plan}`);
+      }
+    },
   });
 
   const portal = useMutation({
@@ -129,6 +150,14 @@ export function BillingPanel() {
     const timeout = window.setTimeout(() => setAwaitingWebhook(false), 60_000);
     return () => window.clearTimeout(timeout);
   }, []);
+
+  useEffect(() => {
+    const current = billing.data?.current_plan;
+    if (current === "standard" || current === "pro") {
+      window.sessionStorage.removeItem(`indexd:billing-checkout:${current}`);
+      setAwaitingWebhook(false);
+    }
+  }, [billing.data?.current_plan]);
 
   const summary = billing.data;
   const plans = summary
@@ -209,8 +238,52 @@ export function BillingPanel() {
         <>
           {!summary.enabled ? (
             <p className="billing-disabled-note" role="status">
-              Paid plans are not configured yet. Starter limits remain active.
+              {summary.configuration_state === "invalid_configuration"
+                ? "Paid billing configuration is incomplete or unsafe. Starter limits remain active."
+                : "Paid plans are not configured yet. Starter limits remain active."}
             </p>
+          ) : null}
+
+          {summary.entitlement_state === "grace" ? (
+            <div className="billing-notice quiet" role="status">
+              <CircleAlert aria-hidden="true" size={17} />
+              <span>
+                Paid capacity is in a bounded grace period
+                {summary.grace_until ? ` until ${formatDate(summary.grace_until)}` : ""}. Existing
+                workloads remain intact; resolve payment in the billing portal.
+              </span>
+            </div>
+          ) : null}
+
+          {summary.quota_reconciliation.state === "needs_reconciliation" ? (
+            <div className="billing-notice quiet" role="alert">
+              <RefreshCw aria-hidden="true" size={17} />
+              <span>
+                Entitlement and quota projection do not match. New allocation may be blocked until
+                the connector reconciles them.
+              </span>
+            </div>
+          ) : null}
+
+          {summary.quota_reconciliation.over_quota ? (
+            <div className="billing-notice quiet" role="status">
+              <CircleAlert aria-hidden="true" size={17} />
+              <span>
+                Current usage exceeds this entitlement. Existing workloads are preserved; new
+                workloads and backups are blocked until usage or plan limits change.
+              </span>
+            </div>
+          ) : null}
+
+          {summary.checkout_reconciliation?.state === "uncertain" ||
+          summary.checkout_reconciliation?.state === "creating" ? (
+            <div className="billing-notice quiet" role="status">
+              <RefreshCw aria-hidden="true" size={17} />
+              <span>
+                The latest {planLabel(summary.checkout_reconciliation.plan)} checkout is awaiting
+                reconciliation. Retry reuses its request key and cannot silently open a duplicate.
+              </span>
+            </div>
           ) : null}
 
           {summary.subscription ? (
@@ -300,7 +373,8 @@ export function BillingPanel() {
 
           <p className="billing-footnote">
             Pricing and payment details are confirmed in Dodo&apos;s secure checkout. A checkout
-            return never changes your plan by itself.
+            return never changes your plan by itself. A timed-out request keeps its request key so
+            Retry cannot silently create a second checkout.
           </p>
         </>
       ) : null}
@@ -312,4 +386,13 @@ export function BillingPanel() {
       ) : null}
     </section>
   );
+}
+
+function stableCheckoutKey(plan: PaidBillingPlan): string {
+  const storageKey = `indexd:billing-checkout:${plan}`;
+  const existing = window.sessionStorage.getItem(storageKey);
+  if (existing) return existing;
+  const created = `billing:${plan}:${crypto.randomUUID()}`;
+  window.sessionStorage.setItem(storageKey, created);
+  return created;
 }

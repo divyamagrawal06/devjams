@@ -1,12 +1,19 @@
-import * as k8s from "@kubernetes/client-node";
-import { gameServers, serverConfigs, serverK8s, serverRoutes, userQuotas } from "@repo/db";
-import { and, desc, eq, inArray, ne } from "drizzle-orm";
+import type * as k8s from "@kubernetes/client-node";
+import {
+  controlPlaneEvents,
+  gameServers,
+  operatorReceipts,
+  serverConfigs,
+  serverK8s,
+  serverRoutes,
+} from "@repo/db";
+import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import { status } from "elysia";
 import { db, type TransactionType } from "../../db";
 import { deleteGameServer, provisionGameServer } from "../provisioning";
 import { makeKubernetesClients, waitForDeploymentReplicasReady } from "../provisioning/kubernetes";
 import { calculateContainerMemory } from "../provisioning/utils";
-import { QuotaService } from "../quota/quota.service";
+import { assertAllocationFits, QuotaService } from "../quota/quota.service";
 import {
   type CreateServerInput,
   type ServerActionInput,
@@ -208,6 +215,19 @@ type GameType = (typeof VALID_GAMES)[number];
 type StateType = (typeof VALID_STATES)[number];
 type DesiredStateType = (typeof VALID_DESIRED_STATES)[number];
 
+export type OperatorReceiptDisposition = "create" | "reuse" | "retry" | "conflict";
+
+export function operatorReceiptDisposition(
+  existing: { serverId: string; action: string; status: string } | null,
+  serverId: string,
+  action: ServerActionInput["action"],
+): OperatorReceiptDisposition {
+  if (!existing) return "create";
+  if (existing.serverId !== serverId || existing.action !== action) return "conflict";
+  if (existing.status === "failed" || existing.status === "refused") return "retry";
+  return "reuse";
+}
+
 export abstract class ServerService {
   private static readonly selection = {
     id: gameServers.id,
@@ -217,6 +237,7 @@ export abstract class ServerService {
     desiredState: gameServers.desiredState,
     statusMessage: gameServers.statusMessage,
     version: serverConfigs.version,
+    type: serverConfigs.type,
     cpuCores: serverConfigs.cpuCores,
     ramMb: serverConfigs.ramMb,
     storageGb: serverConfigs.storageGb,
@@ -492,81 +513,70 @@ export abstract class ServerService {
     });
   }
 
-  private static async patchPvcSize(_pvcName: string, _namespace: string, _storageGb: number) {
-    // TODO: confirm farlands-gp3 has allowVolumeExpansion: true before enabling.
-    throw new Error("Storage size increases are not yet supported. Contact an admin.");
-  }
-
   static async updateServerConfig(serverId: string, userId: string, data: UpdateServerConfigInput) {
     await this.requireOwnership(userId, serverId);
     const k8sRecord = await this.getK8sRecord(serverId);
+    const persistedAt = new Date();
+    const { previousConfig, newCpuCores, newRamMb } = await db.transaction(async (tx) => {
+      // Every allocation mutation for an owner takes the same quota-row lock,
+      // so two concurrent workload expansions cannot both admit against the
+      // same stale aggregate.
+      const quota = await QuotaService.getResourceLimits(userId, tx);
+      if (!quota) throw status(404, "No quota found for this account.");
 
-    // Snapshot current config — needed to revert if K8s patch fails.
-    const [previousConfig] = await db
-      .select()
-      .from(serverConfigs)
-      .where(eq(serverConfigs.serverId, serverId))
-      .limit(1);
+      const [previousConfig] = await tx
+        .select()
+        .from(serverConfigs)
+        .where(eq(serverConfigs.serverId, serverId))
+        .for("update");
+      if (!previousConfig) throw status(404, "Server configuration not found");
 
-    if (!previousConfig) throw status(404, "Server configuration not found");
+      const newCpuCores = data.cpuCores ?? Number(previousConfig.cpuCores);
+      const newRamMb = data.ramMb ?? previousConfig.ramMb;
+      const newStorageGb = data.storageGb ?? previousConfig.storageGb;
 
-    const newCpuCores = data.cpuCores ?? Number(previousConfig.cpuCores);
-    const newRamMb = data.ramMb ?? previousConfig.ramMb;
-    const newStorageGb = data.storageGb ?? previousConfig.storageGb;
+      // Storage can be increased but not shrunk — PVCs are immutable in that direction.
+      if (newStorageGb < previousConfig.storageGb) {
+        throw status(
+          400,
+          `Storage cannot be reduced. Current size is ${previousConfig.storageGb}GB.`,
+        );
+      }
+      if (newStorageGb > previousConfig.storageGb) {
+        throw status(400, "Storage increases are not yet supported.");
+      }
 
-    // Storage can be increased but not shrunk — PVCs are immutable in that direction.
-    if (newStorageGb < previousConfig.storageGb) {
-      throw status(
-        400,
-        `Storage cannot be reduced. Current size is ${previousConfig.storageGb}GB.`,
-      );
-    }
+      const expandsAllocation =
+        newCpuCores > Number(previousConfig.cpuCores) ||
+        newRamMb > previousConfig.ramMb ||
+        newStorageGb > previousConfig.storageGb;
+      if (expandsAllocation) {
+        assertAllocationFits(quota.limits, {
+          servers: quota.used.servers,
+          cpu: quota.used.cpu - Number(previousConfig.cpuCores) + newCpuCores,
+          ramMb: quota.used.ramMb - previousConfig.ramMb + newRamMb,
+          storageGb: quota.used.storageGb - previousConfig.storageGb + newStorageGb,
+        });
+      }
 
-    if (newStorageGb > previousConfig.storageGb) {
-      throw status(400, "Storage increases are not yet supported.");
-    }
+      await tx
+        .update(serverConfigs)
+        .set({
+          cpuCores: String(newCpuCores),
+          ramMb: newRamMb,
+          storageGb: newStorageGb,
+          gameConfigJson: data.gameConfigJson
+            ? {
+                ...(previousConfig.gameConfigJson as Record<string, unknown>),
+                ...data.gameConfigJson,
+              }
+            : previousConfig.gameConfigJson,
+          updatedAt: persistedAt,
+        })
+        .where(eq(serverConfigs.serverId, serverId));
 
-    const [quotaRow] = await db
-      .select()
-      .from(userQuotas)
-      .where(eq(userQuotas.userId, userId))
-      .limit(1);
-    if (!quotaRow) throw status(404, "No quota found for this account.");
-
-    if (newCpuCores > Number(quotaRow.cpuLimit)) {
-      throw status(
-        403,
-        `CPU limit exceeded. Your plan allows ${quotaRow.cpuLimit} cores per server.`,
-      );
-    }
-    if (newRamMb > quotaRow.ramLimitMb) {
-      throw status(
-        403,
-        `RAM limit exceeded. Your plan allows ${quotaRow.ramLimitMb}MB per server.`,
-      );
-    }
-    if (newStorageGb > quotaRow.storageLimitGb) {
-      throw status(
-        403,
-        `Storage limit exceeded. Your plan allows ${quotaRow.storageLimitGb}GB per server.`,
-      );
-    }
-
-    await db
-      .update(serverConfigs)
-      .set({
-        cpuCores: String(newCpuCores),
-        ramMb: newRamMb,
-        storageGb: newStorageGb,
-        gameConfigJson: data.gameConfigJson
-          ? {
-              ...(previousConfig.gameConfigJson as Record<string, unknown>),
-              ...data.gameConfigJson,
-            }
-          : previousConfig.gameConfigJson,
-        updatedAt: new Date(),
-      })
-      .where(eq(serverConfigs.serverId, serverId));
+      return { previousConfig, newCpuCores, newRamMb, newStorageGb };
+    });
 
     // Apply to K8s. If anything fails, revert the DB write above.
     try {
@@ -595,7 +605,7 @@ export abstract class ServerService {
       console.error(`[${serverId}] K8s config patch failed, reverting server_configs:`, error);
 
       // Revert DB to the snapshot taken before the update.
-      await db
+      const reverted = await db
         .update(serverConfigs)
         .set({
           cpuCores: previousConfig.cpuCores,
@@ -604,14 +614,165 @@ export abstract class ServerService {
           gameConfigJson: previousConfig.gameConfigJson,
           updatedAt: new Date(),
         })
-        .where(eq(serverConfigs.serverId, serverId));
+        .where(and(eq(serverConfigs.serverId, serverId), eq(serverConfigs.updatedAt, persistedAt)))
+        .returning({ id: serverConfigs.id });
+      if (!reverted.length) {
+        console.error(
+          `[${serverId}] Config rollback skipped because a newer database revision exists`,
+        );
+      }
 
       throw status(500, "Failed to apply configuration change to server.");
     }
   }
 
+  private static publicReceipt(row: typeof operatorReceipts.$inferSelect, reused: boolean) {
+    return {
+      receiptId: row.id,
+      requestKey: row.requestKey,
+      action: row.action,
+      status: row.status,
+      observedState: row.observedState,
+      acceptedAt: row.acceptedAt.toISOString(),
+      completedAt: row.completedAt?.toISOString() ?? null,
+      reused,
+    };
+  }
+
   static async performAction(serverId: string, userId: string, data: ServerActionInput) {
-    const { action } = serverActionDto.parse(data);
+    const { action, requestKey = `legacy:${crypto.randomUUID()}` } = serverActionDto.parse(data);
+    await this.requireOwnership(userId, serverId);
+    const id = `orc_${crypto.randomUUID().replaceAll("-", "")}`;
+    const reservation = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`SELECT pg_advisory_xact_lock(hashtext(${`operator:${userId}:${requestKey}`}))`,
+      );
+      const [existing] = await tx
+        .select()
+        .from(operatorReceipts)
+        .where(
+          and(eq(operatorReceipts.userId, userId), eq(operatorReceipts.requestKey, requestKey)),
+        );
+      const disposition = operatorReceiptDisposition(existing ?? null, serverId, action);
+      if (disposition === "conflict") {
+        throw status(409, "That request key is already bound to another operation");
+      }
+      if (existing && disposition === "reuse") {
+        return { receipt: existing, shouldExecute: false, reused: true };
+      }
+      if (existing && disposition === "retry") {
+        const acceptedAt = new Date();
+        const previousAttempt =
+          typeof existing.detail.attempt === "number" ? existing.detail.attempt : 1;
+        const attempt = previousAttempt + 1;
+        const [retried] = await tx
+          .update(operatorReceipts)
+          .set({
+            status: "accepted",
+            observedState: null,
+            detail: { ...existing.detail, attempt, retried_from: existing.status },
+            acceptedAt,
+            completedAt: null,
+            updatedAt: acceptedAt,
+          })
+          .where(eq(operatorReceipts.id, existing.id))
+          .returning();
+        if (!retried) throw status(500, "Could not retry the operation receipt");
+        await tx.insert(controlPlaneEvents).values({
+          serverId,
+          type: "operator_action",
+          data: { receipt_id: existing.id, action, status: "accepted", attempt, retry: true },
+        });
+        return { receipt: retried, shouldExecute: true, reused: true };
+      }
+
+      const [created] = await tx
+        .insert(operatorReceipts)
+        .values({
+          id,
+          userId,
+          serverId,
+          requestKey,
+          action,
+          status: "accepted",
+          detail: { attempt: 1 },
+        })
+        .returning();
+      if (!created) throw status(500, "Could not create an operation receipt");
+      await tx.insert(controlPlaneEvents).values({
+        serverId,
+        type: "operator_action",
+        data: { receipt_id: id, action, status: "accepted", attempt: 1 },
+      });
+      return { receipt: created, shouldExecute: true, reused: false };
+    });
+    const receipt = reservation.receipt;
+    const attempt = typeof receipt.detail.attempt === "number" ? receipt.detail.attempt : 1;
+    if (!reservation.shouldExecute) {
+      return {
+        success: receipt.status === "completed",
+        action,
+        status: receipt.observedState ?? receipt.status,
+        receipt: this.publicReceipt(receipt, true),
+      };
+    }
+
+    try {
+      const result = await this.performActionOnce(serverId, userId, { action });
+      const completedAt = new Date();
+      const [completed] = await db.transaction(async (tx) => {
+        const rows = await tx
+          .update(operatorReceipts)
+          .set({
+            status: "completed",
+            observedState: result.status,
+            completedAt,
+            updatedAt: completedAt,
+          })
+          .where(eq(operatorReceipts.id, receipt.id))
+          .returning();
+        await tx.insert(controlPlaneEvents).values({
+          serverId,
+          type: "operator_action",
+          data: {
+            receipt_id: receipt.id,
+            action,
+            status: "completed",
+            observed_state: result.status,
+            attempt,
+          },
+        });
+        return rows;
+      });
+      return { ...result, receipt: this.publicReceipt(completed!, reservation.reused) };
+    } catch (error) {
+      const failedAt = new Date();
+      const code =
+        typeof error === "object" && error !== null && "code" in error
+          ? Number((error as { code: unknown }).code)
+          : 500;
+      const receiptStatus = code >= 400 && code < 500 ? "refused" : "failed";
+      await db.transaction(async (tx) => {
+        await tx
+          .update(operatorReceipts)
+          .set({ status: receiptStatus, completedAt: failedAt, updatedAt: failedAt })
+          .where(eq(operatorReceipts.id, receipt.id));
+        await tx.insert(controlPlaneEvents).values({
+          serverId,
+          type: "operator_action",
+          data: { receipt_id: receipt.id, action, status: receiptStatus, attempt },
+        });
+      });
+      throw error;
+    }
+  }
+
+  private static async performActionOnce(
+    serverId: string,
+    userId: string,
+    data: Pick<ServerActionInput, "action">,
+  ) {
+    const { action } = data;
     let previousState = await this.requireOwnership(userId, serverId);
 
     if (
@@ -625,12 +786,6 @@ export abstract class ServerService {
       const { BackupService } = await import("../backup/service");
       await BackupService.reconcileServerOperations(serverId);
       previousState = await this.requireOwnership(userId, serverId);
-    }
-
-    // Validate quota before claiming the transition if reactivating a failed server.
-    // Failed servers are excluded from quota, so restoring them requires validation.
-    if ((action === "restart" || action === "start") && previousState.currentState === "failed") {
-      await QuotaService.validateRestartQuota(userId, serverId);
     }
 
     await this.claimTransition(userId, serverId, action);
@@ -746,29 +901,12 @@ export abstract class ServerService {
           throw status(404, "No quota found for this account.");
         }
 
-        const projectedServers = quota.serversUsed + 1;
-        // Check limits for the server
-        if (projectedServers > quota.serversLimit) {
-          throw status(
-            403,
-            `Server limit exceeded. Your plan allows ${quota.serversLimit} servers.`,
-          );
-        }
-        if (data.cpuCores > Number(quota.cpuLimit)) {
-          throw status(
-            403,
-            `CPU limit exceeded. You have ${Number(quota.cpuLimit)} cores available.`,
-          );
-        }
-        if (data.ramMb > quota.ramLimitMb) {
-          throw status(403, `RAM limit exceeded. You have ${quota.ramLimitMb}MB available.`);
-        }
-        if (data.storageGb > quota.storageLimitGb) {
-          throw status(
-            403,
-            `Storage limit exceeded. You have ${quota.storageLimitGb}GB available.`,
-          );
-        }
+        assertAllocationFits(quota.limits, {
+          servers: quota.used.servers + 1,
+          cpu: quota.used.cpu + data.cpuCores,
+          ramMb: quota.used.ramMb + data.ramMb,
+          storageGb: quota.used.storageGb + data.storageGb,
+        });
 
         await tx.insert(gameServers).values({
           id: serverId,

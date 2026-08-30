@@ -7,6 +7,11 @@ describe("connectorPathAllowed", () => {
     expect(connectorPathAllowed("/health")).toBe(true);
     expect(connectorPathAllowed("/api/servers/server-1/status")).toBe(true);
     expect(connectorPathAllowed("/api/quota")).toBe(true);
+    expect(connectorPathAllowed("/api/operator")).toBe(true);
+    expect(connectorPathAllowed("/api/operator/notifications")).toBe(true);
+    expect(connectorPathAllowed("/api/operator/maintenance")).toBe(true);
+    expect(connectorPathAllowed("/api/operator/maintenance/mnt_owner")).toBe(true);
+    expect(connectorPathAllowed("/api/servers/templates")).toBe(true);
     expect(connectorPathAllowed("/api/billing")).toBe(true);
     expect(connectorPathAllowed("/api/billing/checkout")).toBe(true);
     expect(connectorPathAllowed("/api/billing/portal")).toBe(true);
@@ -23,6 +28,7 @@ describe("connectorPathAllowed", () => {
     expect(connectorPathAllowed("/api/admin/users")).toBe(false);
     expect(connectorPathAllowed("/api/billing/subscriptions")).toBe(false);
     expect(connectorPathAllowed("/api/billing/checkout/anything-else")).toBe(false);
+    expect(connectorPathAllowed("/api/operator/receipts/export")).toBe(false);
     expect(connectorPathAllowed("/metrics")).toBe(false);
     expect(connectorPathAllowed("/%2E%2E/health")).toBe(false);
   });

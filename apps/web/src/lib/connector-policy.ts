@@ -11,9 +11,14 @@ export function connectorPathAllowed(pathname: string): boolean {
     pathname.startsWith("/api/servers/") ||
     pathname === "/api/quota" ||
     pathname.startsWith("/api/quota/") ||
+    pathname === "/api/operator" ||
+    pathname === "/api/operator/notifications" ||
+    pathname === "/api/operator/maintenance" ||
+    /^\/api\/operator\/maintenance\/[^/]+$/.test(pathname) ||
     pathname === "/api/billing" ||
     pathname === "/api/billing/checkout" ||
     pathname === "/api/billing/portal" ||
+    pathname === "/api/servers/templates" ||
     pathname === "/api/rules" ||
     pathname.startsWith("/api/rules/") ||
     pathname === "/api/changes" ||

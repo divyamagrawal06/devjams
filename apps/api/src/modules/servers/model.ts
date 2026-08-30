@@ -3,6 +3,12 @@ import { z } from "zod";
 
 export const serverActionDto = z.object({
   action: z.enum(["start", "stop", "restart"]),
+  requestKey: z
+    .string()
+    .min(8)
+    .max(120)
+    .regex(/^[A-Za-z0-9:_-]+$/, "requestKey contains unsupported characters")
+    .optional(),
 });
 
 const baseServerSchema = z.object({

@@ -8,9 +8,11 @@ import { operationApprovalModule } from "./modules/agent/approval-http";
 import { machineTokenModule } from "./modules/auth/machine-token-http";
 import { AuthService } from "./modules/auth/service";
 import { BackupModule } from "./modules/backup";
+import { billingModule, billingWebhookModule } from "./modules/billing/http";
 import { changesModule } from "./modules/changes/http";
 import { deployModule } from "./modules/deploy/http";
 import { eventStreamModule } from "./modules/events/http";
+import { operatorModule } from "./modules/operator/http";
 import { quotaModule } from "./modules/quota";
 import { rulesModule } from "./modules/rules";
 import { serversModule } from "./modules/servers";
@@ -36,10 +38,16 @@ export const app = new Elysia()
     return { status: "ok", db: row?.db, now: row?.now };
   })
 
+  // The provider webhook verifies its own Standard Webhooks signature and is
+  // intentionally mounted before all session-derived owner routes.
+  .use(billingWebhookModule)
+
   .use(rulesModule)
   .use(changesModule)
   .use(serversModule)
   .use(quotaModule)
+  .use(billingModule)
+  .use(operatorModule)
   .use(adminModule)
   .use(machineTokenModule)
   .use(operationApprovalModule)

@@ -9,11 +9,94 @@ export type LiveServer = {
   type?: string | null;
   hostname: string | null;
   port: number | null;
+  cpuCores?: string | null;
+  ramMb?: number | null;
+  storageGb?: number | null;
+  createdAt?: string;
+  updatedAt?: string;
 };
 
 export type LiveListResponse = {
   success: boolean;
   data: LiveServer[];
+};
+
+export type QuotaUsage = {
+  plan: "starter" | "standard" | "pro";
+  cpuLimit: string | number;
+  cpuUsed: string | number;
+  ramLimitMb: number;
+  ramUsedMb: number;
+  storageLimitGb: number;
+  storageUsedGb: number;
+  serversLimit: number;
+  serversUsed: number;
+  backupsLimit: number;
+  backupsUsed: number;
+  overQuota: boolean;
+  deploymentHeadroomReserved?: boolean;
+};
+
+export type QuotaResponse = { success: boolean; data: QuotaUsage };
+
+export type OperatorReceipt = {
+  id: string;
+  serverId: string;
+  requestKey: string;
+  action: "start" | "stop" | "restart";
+  status: "accepted" | "completed" | "refused" | "failed";
+  observedState: string | null;
+  acceptedAt: string;
+  completedAt: string | null;
+};
+
+export type MaintenanceWindow = {
+  id: string;
+  serverId: string;
+  startsAt: string;
+  durationMinutes: number;
+  action: "restart" | "operator_work";
+  status: "scheduled" | "cancelled" | "completed";
+  reason: string;
+};
+
+export type NotificationPreferences = {
+  deploymentEvents: boolean;
+  backupEvents: boolean;
+  billingEvents: boolean;
+  maintenanceEvents: boolean;
+  timezone: string;
+};
+
+export type OperatorSummaryResponse = {
+  success: boolean;
+  data: {
+    receipts: OperatorReceipt[];
+    maintenanceWindows: MaintenanceWindow[];
+    notificationPreferences: NotificationPreferences;
+    delivery: { inApp: boolean; email: "unavailable"; push: "unavailable" };
+  };
+};
+
+export type WorkloadCatalogueResponse = {
+  success: boolean;
+  data: {
+    observedAt: string;
+    workloadKinds: Array<{
+      id: string;
+      label: string;
+      available: boolean;
+      unavailableReason?: string;
+      versionPolicy?: string;
+      defaultVersion?: string;
+      runtimes: Array<{ id: string; label: string; loaderVersionRequired: boolean }>;
+    }>;
+    constraints: {
+      cpuCores: { min: number; max: number };
+      ramMb: { min: number; max: number; step: number };
+      storageGb: { min: number; max: number };
+    };
+  };
 };
 
 export type BackupStatus = "pending" | "in_progress" | "completed" | "failed";

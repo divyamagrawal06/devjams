@@ -31,6 +31,7 @@ import {
   formatUtcDateTime,
   weeklyScheduleLabel,
 } from "@/lib/backups";
+import { type OperatorReceiptStatus, operatorReceiptOutcome } from "@/lib/operator-receipts";
 
 const RESTORE_CONFIRMATION = "RESTORE_BACKUP_DISCARDS_NEWER_DATA";
 
@@ -46,6 +47,19 @@ type BackupsWindowProps = {
 type BackupMutationResponse = {
   success: boolean;
   data: Backup;
+};
+
+type StopActionResponse = {
+  success: boolean;
+  data: {
+    success: boolean;
+    action: "stop";
+    status: string;
+    receipt: {
+      receiptId: string;
+      status: OperatorReceiptStatus;
+    };
+  };
 };
 
 function humanizeState(value: string): string {
@@ -143,13 +157,29 @@ export function BackupsWindow({
   });
 
   const stopRealm = useMutation({
-    mutationFn: (changedServerId: string) =>
-      api(`/api/servers/${encodeURIComponent(changedServerId)}/action`, {
+    mutationFn: (changedServerId: string) => {
+      const storageKey = `indexd:recovery-stop:${changedServerId}`;
+      const requestKey =
+        window.sessionStorage.getItem(storageKey) ?? `recovery-stop:${crypto.randomUUID()}`;
+      window.sessionStorage.setItem(storageKey, requestKey);
+      return api<StopActionResponse>(`/api/servers/${encodeURIComponent(changedServerId)}/action`, {
         method: "POST",
-        body: JSON.stringify({ action: "stop" }),
-      }),
-    onSuccess: async () => {
-      setAnnouncement("Stop requested. Restore will remain paused until the realm is stopped.");
+        body: JSON.stringify({ action: "stop", requestKey }),
+      });
+    },
+    onSuccess: async (result, changedServerId) => {
+      const receiptStatus = result.data.receipt.status;
+      const outcome = operatorReceiptOutcome(receiptStatus);
+      if (outcome.clearRequestKey) {
+        window.sessionStorage.removeItem(`indexd:recovery-stop:${changedServerId}`);
+      }
+      setAnnouncement(
+        outcome.completed
+          ? "Stop completed with a durable receipt. Restore remains paused until stopped state is freshly observed."
+          : outcome.pending
+            ? "Stop accepted with a durable receipt. Completion has not been observed yet, so restore remains paused and the same request key is retained."
+            : `Stop ${receiptStatus}. Completion was not observed, and the same request key is retained for a safe retry.`,
+      );
       await queryClient.invalidateQueries({ queryKey: ["servers"] });
     },
   });
@@ -201,8 +231,8 @@ export function BackupsWindow({
     return (
       <div className="backups-view">
         <div className="window-hero">
-          <p className="eyebrow">Protected world archives</p>
-          <h2>Loading realm backups</h2>
+          <p className="eyebrow">Recovery Center</p>
+          <h2>Loading snapshot history</h2>
           <p>Checking which backup history belongs to this account.</p>
         </div>
         <BackupLoadingRows />
@@ -215,7 +245,7 @@ export function BackupsWindow({
       <div className="query-state error-state" role="alert">
         <CircleAlert aria-hidden="true" size={25} />
         <div>
-          <h3>Realm backup access could not be loaded</h3>
+          <h3>Recovery access could not be loaded</h3>
           <p>Your session is still active. Retry the connector without signing in again.</p>
         </div>
         <button className="inline-action" onClick={onRetryServers} type="button">
@@ -229,8 +259,8 @@ export function BackupsWindow({
     return (
       <div className="empty-state">
         <Server aria-hidden="true" size={29} />
-        <h3>No realms available for backup</h3>
-        <p>Backups will appear here after a realm is assigned to this account.</p>
+        <h3>No workloads available for recovery</h3>
+        <p>Snapshot recovery appears here after a compatible workload is provisioned.</p>
       </div>
     );
   }
@@ -240,7 +270,12 @@ export function BackupsWindow({
   const serverRunning = selectedServer.currentState === "running";
   const serverStopped = ["ready", "stopped"].includes(selectedServer.currentState);
   const serverCanStop = selectedServer.currentState === "running";
-  const stopWasRequested = stopRealm.isSuccess && stopRealm.variables === selectedServer.id;
+  const stopReceiptStatus = stopRealm.data?.data.receipt.status;
+  const stopReceiptOutcome = stopReceiptStatus ? operatorReceiptOutcome(stopReceiptStatus) : null;
+  const stopWasRequested =
+    stopRealm.isSuccess &&
+    stopRealm.variables === selectedServer.id &&
+    Boolean(stopReceiptOutcome?.pending || stopReceiptOutcome?.completed);
   const createDisabled =
     !serverRunning || Boolean(busyBackup) || createBackup.isPending || stopRealm.isPending;
   const actionError =
@@ -250,17 +285,37 @@ export function BackupsWindow({
   return (
     <div className="backups-view">
       <div className="window-hero backups-hero">
-        <p className="eyebrow">Protected world archives</p>
-        <h2>Backups for {selectedServer.name}</h2>
+        <p className="eyebrow">Recovery Center</p>
+        <h2>Recovery for {selectedServer.name}</h2>
         <p>
-          Automatic and manual archives share one protected recovery history. The verified schedule
-          for this realm appears below.
+          Automatic and manual snapshots share one recovery history. This connector manages world
+          data only; live-rule rollback is a separate operation in the Trust Ledger.
         </p>
+      </div>
+
+      <div className="recovery-scope-grid">
+        <article>
+          <Archive aria-hidden="true" size={18} />
+          <div>
+            <strong>Snapshot restore</strong>
+            <span>
+              Replaces world data and permanently discards newer world changes after explicit
+              confirmation.
+            </span>
+          </div>
+        </article>
+        <article>
+          <ShieldAlert aria-hidden="true" size={18} />
+          <div>
+            <strong>Rule rollback</strong>
+            <span>Uses the reviewed deployment ledger; it never restores a world snapshot.</span>
+          </div>
+        </article>
       </div>
 
       <div className="backups-toolbar">
         <label className="backup-realm-picker">
-          <span>Realm</span>
+          <span>Workload</span>
           <select
             onChange={(event) => onSelectServer(event.target.value)}
             value={selectedServer.id}
@@ -283,7 +338,7 @@ export function BackupsWindow({
             }}
             title={
               !serverRunning
-                ? "The realm must be running before a manual backup can start."
+                ? "The workload must be running before a manual snapshot can start."
                 : busyBackup
                   ? "Wait for the current backup operation to finish."
                   : undefined
@@ -295,7 +350,7 @@ export function BackupsWindow({
           </button>
           <p>
             {!serverRunning
-              ? `Manual backups require a running realm. Current state: ${humanizeState(selectedServer.currentState)}.`
+              ? `Manual snapshots require a running workload. Current state: ${humanizeState(selectedServer.currentState)}.`
               : busyBackup
                 ? `${backupStatusLabel(busyBackup)} ${busyBackup.name}.`
                 : "Create an additional recovery point now."}
@@ -348,7 +403,7 @@ export function BackupsWindow({
                 <span className="backup-schedule-description">
                   {scheduleData.enabled
                     ? weeklyScheduleLabel(scheduleData)
-                    : "No automatic archive will be created for this realm."}
+                    : "No automatic snapshot will be created for this workload."}
                 </span>
               </div>
             </div>
@@ -541,7 +596,7 @@ export function BackupsWindow({
                         <div>
                           <h5>Restore {backup.name}?</h5>
                           <p>
-                            This replaces the realm&apos;s current world with this archive. Every
+                            This replaces the workload&apos;s current world with this archive. Every
                             block, item, and player change made after this backup will be
                             permanently discarded.
                           </p>
@@ -551,7 +606,7 @@ export function BackupsWindow({
                       {!serverStopped ? (
                         <div className="restore-prerequisite">
                           <p>
-                            <strong>Stop the realm first.</strong> Stopping disconnects current
+                            <strong>Stop the workload first.</strong> Stopping disconnects current
                             players. It does not begin the restore.
                           </p>
                           <button
@@ -567,11 +622,14 @@ export function BackupsWindow({
                             <Power aria-hidden="true" size={15} />
                             {stopRealm.isPending
                               ? "Requesting stop…"
-                              : stopWasRequested || selectedServer.currentState === "stopping"
-                                ? "Stop requested"
-                                : serverCanStop
-                                  ? `Stop ${selectedServer.name}`
-                                  : `Wait for ${humanizeState(selectedServer.currentState)}`}
+                              : stopReceiptOutcome?.pending ||
+                                  selectedServer.currentState === "stopping"
+                                ? "Stop accepted"
+                                : stopReceiptOutcome?.completed
+                                  ? "Stop completed; refreshing"
+                                  : serverCanStop
+                                    ? `Stop ${selectedServer.name}`
+                                    : `Wait for ${humanizeState(selectedServer.currentState)}`}
                           </button>
                         </div>
                       ) : (

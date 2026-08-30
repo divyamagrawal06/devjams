@@ -5,5 +5,18 @@
   "type": "module",
   "exports": {
     ".": "./index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test test/"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1083.0",
+    "@farlands/contracts": "workspace:*",
+    "adm-zip": "^0.5.16",
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7"
   }
 }

@@ -8,7 +8,7 @@ export const rulesModule = new Elysia({ prefix: "/api/rules" })
   .use(RulesModel)
 
   .get("/", async ({ headers }) => {
-    const userId = await AuthService.requireUserId(headers.cookie ?? "");
+    const userId = await AuthService.requireUserIdFromHeaders(headers);
     const rules = await RulesService.getAllByUser(userId);
     return { success: true, data: rules };
   })
@@ -16,7 +16,7 @@ export const rulesModule = new Elysia({ prefix: "/api/rules" })
   .post(
     "/",
     async ({ headers, body, set }) => {
-      const userId = await AuthService.requireUserId(headers.cookie ?? "");
+      const userId = await AuthService.requireUserIdFromHeaders(headers);
       const rule = await RulesService.create(userId, body);
       set.status = 201;
       return { success: true, data: rule };
@@ -26,10 +26,21 @@ export const rulesModule = new Elysia({ prefix: "/api/rules" })
     },
   )
 
+  .post(
+    "/:id/versions",
+    async ({ headers, params: { id }, body, set }) => {
+      const userId = await AuthService.requireUserIdFromHeaders(headers);
+      const version = await RulesService.createVersion(id, userId, body);
+      set.status = 201;
+      return { success: true, data: version };
+    },
+    { body: "rules.version.create" },
+  )
+
   .patch(
     "/:id",
     async ({ headers, params: { id }, body }) => {
-      const userId = await AuthService.requireUserId(headers.cookie ?? "");
+      const userId = await AuthService.requireUserIdFromHeaders(headers);
       const rule = await RulesService.update(id, userId, body);
       return { success: true, data: rule };
     },
@@ -39,7 +50,7 @@ export const rulesModule = new Elysia({ prefix: "/api/rules" })
   )
 
   .delete("/:id", async ({ headers, params: { id } }) => {
-    const userId = await AuthService.requireUserId(headers.cookie ?? "");
+    const userId = await AuthService.requireUserIdFromHeaders(headers);
     const rule = await RulesService.delete(id, userId);
     return { success: true, data: rule };
   });

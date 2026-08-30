@@ -5,6 +5,7 @@ export const MAX_PLUGIN_BUILDER_BODY_BYTES = 20 * 1024;
 const PLUGIN_NAME_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
 const MINECRAFT_VERSION_PATTERN = /^[a-zA-Z0-9_.-]{0,32}$/;
 const MATERIAL_PATTERN = /^[a-zA-Z0-9_:.-]{0,64}$/;
+const STATEFUL_KEYS = new Set(["counter", "counters", "memory", "state", "storage"]);
 
 type ValidationResult =
   | { ok: true; value: PluginBuilderBody; pluginName: string }
@@ -12,6 +13,22 @@ type ValidationResult =
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function rejectStatefulVocabulary(value: unknown, path = "rule"): void {
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => {
+      rejectStatefulVocabulary(entry, `${path}.${index}`);
+    });
+    return;
+  }
+  if (!isRecord(value)) return;
+  for (const [key, child] of Object.entries(value)) {
+    if (STATEFUL_KEYS.has(key.toLowerCase())) {
+      throw new Error(`${path}.${key} is stateful and cannot survive a backend handover`);
+    }
+    rejectStatefulVocabulary(child, `${path}.${key}`);
+  }
 }
 
 function optionalRecord(value: unknown, field: string): Record<string, unknown> | undefined {
@@ -169,6 +186,7 @@ export function validatePluginBuilderBody(body: unknown): ValidationResult {
     if (!isRecord(body)) {
       throw new Error("Request body must be an object");
     }
+    rejectStatefulVocabulary(body);
 
     const metadata = optionalRecord(body.metadata, "metadata");
     const onPlayerJoin = optionalRecord(body.onPlayerJoin, "onPlayerJoin");

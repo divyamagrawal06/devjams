@@ -13,7 +13,19 @@ export const ruleDto = z.object({
 export type RuleCreateInput = z.infer<typeof ruleDto>;
 export type RuleUpdateInput = Partial<RuleCreateInput>;
 
+export const ruleVersionDto = z.object({
+  document: z.unknown(),
+  source: z.enum(["form", "agent", "director"]),
+  provenanceRef: z
+    .string()
+    .regex(/^[a-zA-Z0-9:/._-]{1,200}$/)
+    .optional(),
+});
+
+export type RuleVersionCreateInput = z.infer<typeof ruleVersionDto>;
+
 export const RulesModel = new Elysia({ name: "rules.model" }).model({
   "rules.create": ruleDto,
   "rules.update": ruleDto.partial(),
+  "rules.version.create": ruleVersionDto,
 });

@@ -20,6 +20,33 @@ export const WORLD_SYNC_PORT = 8080;
 export const RCON_PORT = 25575;
 export const VELOCITY_SECRET_NAME =
   process.env.FARLANDS_VELOCITY_SECRET_NAME ?? "velocity-forwarding-secret";
+const DEFAULT_ARTIFACT_SERVICE_ACCOUNT = "farlands-artifact-reader";
+
+export function artifactServiceAccountName(
+  configured = process.env.FARLANDS_ARTIFACT_SERVICE_ACCOUNT,
+): string {
+  const name = configured?.trim() || DEFAULT_ARTIFACT_SERVICE_ACCOUNT;
+  if (name.length > 63 || !/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(name)) {
+    throw new Error("FARLANDS_ARTIFACT_SERVICE_ACCOUNT must be a DNS-1123 service account name");
+  }
+  return name;
+}
+
+export function buildArtifactServiceAccount(
+  namespace: string,
+  name = artifactServiceAccountName(),
+  roleArn = process.env.FARLANDS_ARTIFACT_ROLE_ARN?.trim(),
+): k8s.V1ServiceAccount {
+  return {
+    metadata: {
+      name,
+      namespace,
+      labels: { "farlands.dev/kind": "rule-artifact-reader" },
+      ...(roleArn ? { annotations: { "eks.amazonaws.com/role-arn": roleArn } } : {}),
+    },
+    automountServiceAccountToken: false,
+  };
+}
 
 export type TenantQuotaMirror = {
   cpuLimit: string;
@@ -223,6 +250,31 @@ async function ensureRconSecret(core: k8s.CoreV1Api, namespace: string): Promise
   });
 }
 
+async function ensureArtifactServiceAccount(core: k8s.CoreV1Api, namespace: string): Promise<void> {
+  const body = buildArtifactServiceAccount(namespace);
+  const name = body.metadata?.name;
+  if (!name) throw new Error("Artifact ServiceAccount name is unavailable");
+  try {
+    const existing = await core.readNamespacedServiceAccount({ name, namespace });
+    const expectedRole = body.metadata?.annotations?.["eks.amazonaws.com/role-arn"];
+    if (
+      expectedRole &&
+      existing.metadata?.annotations?.["eks.amazonaws.com/role-arn"] !== expectedRole
+    ) {
+      throw new Error(`Artifact ServiceAccount ${namespace}/${name} has the wrong IAM role`);
+    }
+    return;
+  } catch (error) {
+    if (!notFound(error)) throw error;
+  }
+
+  try {
+    await core.createNamespacedServiceAccount({ namespace, body });
+  } catch (error) {
+    if (!alreadyExists(error)) throw error;
+  }
+}
+
 async function copyVelocitySecret(core: k8s.CoreV1Api, namespace: string): Promise<void> {
   try {
     await core.readNamespacedSecret({
@@ -291,19 +343,27 @@ http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 `;
 
   const receiver = `#!/usr/bin/env python3
-import os, socket, subprocess, sys
+import os, sys, tarfile, urllib.parse, urllib.request
 PORT = int(os.environ.get("WORLD_SYNC_PORT", "8080"))
 ROOT = os.environ.get("WORLD_ROOT", "/data/world")
+SOURCE = os.environ["SOURCE_SYNC_URL"]
+PHASE = os.environ.get("WORLD_SYNC_PHASE", "presync")
+
+parsed = urllib.parse.urlparse(SOURCE)
+if parsed.scheme != "http" or parsed.port != PORT or parsed.path != "/stream":
+    raise ValueError("SOURCE_SYNC_URL must name the tenant world-sync service")
+if not parsed.hostname or not parsed.hostname.endswith(".svc.cluster.local"):
+    raise ValueError("SOURCE_SYNC_URL must stay inside cluster DNS")
+query = "?delta=1" if PHASE == "delta" else ""
+request = urllib.request.Request(SOURCE + query, data=b"", method="POST")
 os.makedirs(ROOT, exist_ok=True)
-srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(("0.0.0.0", PORT)); srv.listen(1)
-print("receiver listening on %s" % PORT, flush=True)
-conn, _ = srv.accept()
-os.makedirs(ROOT, exist_ok=True)
-proc = subprocess.Popen(["tar", "-C", ROOT, "-xf", "-"], stdin=conn)
-proc.wait()
-conn.close(); srv.close()
-sys.exit(proc.returncode)
+with urllib.request.urlopen(request, timeout=900) as response:
+    if response.status == 204:
+        sys.exit(0)
+    if response.headers.get_content_type() != "application/x-tar":
+        raise RuntimeError("world-sync sender returned an unexpected content type")
+    with tarfile.open(fileobj=response, mode="r|") as archive:
+        archive.extractall(path=ROOT, filter="data")
 `;
 
   const body: k8s.V1ConfigMap = {
@@ -337,6 +397,7 @@ export async function ensureTenantNamespace(
   await upsertQuota(clients.core, namespace, quota);
   await ensureLimitRange(clients.core, namespace);
   await ensureDefaultDeny(clients.networking, namespace);
+  await ensureArtifactServiceAccount(clients.core, namespace);
   await ensureRconSecret(clients.core, namespace);
   await copyVelocitySecret(clients.core, namespace);
   await ensureWorldSyncConfigMap(clients.core, namespace);

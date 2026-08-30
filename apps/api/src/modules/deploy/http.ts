@@ -1,4 +1,4 @@
-import { approvalRequired, notFound } from "@farlands/contracts";
+import { approvalRequired, digestsEqual, notFound } from "@farlands/contracts";
 import { Elysia, t } from "elysia";
 import {
   deployRulesApprovalClaim,
@@ -6,6 +6,7 @@ import {
   rollbackRulesApprovalClaim,
 } from "../agent/approvals";
 import { AuthService } from "../auth/service";
+import { RulesService } from "../rules/service";
 import { ServerService } from "../servers/service";
 import {
   abortDeployment,
@@ -42,6 +43,23 @@ export const deployModule = new Elysia({ name: "authenticated-deployments" })
       if (!(await ownsDeploymentTarget(identity.userId, params.id))) {
         set.status = 404;
         return notFound({ tool: "deploy_rules", resource: `server ${params.id}` });
+      }
+
+      try {
+        const artifact = await RulesService.resolveDeploymentArtifact({
+          serverId: params.id,
+          userId: identity.userId,
+          ruleSetVersion: String(body.rule_set_version),
+        });
+        if (!digestsEqual(artifact.artifactDigest, body.content_digest)) {
+          set.status = 409;
+          return { error: "Reviewed digest does not match the immutable deployment artifact" };
+        }
+      } catch (error) {
+        set.status = 409;
+        return {
+          error: error instanceof Error ? error.message : "Reviewed artifact is unavailable",
+        };
       }
 
       const claim = deployRulesApprovalClaim(params.id, body.rule_set_version, body.content_digest);
@@ -113,6 +131,23 @@ export const deployModule = new Elysia({ name: "authenticated-deployments" })
       if (targetError) {
         set.status = 409;
         return { error: targetError };
+      }
+
+      try {
+        const artifact = await RulesService.resolveDeploymentArtifact({
+          serverId: params.id,
+          userId: identity.userId,
+          ruleSetVersion: String(body.rule_set_version),
+        });
+        if (!digestsEqual(artifact.artifactDigest, body.content_digest)) {
+          set.status = 409;
+          return { error: "Reviewed digest does not match the immutable rollback artifact" };
+        }
+      } catch (error) {
+        set.status = 409;
+        return {
+          error: error instanceof Error ? error.message : "Rollback artifact is unavailable",
+        };
       }
 
       const claim = rollbackRulesApprovalClaim(

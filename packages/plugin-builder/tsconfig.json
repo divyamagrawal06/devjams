@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "types": ["bun"]
+  },
+  "include": [
+    "index.ts",
+    "jar-builder.ts",
+    "runtime-jar.ts",
+    "storage.ts",
+    "types.ts",
+    "validation.ts",
+    "yaml-generator.ts",
+    "test/**/*.ts"
+  ]
+}

@@ -1,13 +1,19 @@
 import type { NextRequest } from "next/server";
 
-import { auth } from "@/lib/auth";
+import { getSession } from "@/lib/auth";
 import { upstreamSessionCookie } from "@/lib/auth-cookie";
 import { connectorOriginAllowed, connectorPathAllowed } from "@/lib/connector-policy";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
 
-const FORWARDED_REQUEST_HEADERS = ["accept", "content-type", "if-match", "x-request-id"];
+const FORWARDED_REQUEST_HEADERS = [
+  "accept",
+  "content-type",
+  "if-match",
+  "last-event-id",
+  "x-request-id",
+];
 const FORWARDED_RESPONSE_HEADERS = [
   "content-disposition",
   "content-type",
@@ -26,7 +32,9 @@ function requestOriginAllowed(request: NextRequest): boolean {
 }
 
 async function proxy(request: NextRequest, path: string[]): Promise<Response> {
-  const session = await auth.api.getSession({ headers: request.headers });
+  const authResult = await getSession(request.headers);
+  if (authResult.response) return authResult.response;
+  const session = authResult.session;
   if (!session) {
     return Response.json({ error: "Authentication required" }, { status: 401 });
   }

@@ -6,6 +6,7 @@ export * from "./enums";
 export * from "./extensions";
 export * from "./jobs";
 export * from "./k8s";
+export * from "./operations";
 export * from "./quotas";
 export * from "./rules";
 export * from "./servers";

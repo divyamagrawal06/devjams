@@ -7,16 +7,21 @@ declare global {
   var indexdWebPool: Pool | undefined;
 }
 
-const connectionString = process.env.DATABASE_URL?.trim();
+let database: ReturnType<typeof drizzle<typeof schema>> | undefined;
 
-if (!connectionString) {
-  throw new Error("DATABASE_URL is required for indexd authentication.");
+export function getDb(): ReturnType<typeof drizzle<typeof schema>> {
+  if (database) return database;
+
+  const connectionString = process.env.DATABASE_URL?.trim();
+  if (!connectionString) {
+    throw new Error("DATABASE_URL is required for indexd authentication.");
+  }
+
+  const pool = globalThis.indexdWebPool ?? new Pool({ connectionString, max: 4 });
+  if (process.env.NODE_ENV !== "production") {
+    globalThis.indexdWebPool = pool;
+  }
+
+  database = drizzle(pool, { schema });
+  return database;
 }
-
-const pool = globalThis.indexdWebPool ?? new Pool({ connectionString, max: 4 });
-
-if (process.env.NODE_ENV !== "production") {
-  globalThis.indexdWebPool = pool;
-}
-
-export const db = drizzle(pool, { schema });

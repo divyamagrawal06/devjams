@@ -71,6 +71,13 @@
       "when": 1788041000000,
       "tag": "0009_real_cutover",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1788042000000,
+      "tag": "0010_connected_operations",
+      "breakpoints": true
     }
   ]
 }

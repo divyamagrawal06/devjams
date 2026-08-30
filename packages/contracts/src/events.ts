@@ -1,5 +1,5 @@
 import { type Static, Type } from "@sinclair/typebox";
-import { DeploymentId, ProposalId, ServerId, Timestamp } from "./common.ts";
+import { ContentDigest, DeploymentId, ProposalId, ServerId, Timestamp } from "./common.ts";
 import { DeploymentState } from "./deployment.ts";
 import { RollupMetrics } from "./telemetry.ts";
 
@@ -53,6 +53,29 @@ export const ProposalCreatedSseEvent = Envelope(
   }),
 );
 
+/** A validated immutable draft entered the human review queue. */
+export const ChangeSubmittedSseEvent = Envelope(
+  "change_submitted",
+  Type.Object({
+    change_id: Type.String(),
+    title: Type.String(),
+    rule_version: Type.Integer({ minimum: 1 }),
+    content_digest: ContentDigest,
+    artifact_digest: ContentDigest,
+  }),
+);
+
+/** A human reviewed an exact artifact. Approval may name the deployment receipt. */
+export const ChangeReviewedSseEvent = Envelope(
+  "change_reviewed",
+  Type.Object({
+    change_id: Type.String(),
+    verdict: Type.Union([Type.Literal("approved"), Type.Literal("rejected")]),
+    artifact_digest: ContentDigest,
+    deployment_id: Type.Union([DeploymentId, Type.Null()]),
+  }),
+);
+
 export const ServerLogSseEvent = Envelope(
   "server_log",
   Type.Object({
@@ -71,6 +94,8 @@ export const SseEvent = Type.Union([
   DeploymentStateSseEvent,
   WorldActivitySseEvent,
   ProposalCreatedSseEvent,
+  ChangeSubmittedSseEvent,
+  ChangeReviewedSseEvent,
   ServerLogSseEvent,
   HeartbeatSseEvent,
 ]);
@@ -79,6 +104,8 @@ export type SseEvent = Static<typeof SseEvent>;
 export type DeploymentStateSseEvent = Static<typeof DeploymentStateSseEvent>;
 export type WorldActivitySseEvent = Static<typeof WorldActivitySseEvent>;
 export type ProposalCreatedSseEvent = Static<typeof ProposalCreatedSseEvent>;
+export type ChangeSubmittedSseEvent = Static<typeof ChangeSubmittedSseEvent>;
+export type ChangeReviewedSseEvent = Static<typeof ChangeReviewedSseEvent>;
 export type ServerLogSseEvent = Static<typeof ServerLogSseEvent>;
 export type HeartbeatSseEvent = Static<typeof HeartbeatSseEvent>;
 

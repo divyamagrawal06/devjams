@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
-import { desktopApps, desktopRoute, isDesktopApp } from "./routes";
+import { desktopApps, desktopRoute, desktopWindowForRoute, isDesktopApp } from "./routes";
 
 const appRoot = join(import.meta.dir, "..", "app");
 
@@ -26,5 +26,8 @@ describe("canonical web routes", () => {
       expect(desktopRoute(app)).toBe(`/?app=${app}`);
     }
     expect(isDesktopApp("cluster-admin")).toBe(false);
+    expect(desktopWindowForRoute("review-queue")).toBe("review");
+    expect(desktopWindowForRoute("rule-forge")).toBe("forge");
+    expect(desktopWindowForRoute("deployments")).toBe("activity");
   });
 });

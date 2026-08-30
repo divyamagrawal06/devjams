@@ -1,8 +1,8 @@
 import { type DeploymentState, type DeploymentView, PRE_CUTOVER_STATES } from "@farlands/contracts";
-import { deploymentStateEvents, deployments, serverRuleHeads } from "@repo/db";
+import { controlPlaneEvents, deploymentStateEvents, deployments, serverRuleHeads } from "@repo/db";
 import { and, asc, count, eq, inArray, isNotNull, isNull, lt, notInArray, sql } from "drizzle-orm";
 
-import { db } from "../../db";
+import { db, type TransactionType } from "../../db";
 
 export type QueueStatus = "waiting" | "running" | "complete";
 
@@ -230,18 +230,51 @@ function updateValues(patch: DeploymentPatch) {
   };
 }
 
+function deploymentEventData(input: {
+  deploymentId: string;
+  state: DeploymentState;
+  detail: string | null;
+  queuePosition?: number | null;
+}): Record<string, unknown> {
+  return {
+    deployment_id: input.deploymentId,
+    state: input.state,
+    detail: input.detail,
+    queue_position: input.queuePosition ?? null,
+  };
+}
+
+/**
+ * Inserts the queue row and both receipt streams on the caller's transaction.
+ * Approval uses this to ensure a deployment cannot become runnable before its
+ * exact reviewed envelope commits.
+ */
+export async function createDeploymentRecordInTransaction(
+  tx: TransactionType,
+  record: Omit<DeploymentRecord, "queueSequence">,
+): Promise<DeploymentRecord> {
+  const [created] = await tx.insert(deployments).values(insertValues(record)).returning();
+  if (!created) throw new Error("Deployment insert did not return a row");
+  await tx.insert(deploymentStateEvents).values({
+    deploymentId: created.id,
+    state: created.state,
+    detail: "enqueued",
+  });
+  await tx.insert(controlPlaneEvents).values({
+    serverId: created.serverId,
+    type: "deployment_state",
+    data: deploymentEventData({
+      deploymentId: created.id,
+      state: created.state as DeploymentState,
+      detail: "enqueued",
+    }),
+  });
+  return toRecord(created);
+}
+
 export class DrizzleDeploymentStore implements DeploymentStore {
   async create(record: Omit<DeploymentRecord, "queueSequence">): Promise<DeploymentRecord> {
-    return db.transaction(async (tx) => {
-      const [created] = await tx.insert(deployments).values(insertValues(record)).returning();
-      if (!created) throw new Error("Deployment insert did not return a row");
-      await tx.insert(deploymentStateEvents).values({
-        deploymentId: created.id,
-        state: created.state,
-        detail: "enqueued",
-      });
-      return toRecord(created);
-    });
+    return db.transaction((tx) => createDeploymentRecordInTransaction(tx, record));
   }
 
   async find(id: string): Promise<DeploymentRecord | null> {
@@ -275,25 +308,43 @@ export class DrizzleDeploymentStore implements DeploymentStore {
         throw new DeploymentInterruptedError(id, current.state as DeploymentState);
       }
       await tx.insert(deploymentStateEvents).values({ deploymentId: id, state, detail });
+      await tx.insert(controlPlaneEvents).values({
+        serverId: updated.serverId,
+        type: "deployment_state",
+        data: deploymentEventData({ deploymentId: id, state, detail }),
+      });
       return toRecord(updated);
     });
   }
 
   async requestAbort(id: string, requestedAt: Date): Promise<DeploymentRecord | null> {
-    const [updated] = await db
-      .update(deployments)
-      .set({ abortRequestedAt: requestedAt, updatedAt: sql`now()` })
-      .where(
-        and(
-          eq(deployments.id, id),
-          inArray(deployments.state, [...PRE_CUTOVER_STATES]),
-          isNull(deployments.abortRequestedAt),
-        ),
-      )
-      .returning();
-    if (updated) return toRecord(updated);
-    const current = await db.query.deployments.findFirst({ where: eq(deployments.id, id) });
-    return current ? toRecord(current) : null;
+    return db.transaction(async (tx) => {
+      const [updated] = await tx
+        .update(deployments)
+        .set({ abortRequestedAt: requestedAt, updatedAt: sql`now()` })
+        .where(
+          and(
+            eq(deployments.id, id),
+            inArray(deployments.state, [...PRE_CUTOVER_STATES]),
+            isNull(deployments.abortRequestedAt),
+          ),
+        )
+        .returning();
+      if (updated) {
+        await tx.insert(controlPlaneEvents).values({
+          serverId: updated.serverId,
+          type: "deployment_state",
+          data: deploymentEventData({
+            deploymentId: id,
+            state: updated.state as DeploymentState,
+            detail: "abort requested by operator",
+          }),
+        });
+        return toRecord(updated);
+      }
+      const [current] = await tx.select().from(deployments).where(eq(deployments.id, id));
+      return current ? toRecord(current) : null;
+    });
   }
 
   async queuePosition(id: string): Promise<number | null> {
@@ -551,6 +602,15 @@ export class DrizzleDeploymentStore implements DeploymentStore {
         deploymentId: input.deploymentId,
         state: "draining",
         detail: "candidate B is authoritative; retaining A for rollback",
+      });
+      await tx.insert(controlPlaneEvents).values({
+        serverId: input.serverId,
+        type: "deployment_state",
+        data: deploymentEventData({
+          deploymentId: input.deploymentId,
+          state: "draining",
+          detail: "candidate B is authoritative; retaining A for rollback",
+        }),
       });
       return toRecord(updated);
     });

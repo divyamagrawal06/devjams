@@ -10,6 +10,10 @@ describe("connectorPathAllowed", () => {
     expect(connectorPathAllowed("/api/billing")).toBe(true);
     expect(connectorPathAllowed("/api/billing/checkout")).toBe(true);
     expect(connectorPathAllowed("/api/billing/portal")).toBe(true);
+    expect(connectorPathAllowed("/api/changes?status=pending_review")).toBe(false);
+    expect(connectorPathAllowed("/api/changes")).toBe(true);
+    expect(connectorPathAllowed("/api/changes/change-1/approve")).toBe(true);
+    expect(connectorPathAllowed("/api/servers/server-1/events")).toBe(true);
   });
 
   test("rejects internal and unrelated surfaces", () => {

@@ -24,18 +24,51 @@ import {
   WifiOff,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import dynamic from "next/dynamic";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useOnlineStatus } from "@/app/providers";
 import { api, type LiveListResponse, type QuotaResponse } from "@/lib/api";
 import { authClient } from "@/lib/auth-client";
+import { type ConnectorState, evaluateControlTruth } from "@/lib/control-truth";
 import { desktopWindowForRoute, isDesktopApp } from "@/lib/routes";
-import { AllayCompanion } from "./allay-companion";
-import { BackupsWindow } from "./backups-window";
-import { BillingPanel } from "./billing-panel";
-import { OperatorHome } from "./operator-home";
 import { PanoramaBackground } from "./panorama-background";
-import { ReviewQueueWindow } from "./review-queue-window";
-import { RuleForgeWindow } from "./rule-forge-window";
-import { TrustLedgerWindow } from "./trust-ledger-window";
+
+function WindowLoading() {
+  return (
+    <div className="window-loading" role="status">
+      Loading workspace…
+    </div>
+  );
+}
+
+const BackupsWindow = dynamic(
+  () => import("./backups-window").then((module) => module.BackupsWindow),
+  { loading: WindowLoading },
+);
+const AllayCompanion = dynamic(
+  () => import("./allay-companion").then((module) => module.AllayCompanion),
+  { loading: () => null },
+);
+const BillingPanel = dynamic(
+  () => import("./billing-panel").then((module) => module.BillingPanel),
+  { loading: WindowLoading },
+);
+const OperatorHome = dynamic(
+  () => import("./operator-home").then((module) => module.OperatorHome),
+  { loading: WindowLoading },
+);
+const ReviewQueueWindow = dynamic(
+  () => import("./review-queue-window").then((module) => module.ReviewQueueWindow),
+  { loading: WindowLoading },
+);
+const RuleForgeWindow = dynamic(
+  () => import("./rule-forge-window").then((module) => module.RuleForgeWindow),
+  { loading: WindowLoading },
+);
+const TrustLedgerWindow = dynamic(
+  () => import("./trust-ledger-window").then((module) => module.TrustLedgerWindow),
+  { loading: WindowLoading },
+);
 
 type AppId = "realms" | "backups" | "review" | "forge" | "activity" | "account";
 
@@ -95,7 +128,7 @@ function useCompactViewport() {
   const [compact, setCompact] = useState(false);
 
   useEffect(() => {
-    const query = window.matchMedia("(max-width: 760px)");
+    const query = window.matchMedia("(max-width: 760px), (max-height: 700px)");
     const update = () => setCompact(query.matches);
     update();
     query.addEventListener("change", update);
@@ -140,6 +173,9 @@ function DesktopClock() {
 
 type WindowBodyProps = {
   appId: AppId;
+  connectorState: ConnectorState;
+  controlMessage: string;
+  controlsAvailable: boolean;
   health: ReturnType<typeof useQuery<HealthResponse>>;
   onOpenBackups: (serverId: string) => void;
   onOpenReview: (changeId: string) => void;
@@ -161,6 +197,9 @@ type WindowBodyProps = {
 
 function WindowBody({
   appId,
+  connectorState,
+  controlMessage,
+  controlsAvailable,
   health,
   onOpenBackups,
   onOpenReview,
@@ -178,9 +217,7 @@ function WindowBody({
   if (appId === "realms") {
     return (
       <OperatorHome
-        connectorState={
-          health.isError ? "unavailable" : health.data?.status === "ok" ? "connected" : "checking"
-        }
+        connectorState={connectorState}
         onOpenRecovery={onOpenBackups}
         operatorName={firstName(user?.name, user?.email)}
         quota={quota.data?.data ?? null}
@@ -199,6 +236,8 @@ function WindowBody({
   if (appId === "backups") {
     return (
       <BackupsWindow
+        controlMessage={controlMessage}
+        controlsAvailable={controlsAvailable}
         onRetryServers={() => void servers.refetch()}
         onSelectServer={onSelectBackupServer}
         selectedServerId={selectedBackupServerId}
@@ -211,16 +250,34 @@ function WindowBody({
 
   if (appId === "review") {
     return (
-      <ReviewQueueWindow onSelectChange={onSelectChange} selectedChangeId={selectedChangeId} />
+      <ReviewQueueWindow
+        controlMessage={controlMessage}
+        controlsAvailable={controlsAvailable}
+        onSelectChange={onSelectChange}
+        selectedChangeId={selectedChangeId}
+      />
     );
   }
 
   if (appId === "forge") {
-    return <RuleForgeWindow onOpenReview={onOpenReview} servers={servers.data?.data ?? []} />;
+    return (
+      <RuleForgeWindow
+        controlMessage={controlMessage}
+        controlsAvailable={controlsAvailable}
+        onOpenReview={onOpenReview}
+        servers={servers.data?.data ?? []}
+      />
+    );
   }
 
   if (appId === "activity") {
-    return <TrustLedgerWindow servers={servers.data?.data ?? []} />;
+    return (
+      <TrustLedgerWindow
+        controlMessage={controlMessage}
+        controlsAvailable={controlsAvailable}
+        servers={servers.data?.data ?? []}
+      />
+    );
   }
 
   const quotaData = quota.data?.data;
@@ -337,7 +394,7 @@ function WindowBody({
         ) : null}
       </div>
 
-      <BillingPanel />
+      <BillingPanel controlMessage={controlMessage} controlsAvailable={controlsAvailable} />
 
       <div className="account-actions">
         <p>Signing out clears this browser session. It does not stop or change any realm.</p>
@@ -363,6 +420,7 @@ function DesktopWindow({
   onFocus,
   onMinimize,
   onToggleMaximize,
+  registerWindow,
   windowState,
 }: {
   app: AppDefinition;
@@ -373,6 +431,7 @@ function DesktopWindow({
   onFocus: () => void;
   onMinimize: () => void;
   onToggleMaximize: () => void;
+  registerWindow: (node: HTMLElement | null) => void;
   windowState: WindowState;
 }) {
   const dragControls = useDragControls();
@@ -385,6 +444,7 @@ function DesktopWindow({
       animate={{ opacity: 1, scale: 1, y: 0 }}
       aria-labelledby={titleId}
       className={`app-window pixel-border ${windowState.maximized ? "maximized" : ""}`}
+      data-app-window={app.id}
       drag={!windowState.maximized && !compact}
       dragControls={dragControls}
       dragElastic={0}
@@ -392,7 +452,9 @@ function DesktopWindow({
       dragMomentum={false}
       initial={reducedMotion ? false : { opacity: 0, scale: 0.96, y: 14 }}
       onDragEnd={(_event, info) => onDragEnd(info)}
+      onFocusCapture={onFocus}
       onPointerDown={onFocus}
+      ref={registerWindow}
       style={
         windowState.maximized || compact
           ? { zIndex: windowState.z }
@@ -404,6 +466,7 @@ function DesktopWindow({
             }
       }
       transition={{ duration: reducedMotion ? 0 : 0.18, ease: [0.22, 1, 0.36, 1] }}
+      tabIndex={-1}
     >
       <div
         aria-label={`${app.label} window controls`}
@@ -455,13 +518,26 @@ function DesktopWindow({
 
 export function Desktop() {
   const session = authClient.useSession();
-  const user = session.data?.user ?? null;
+  const [hydrated, setHydrated] = useState(false);
+  const user = hydrated ? (session.data?.user ?? null) : null;
   const compact = useCompactViewport();
+  const online = useOnlineStatus();
+  const [now, setNow] = useState(() => Date.now());
   const [windows, setWindows] = useState<WindowState[]>(initialWindows);
   const [selectedBackupServerId, setSelectedBackupServerId] = useState<string | null>(null);
   const [selectedChangeId, setSelectedChangeId] = useState<string | null>(null);
   const [signingOut, setSigningOut] = useState(false);
   const [signOutError, setSignOutError] = useState<string | null>(null);
+  const windowRefs = useRef(new Map<AppId, HTMLElement>());
+  const iconRefs = useRef(new Map<AppId, HTMLButtonElement>());
+  const taskbarRefs = useRef(new Map<AppId, HTMLButtonElement>());
+
+  useEffect(() => setHydrated(true), []);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => setNow(Date.now()), 5_000);
+    return () => window.clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     const route = new URLSearchParams(window.location.search).get("app");
@@ -538,6 +614,24 @@ export function Desktop() {
     retry: 1,
   });
 
+  const rawConnectorState: ConnectorState = health.isError
+    ? "unavailable"
+    : health.data?.status === "ok"
+      ? "connected"
+      : "checking";
+  const controlTruth = evaluateControlTruth({
+    connectorState: rawConnectorState,
+    now,
+    observedAt: servers.dataUpdatedAt,
+    online,
+  });
+  const connectorState: ConnectorState =
+    controlTruth.state === "verified"
+      ? "connected"
+      : controlTruth.state === "checking"
+        ? "checking"
+        : "unavailable";
+
   const apps = useMemo<AppDefinition[]>(() => {
     const realmCount = servers.data?.data.length;
     return [
@@ -589,56 +683,93 @@ export function Desktop() {
     ];
   }, [servers.data?.data.length, user?.email]);
 
-  const focus = (appId: AppId) =>
-    setWindows((items) =>
-      items.map((item) =>
-        item.appId === appId ? { ...item, z: nextWindowZ(items), minimized: false } : item,
-      ),
-    );
+  const focusWindowElement = useCallback((appId: AppId) => {
+    window.requestAnimationFrame(() => windowRefs.current.get(appId)?.focus());
+  }, []);
 
-  const open = (appId: AppId) =>
-    setWindows((items) => {
-      if (items.some((item) => item.appId === appId)) {
-        return items.map((item) =>
-          item.appId === appId ? { ...item, minimized: false, z: nextWindowZ(items) } : item,
-        );
+  const focus = useCallback(
+    (appId: AppId, moveKeyboardFocus = true) => {
+      setWindows((items) =>
+        items.map((item) =>
+          item.appId === appId ? { ...item, z: nextWindowZ(items), minimized: false } : item,
+        ),
+      );
+      if (moveKeyboardFocus) focusWindowElement(appId);
+    },
+    [focusWindowElement],
+  );
+
+  const open = useCallback(
+    (appId: AppId) => {
+      setWindows((items) => {
+        if (items.some((item) => item.appId === appId)) {
+          return items.map((item) =>
+            item.appId === appId ? { ...item, minimized: false, z: nextWindowZ(items) } : item,
+          );
+        }
+
+        const offset = 30 * (items.length % 5);
+        return [
+          ...items,
+          {
+            appId,
+            x: 118 + offset,
+            y: 108 + offset,
+            z: nextWindowZ(items),
+            minimized: false,
+            maximized: false,
+          },
+        ];
+      });
+      focusWindowElement(appId);
+    },
+    [focusWindowElement],
+  );
+
+  const openBackups = useCallback(
+    (serverId?: string) => {
+      if (serverId) {
+        setSelectedBackupServerId(serverId);
+      } else if (!selectedBackupServerId && servers.data?.data[0]) {
+        setSelectedBackupServerId(servers.data.data[0].id);
       }
+      open("backups");
+    },
+    [open, selectedBackupServerId, servers.data?.data],
+  );
 
-      const offset = 30 * (items.length % 5);
-      return [
-        ...items,
-        {
-          appId,
-          x: 118 + offset,
-          y: 108 + offset,
-          z: nextWindowZ(items),
-          minimized: false,
-          maximized: false,
-        },
-      ];
-    });
-
-  const openBackups = (serverId?: string) => {
-    if (serverId) {
-      setSelectedBackupServerId(serverId);
-    } else if (!selectedBackupServerId && servers.data?.data[0]) {
-      setSelectedBackupServerId(servers.data.data[0].id);
-    }
-    open("backups");
-  };
+  useEffect(() => {
+    const shortcuts = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || !event.altKey || event.metaKey) return;
+      const target = event.target;
+      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) return;
+      const index = Number(event.key) - 1;
+      const app = apps[index];
+      if (!app) return;
+      event.preventDefault();
+      if (app.id === "backups") openBackups();
+      else open(app.id);
+    };
+    window.addEventListener("keydown", shortcuts);
+    return () => window.removeEventListener("keydown", shortcuts);
+  }, [apps, open, openBackups]);
 
   const openReview = (changeId: string) => {
     setSelectedChangeId(changeId);
     open("review");
   };
 
-  const close = (appId: AppId) =>
+  const close = (appId: AppId) => {
     setWindows((items) => items.filter((item) => item.appId !== appId));
+    window.requestAnimationFrame(() => iconRefs.current.get(appId)?.focus());
+  };
 
-  const minimize = (appId: AppId) =>
+  const minimize = (appId: AppId) => {
     setWindows((items) =>
       items.map((item) => (item.appId === appId ? { ...item, minimized: true } : item)),
     );
+    window.requestAnimationFrame(() => taskbarRefs.current.get(appId)?.focus());
+  };
 
   const toggleMaximize = (appId: AppId) =>
     setWindows((items) =>
@@ -689,15 +820,16 @@ export function Desktop() {
     (server) => server.currentState === "running" || server.currentState === "ready",
   ).length;
   const totalCount = servers.data?.data.length;
-  const connectorStatus = health.isError
-    ? "Connector unavailable"
-    : health.data?.status === "ok"
-      ? totalCount === undefined
-        ? "Control plane connected"
-        : totalCount === 0
-          ? "Connected, no workloads yet"
-          : `${runningCount} of ${totalCount} workloads running`
-      : "Connecting to control plane";
+  const connectorStatus =
+    controlTruth.state !== "verified"
+      ? controlTruth.message
+      : health.data?.status === "ok"
+        ? totalCount === undefined
+          ? "Control plane connected"
+          : totalCount === 0
+            ? "Connected, no workloads yet"
+            : `${runningCount} of ${totalCount} workloads running`
+        : "Connecting to control plane";
 
   return (
     <main className="mc-desktop">
@@ -711,7 +843,7 @@ export function Desktop() {
         </div>
         <div className="topbar-actions">
           <div className="topbar-status" aria-live="polite">
-            {health.isError ? (
+            {controlTruth.state !== "verified" ? (
               <WifiOff aria-hidden="true" size={16} />
             ) : (
               <Wifi aria-hidden="true" size={16} />
@@ -736,7 +868,12 @@ export function Desktop() {
             <button
               className="desktop-icon"
               key={app.id}
+              aria-keyshortcuts={`Control+Alt+${apps.indexOf(app) + 1}`}
               onClick={() => (app.id === "backups" ? openBackups() : open(app.id))}
+              ref={(node) => {
+                if (node) iconRefs.current.set(app.id, node);
+                else iconRefs.current.delete(app.id);
+              }}
               type="button"
             >
               <span className="icon-tile" style={{ color: app.color }}>
@@ -761,13 +898,20 @@ export function Desktop() {
               key={windowState.appId}
               onClose={() => close(windowState.appId)}
               onDragEnd={(info) => move(windowState.appId, info)}
-              onFocus={() => focus(windowState.appId)}
+              onFocus={() => focus(windowState.appId, false)}
               onMinimize={() => minimize(windowState.appId)}
               onToggleMaximize={() => toggleMaximize(windowState.appId)}
+              registerWindow={(node) => {
+                if (node) windowRefs.current.set(windowState.appId, node);
+                else windowRefs.current.delete(windowState.appId);
+              }}
               windowState={windowState}
             >
               <WindowBody
                 appId={windowState.appId}
+                connectorState={connectorState}
+                controlMessage={controlTruth.message}
+                controlsAvailable={controlTruth.canMutate}
                 health={health}
                 onOpenBackups={openBackups}
                 onOpenReview={openReview}
@@ -787,11 +931,14 @@ export function Desktop() {
         })}
 
       <AllayCompanion
-        connectorState={
-          health.isError ? "unavailable" : health.data?.status === "ok" ? "connected" : "checking"
-        }
+        connectorState={connectorState}
+        controlMessage={controlTruth.message}
         operatorName={firstName(user?.name, user?.email)}
-        refreshServers={() => servers.refetch()}
+        refreshServers={async () => {
+          const result = await servers.refetch();
+          if (result.isError || result.fetchStatus === "paused") return undefined;
+          return result.data?.data;
+        }}
         servers={servers.data?.data}
         serversLoading={servers.isPending}
       />
@@ -811,6 +958,10 @@ export function Desktop() {
                 className={!windowState.minimized ? "task-app active" : "task-app"}
                 key={windowState.appId}
                 onClick={() => focus(windowState.appId)}
+                ref={(node) => {
+                  if (node) taskbarRefs.current.set(windowState.appId, node);
+                  else taskbarRefs.current.delete(windowState.appId);
+                }}
                 type="button"
               >
                 <Icon aria-hidden="true" size={17} />
@@ -821,7 +972,7 @@ export function Desktop() {
         <DesktopClock />
       </footer>
 
-      {session.isPending ? (
+      {hydrated && session.isPending ? (
         <div className="session-check" role="status">
           Checking account…
         </div>

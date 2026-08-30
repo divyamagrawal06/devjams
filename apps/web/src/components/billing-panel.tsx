@@ -98,7 +98,13 @@ function actionErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Billing could not be opened. Please try again.";
 }
 
-export function BillingPanel() {
+export function BillingPanel({
+  controlMessage,
+  controlsAvailable,
+}: {
+  controlMessage: string;
+  controlsAvailable: boolean;
+}) {
   const [returnNotice, setReturnNotice] = useState<"return" | "cancel" | null>(null);
   const [awaitingWebhook, setAwaitingWebhook] = useState(false);
 
@@ -179,7 +185,7 @@ export function BillingPanel() {
         {summary?.can_manage_billing ? (
           <button
             className="billing-secondary-action"
-            disabled={billingPending}
+            disabled={!controlsAvailable || billingPending}
             onClick={() => {
               checkout.reset();
               portal.mutate();
@@ -191,6 +197,12 @@ export function BillingPanel() {
           </button>
         ) : null}
       </div>
+
+      {!controlsAvailable ? (
+        <div className="control-truth-banner" role="status">
+          <CircleAlert aria-hidden="true" size={17} /> {controlMessage}
+        </div>
+      ) : null}
 
       {returnNotice === "return" ? (
         <div className="billing-notice good" role="status">
@@ -326,7 +338,7 @@ export function BillingPanel() {
                     </div>
                     <button
                       className={selectable ? "billing-primary-action" : "billing-plan-action"}
-                      disabled={!selectable || billingPending}
+                      disabled={!controlsAvailable || !selectable || billingPending}
                       onClick={() => {
                         if (!selectable) return;
                         portal.reset();

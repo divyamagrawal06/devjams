@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
-import { type AllayCreateTemplate, findMentionedServer, parseAllayIntent } from "./allay-intent";
+import {
+  type AllayCreateTemplate,
+  confirmationDecision,
+  findMentionedServer,
+  parseAllayIntent,
+  resolveCreateCapability,
+} from "./allay-intent";
 
 describe("parseAllayIntent", () => {
   test("recognizes conversational power commands", () => {
@@ -23,6 +29,12 @@ describe("parseAllayIntent", () => {
     expect(parseAllayIntent("copy the join address")).toEqual({ kind: "copy" });
     expect(parseAllayIntent("show my realms")).toEqual({ kind: "list" });
     expect(parseAllayIntent("what can you do?")).toEqual({ kind: "help" });
+  });
+
+  test("treats negated mutations as non-mutating", () => {
+    expect(parseAllayIntent("don't stop Survival")).toEqual({ kind: "negated" });
+    expect(parseAllayIntent("do not restart the realm")).toEqual({ kind: "negated" });
+    expect(parseAllayIntent("never create a Valheim server")).toEqual({ kind: "negated" });
   });
 
   test("normalizes a named Valheim create request", () => {
@@ -143,6 +155,76 @@ describe("parseAllayIntent", () => {
       });
     },
   );
+});
+
+describe("confirmationDecision", () => {
+  test("requires an unambiguous bounded confirmation", () => {
+    expect(confirmationDecision("yes")).toBe("confirm");
+    expect(confirmationDecision("Yes, don't do it")).toBe("unclear");
+    expect(confirmationDecision("do not continue")).toBe("cancel");
+    expect(confirmationDecision("maybe later")).toBe("unclear");
+  });
+});
+
+describe("resolveCreateCapability", () => {
+  const catalogue = {
+    workloadKinds: [
+      {
+        id: "minecraft",
+        label: "Minecraft Java",
+        available: true,
+        defaultVersion: "1.21.4",
+        runtimes: [
+          { id: "paper", label: "Paper" },
+          { id: "vanilla", label: "Vanilla" },
+        ],
+      },
+      {
+        id: "dedicated_game",
+        label: "Dedicated game",
+        available: false,
+        unavailableReason: "No dedicated-game provisioning connector is active.",
+        runtimes: [],
+      },
+      {
+        id: "node_service",
+        label: "Node service",
+        available: false,
+        unavailableReason: "No Node service provisioning connector is active.",
+        runtimes: [],
+      },
+    ],
+    constraints: {
+      cpuCores: { min: 1, max: 16 },
+      ramMb: { min: 512, max: 32_768, step: 512 },
+      storageGb: { min: 2, max: 500 },
+    },
+  };
+
+  test("uses the backend runtime and exact default version", () => {
+    const parsed = parseAllayIntent("create a paper realm named safe realm");
+    if (parsed.kind !== "create") throw new Error("Expected a create intent");
+    expect(resolveCreateCapability(parsed, catalogue)).toMatchObject({
+      available: true,
+      intent: { body: { game: "minecraft", type: "paper", version: "1.21.4" } },
+    });
+  });
+
+  test("preserves honest unavailable states", () => {
+    const valheim = parseAllayIntent("create a valheim server named vikings");
+    const node = parseAllayIntent("host a node website called portfolio");
+    if (valheim.kind !== "create" || node.kind !== "create") {
+      throw new Error("Expected create intents");
+    }
+    expect(resolveCreateCapability(valheim, catalogue)).toEqual({
+      available: false,
+      reason: "No dedicated-game provisioning connector is active.",
+    });
+    expect(resolveCreateCapability(node, catalogue)).toEqual({
+      available: false,
+      reason: "No Node service provisioning connector is active.",
+    });
+  });
 });
 
 describe("findMentionedServer", () => {

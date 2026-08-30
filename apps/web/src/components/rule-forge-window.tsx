@@ -24,9 +24,13 @@ function starterDocument(version: string | null | undefined) {
 }
 
 export function RuleForgeWindow({
+  controlMessage,
+  controlsAvailable,
   onOpenReview,
   servers,
 }: {
+  controlMessage: string;
+  controlsAvailable: boolean;
   onOpenReview: (changeId: string) => void;
   servers: LiveServer[];
 }) {
@@ -98,6 +102,12 @@ export function RuleForgeWindow({
           envelope; it cannot approve or deploy the change.
         </p>
       </div>
+
+      {!controlsAvailable ? (
+        <div className="control-truth-banner" role="status">
+          <CircleAlert aria-hidden="true" size={17} /> {controlMessage}
+        </div>
+      ) : null}
 
       <form
         className="forge-form"
@@ -213,7 +223,13 @@ export function RuleForgeWindow({
           </p>
           <button
             className="operation-primary-action"
-            disabled={draft.isPending || !serverId || title.trim().length < 3 || !rationale.trim()}
+            disabled={
+              !controlsAvailable ||
+              draft.isPending ||
+              !serverId ||
+              title.trim().length < 3 ||
+              !rationale.trim()
+            }
             type="submit"
           >
             <FileJson2 aria-hidden="true" size={17} />

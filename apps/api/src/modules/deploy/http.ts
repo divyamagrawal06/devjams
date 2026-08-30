@@ -11,7 +11,6 @@ import {
   abortDeployment,
   enqueueDeploy,
   getDeployment,
-  reconcileInFlight,
   rollbackServer,
   rollbackTargetError,
 } from "./controller";
@@ -34,9 +33,6 @@ const ruleOperationBody = t.Object(
 );
 
 export const deployModule = new Elysia({ name: "authenticated-deployments" })
-  .onStart(async () => {
-    await reconcileInFlight();
-  })
   .derive(async ({ headers }) => ({
     identity: await AuthService.requireAgentIdentityFromHeaders(headers),
   }))
@@ -81,7 +77,7 @@ export const deployModule = new Elysia({ name: "authenticated-deployments" })
     { body: ruleOperationBody },
   )
   .get("/v1/deployments/:id", async ({ identity, params, set }) => {
-    const row = getDeployment(params.id);
+    const row = await getDeployment(params.id);
     if (!row || !(await ownsDeploymentTarget(identity.userId, row.serverId))) {
       set.status = 404;
       return notFound({ tool: "get_deployment", resource: `deployment ${params.id}` });
@@ -89,7 +85,7 @@ export const deployModule = new Elysia({ name: "authenticated-deployments" })
     return row;
   })
   .post("/v1/deployments/:id/abort", async ({ identity, params, set }) => {
-    const row = getDeployment(params.id);
+    const row = await getDeployment(params.id);
     if (!row || !(await ownsDeploymentTarget(identity.userId, row.serverId))) {
       set.status = 404;
       return notFound({ tool: "abort", resource: `deployment ${params.id}` });
@@ -109,7 +105,11 @@ export const deployModule = new Elysia({ name: "authenticated-deployments" })
         return notFound({ tool: "rollback", resource: `server ${params.id}` });
       }
 
-      const targetError = rollbackTargetError(params.id, String(body.rule_set_version));
+      const targetError = await rollbackTargetError(
+        params.id,
+        String(body.rule_set_version),
+        body.content_digest,
+      );
       if (targetError) {
         set.status = 409;
         return { error: targetError };

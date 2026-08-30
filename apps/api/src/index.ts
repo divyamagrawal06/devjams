@@ -1,6 +1,7 @@
 import "./load-env";
 import type { Elysia } from "elysia";
 import { app } from "./app";
+import { reconcileInFlight, startDeploymentLeaseReaper } from "./modules/deploy/controller";
 import { type RollupStore, telemetryPlugin } from "./modules/telemetry/index.ts";
 
 export { app };
@@ -15,6 +16,19 @@ export function registerTelemetry<T extends Elysia>(instance: T, store: RollupSt
   return instance.use(telemetryPlugin({ store }));
 }
 
-app.listen(process.env.PORT || 3001);
+export async function start() {
+  await reconcileInFlight();
+  startDeploymentLeaseReaper();
 
-console.log(`🦊 Elysia is running at ${app.server?.hostname}:${app.server?.port}`);
+  app.listen(process.env.PORT || 3001);
+
+  console.log(`🦊 Elysia is running at ${app.server?.hostname}:${app.server?.port}`);
+  return app;
+}
+
+if (import.meta.main) {
+  void start().catch((error) => {
+    console.error("API startup failed:", error);
+    process.exitCode = 1;
+  });
+}

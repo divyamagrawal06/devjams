@@ -73,13 +73,25 @@ describe("deployment authority boundary", () => {
     ).not.toThrow();
   });
 
-  test("checks rollback targets before a single-use approval is redeemed", () => {
-    expect(rollbackTargetError("server-one", "7", () => undefined)).toBe(
+  test("checks rollback targets before a single-use approval is redeemed", async () => {
+    const approvedDigest = `sha256:${"a".repeat(64)}`;
+    await expect(rollbackTargetError("server-one", "7", approvedDigest, () => null)).resolves.toBe(
       "No rollback target recorded for this server",
     );
-    expect(rollbackTargetError("server-one", "7", () => "6")).toBe(
+    const head = {
+      currentVersion: "8",
+      currentDigest: `sha256:${"b".repeat(64)}`,
+      previousVersion: "6",
+      previousDigest: approvedDigest,
+    };
+    await expect(rollbackTargetError("server-one", "7", approvedDigest, () => head)).resolves.toBe(
       "Rollback target does not match the recorded previous version",
     );
-    expect(rollbackTargetError("server-one", "7", () => "7")).toBeNull();
+    await expect(
+      rollbackTargetError("server-one", "6", `sha256:${"c".repeat(64)}`, () => head),
+    ).resolves.toBe("Rollback digest does not match the recorded previous artifact");
+    await expect(
+      rollbackTargetError("server-one", "6", approvedDigest, () => head),
+    ).resolves.toBeNull();
   });
 });

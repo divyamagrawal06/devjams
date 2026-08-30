@@ -189,6 +189,11 @@ export type VelocityTransfer = {
   fromRoute: string;
   toRoute: string;
   message: string;
+  /** Snapshot of players on fromRoute. A proxy must never move anyone else. */
+  players: string[];
+  expiresAt: string;
+  /** Monotonic delivery attempt, useful for idempotent proxy retries. */
+  attempt: number;
 };
 
 export type VelocityTransferAck = {

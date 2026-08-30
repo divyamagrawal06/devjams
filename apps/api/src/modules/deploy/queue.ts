@@ -1,31 +1,64 @@
-const MAX_CONCURRENT = Number(process.env.DEPLOY_CONCURRENCY ?? "1");
-const waiting: string[] = [];
-const running = new Set<string>();
+import { randomUUID } from "node:crypto";
 
-export function enqueue(id: string): number {
-  waiting.push(id);
-  return waiting.length;
+import { type DeploymentRecord, type DeploymentStore, deploymentStore } from "./store";
+
+const DEFAULT_MAX_CONCURRENT = 1;
+const DEFAULT_LEASE_MS = 15 * 60 * 1000;
+
+function positiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-export function queuePosition(id: string): number | null {
-  const idx = waiting.indexOf(id);
-  if (idx >= 0) return idx + 1;
-  if (running.has(id)) return 0;
-  return null;
-}
+export class DurableDeploymentQueue {
+  readonly workerId: string;
+  private readonly maxConcurrent: number;
+  private readonly leaseMs: number;
 
-export function admitNext(): string | null {
-  while (running.size < MAX_CONCURRENT && waiting.length > 0) {
-    const id = waiting.shift();
-    if (!id) return null;
-    running.add(id);
-    return id;
+  constructor(
+    private readonly store: DeploymentStore = deploymentStore,
+    options: { workerId?: string; maxConcurrent?: number; leaseMs?: number } = {},
+  ) {
+    this.workerId = options.workerId ?? `worker_${randomUUID()}`;
+    this.maxConcurrent =
+      options.maxConcurrent ??
+      positiveInteger(process.env.DEPLOY_CONCURRENCY, DEFAULT_MAX_CONCURRENT);
+    this.leaseMs =
+      options.leaseMs ?? positiveInteger(process.env.DEPLOY_LEASE_MS, DEFAULT_LEASE_MS);
   }
-  return null;
+
+  position(id: string): Promise<number | null> {
+    return this.store.queuePosition(id);
+  }
+
+  get heartbeatIntervalMs(): number {
+    return Math.max(250, Math.floor(this.leaseMs / 3));
+  }
+
+  claimNext(): Promise<string | null> {
+    return this.store.claimNext(this.workerId, this.maxConcurrent, this.leaseMs);
+  }
+
+  claimExpired(): Promise<DeploymentRecord | null> {
+    return this.store.claimExpired(`recovery_${this.workerId}`, this.leaseMs);
+  }
+
+  async claimAvailable(): Promise<string[]> {
+    const claimed: string[] = [];
+    while (true) {
+      const deploymentId = await this.claimNext();
+      if (!deploymentId) return claimed;
+      claimed.push(deploymentId);
+    }
+  }
+
+  renew(id: string): Promise<boolean> {
+    return this.store.renewLease(id, this.workerId, this.leaseMs);
+  }
+
+  complete(id: string): Promise<void> {
+    return this.store.completeQueue(id);
+  }
 }
 
-export function complete(id: string): void {
-  running.delete(id);
-  const idx = waiting.indexOf(id);
-  if (idx >= 0) waiting.splice(idx, 1);
-}
+export const deploymentQueue = new DurableDeploymentQueue();

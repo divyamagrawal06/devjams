@@ -47,6 +47,10 @@ export const backupStatusEnum = pgEnum("backup_status", [
   "deleted",
 ]);
 
+export const backupSourceEnum = pgEnum("backup_source", ["manual", "scheduled"]);
+
+export const backupOperationEnum = pgEnum("backup_operation", ["create", "restore", "delete"]);
+
 export const k8sEventTypeEnum = pgEnum("k8s_event_type", [
   "pod_ready",
   "pod_started",

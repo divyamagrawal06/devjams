@@ -47,4 +47,13 @@ describe("backup route authentication", () => {
       getPaths.indexOf("/api/servers/:serverId/backups/:backupId"),
     );
   });
+
+  test("rejects a download request before generating a signed URL", async () => {
+    const response = await app.handle(
+      new Request("http://localhost/api/servers/server-id/backups/backup-id/download"),
+    );
+
+    expect(response.status).toBe(401);
+    expect(await response.text()).toBe("Authentication required");
+  });
 });

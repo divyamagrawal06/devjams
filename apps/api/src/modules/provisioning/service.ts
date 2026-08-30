@@ -5,6 +5,14 @@ import { and, eq } from "drizzle-orm";
 import type { z } from "zod";
 import { db } from "../../db";
 import {
+  acquireBackupLease,
+  assertBackupLeaseFence,
+  assertBackupLeaseRenewalFence,
+  releaseBackupLeaseWithRetry,
+  SYNCHRONOUS_SERVER_OPERATION_LEASE_SECONDS,
+} from "../backup/lock";
+import { assertNoActiveServerBackup, assertNoPendingServerCutover } from "../deploy/guard";
+import {
   CLUSTER_NAME,
   getKubernetesStatusCode,
   type KubernetesClients,
@@ -14,6 +22,7 @@ import {
 import {
   ensureTenantNamespace,
   RCON_PASSWORD_FILE,
+  RCON_PASSWORD_MOUNT,
   RCON_PORT,
   RCON_SECRET_NAME,
   WORLD_SYNC_NAMES,
@@ -25,6 +34,10 @@ import { calculateContainerMemory, MinecraftUtils, requiredPinnedImage } from ".
 const TEST_EXISTING_PVC_NAME = process.env.FARLANDS_TEST_EXISTING_PVC_NAME;
 const TEST_WORKLOAD_REPLICAS =
   TEST_EXISTING_PVC_NAME && process.env.FARLANDS_TEST_START_POD !== "true" ? 0 : 1;
+const PROVISIONING_BACKUP_LEASE_RENEW_INTERVAL_MS = Math.max(
+  1_000,
+  Math.floor((SYNCHRONOUS_SERVER_OPERATION_LEASE_SECONDS * 1_000) / 3),
+);
 const SERVER_PORT = 25565;
 const DATA_MOUNT_PATH = "/data";
 const SUPPORTED_RUNTIMES: Record<string, string[]> = {
@@ -61,6 +74,160 @@ type ResourceSpec = {
   requests: { cpu: string; memory: string };
   limits: { cpu: string; memory: string };
 };
+
+type ProvisioningBackupLeaseFence = () => Promise<void>;
+
+type ProvisioningBackupLeaseDependencies = {
+  now: () => number;
+  acquire: typeof acquireBackupLease;
+  release: typeof releaseBackupLeaseWithRetry;
+  assertNoActiveBackup: typeof assertNoActiveServerBackup;
+  assertNoPendingCutover: typeof assertNoPendingServerCutover;
+  scheduleRenewal: (renew: () => void, intervalMs: number) => ReturnType<typeof setInterval>;
+  cancelRenewal: (timer: ReturnType<typeof setInterval>) => void;
+};
+
+const defaultProvisioningBackupLeaseDependencies: ProvisioningBackupLeaseDependencies = {
+  now: Date.now,
+  acquire: acquireBackupLease,
+  release: releaseBackupLeaseWithRetry,
+  assertNoActiveBackup: assertNoActiveServerBackup,
+  assertNoPendingCutover: assertNoPendingServerCutover,
+  scheduleRenewal: (renew, intervalMs) => setInterval(renew, intervalMs),
+  cancelRenewal: (timer) => clearInterval(timer),
+};
+
+async function withProvisioningBackupLease<T>(
+  namespace: string,
+  serverId: string,
+  run: (assertLeaseHeld: ProvisioningBackupLeaseFence) => Promise<T>,
+  dependencies: ProvisioningBackupLeaseDependencies = defaultProvisioningBackupLeaseDependencies,
+): Promise<T> {
+  const holder = `server-provision:${crypto.randomUUID()}`;
+  let confirmedUntil = (
+    await dependencies.acquire(
+      namespace,
+      serverId,
+      holder,
+      SYNCHRONOUS_SERVER_OPERATION_LEASE_SECONDS,
+    )
+  ).getTime();
+  assertBackupLeaseFence(confirmedUntil, dependencies.now());
+
+  let renewalInFlight: Promise<void> | null = null;
+  let renewalFailure: unknown = null;
+  let renewalsStopped = false;
+
+  const renewOnce = (): Promise<void> => {
+    if (renewalsStopped) {
+      return Promise.reject(new Error("Provisioning backup Lease renewal has stopped"));
+    }
+    if (renewalInFlight) return renewalInFlight;
+
+    const previousConfirmedUntil = confirmedUntil;
+    const requestStartedAt = dependencies.now();
+    try {
+      assertBackupLeaseFence(previousConfirmedUntil, requestStartedAt);
+    } catch (error) {
+      renewalFailure = error;
+      return Promise.reject(error);
+    }
+
+    let activeRenewal!: Promise<void>;
+    activeRenewal = (async () => {
+      try {
+        const renewedUntil = await dependencies.acquire(
+          namespace,
+          serverId,
+          holder,
+          SYNCHRONOUS_SERVER_OPERATION_LEASE_SECONDS,
+        );
+        const responseReceivedAt = dependencies.now();
+        assertBackupLeaseRenewalFence(
+          previousConfirmedUntil,
+          renewedUntil.getTime(),
+          requestStartedAt,
+          responseReceivedAt,
+        );
+        confirmedUntil = renewedUntil.getTime();
+        renewalFailure = null;
+      } catch (error) {
+        renewalFailure = error;
+        throw error;
+      } finally {
+        if (renewalInFlight === activeRenewal) renewalInFlight = null;
+      }
+    })();
+    renewalInFlight = activeRenewal;
+    return activeRenewal;
+  };
+
+  const settleRenewal = async (): Promise<void> => {
+    const activeRenewal = renewalInFlight;
+    if (activeRenewal) {
+      try {
+        await activeRenewal;
+      } catch (error) {
+        renewalFailure = error;
+      }
+    }
+    if (renewalFailure !== null) {
+      // A transient failure may be retried only while the last confirmed
+      // ownership window remains live. renewOnce rejects a late response, so a
+      // stopped process can never bridge an expiry after another holder wins.
+      assertBackupLeaseFence(confirmedUntil, dependencies.now());
+      await renewOnce();
+    }
+    assertBackupLeaseFence(confirmedUntil, dependencies.now());
+  };
+
+  const assertLeaseHeld: ProvisioningBackupLeaseFence = async () => {
+    await settleRenewal();
+    // A manual operation writes its durable claim before dispatching its Job,
+    // and migration-era Jobs may not hold the Kubernetes Lease at all. Recheck
+    // both database guards at every mutation boundary, including rollback
+    // after an ambiguous provisioning-state commit.
+    await dependencies.assertNoActiveBackup(serverId);
+    await dependencies.assertNoPendingCutover(serverId);
+    await settleRenewal();
+    // Re-stamp the short synchronous Lease at every mutation boundary in
+    // addition to the background heartbeat. This leaves the full ownership
+    // window available to the immediately following Kubernetes request.
+    await renewOnce();
+    assertBackupLeaseFence(confirmedUntil, dependencies.now());
+  };
+
+  const renewalTimer = dependencies.scheduleRenewal(() => {
+    if (renewalsStopped) return;
+    void renewOnce().catch((error) => {
+      console.error(`[${serverId}] Failed to renew provisioning backup Lease:`, error);
+    });
+  }, PROVISIONING_BACKUP_LEASE_RENEW_INTERVAL_MS);
+  renewalTimer.unref?.();
+
+  const awaitInFlightRenewalBeforeRelease = async (): Promise<void> => {
+    const activeRenewal = renewalInFlight;
+    if (!activeRenewal) return;
+    await activeRenewal.catch((error: unknown) => {
+      console.error(
+        `[${serverId}] Provisioning Lease renewal failed before release completed:`,
+        error,
+      );
+    });
+  };
+
+  try {
+    await assertLeaseHeld();
+    return await run(assertLeaseHeld);
+  } finally {
+    renewalsStopped = true;
+    dependencies.cancelRenewal(renewalTimer);
+    await awaitInFlightRenewalBeforeRelease();
+    await dependencies.release(namespace, serverId, holder).catch((error) => {
+      console.error(`[${serverId}] Failed to release server-provision backup Lease:`, error);
+    });
+  }
+}
 
 // Fetched internally from serverConfigs/gameServers by serverId — see
 // getProvisionConfig(). Replaces the earlier approach of taking this as
@@ -141,6 +308,9 @@ function buildPvc(
       name: names.pvc,
       namespace,
       labels,
+      annotations: {
+        "farlands.dev/backup-service": names.service,
+      },
     },
     spec: {
       accessModes: ["ReadWriteOnce"],
@@ -252,6 +422,7 @@ function buildDeployment(
     },
     spec: {
       replicas: TEST_WORKLOAD_REPLICAS,
+      strategy: { type: "Recreate" },
       selector: {
         matchLabels: {
           "farlands.dev/server-id": labels["farlands.dev/server-id"],
@@ -262,6 +433,12 @@ function buildDeployment(
           labels,
         },
         spec: {
+          automountServiceAccountToken: false,
+          terminationGracePeriodSeconds: 120,
+          securityContext: {
+            fsGroup: 1000,
+            seccompProfile: { type: "RuntimeDefault" },
+          },
           tolerations: [
             {
               key: "farlands.sh/nodepool",
@@ -364,6 +541,11 @@ function buildDeployment(
                 { name: "WORLD_SYNC_PORT", value: String(WORLD_SYNC_PORT) },
                 { name: "WORLD_ROOT", value: WORLD_SYNC_ROOT },
                 { name: "WORLD_NAMES", value: WORLD_SYNC_NAMES },
+                { name: "BACKUP_ROOT", value: DATA_MOUNT_PATH },
+                { name: "RCON_HOST", value: "127.0.0.1" },
+                { name: "RCON_PORT", value: String(RCON_PORT) },
+                { name: "RCON_PASSWORD_FILE", value: RCON_PASSWORD_FILE },
+                { name: "PYTHONDONTWRITEBYTECODE", value: "1" },
               ],
               resources: {
                 requests: { cpu: "50m", memory: "64Mi" },
@@ -378,8 +560,9 @@ function buildDeployment(
                 runAsGroup: 1000,
               },
               volumeMounts: [
-                { name: "server-data", mountPath: DATA_MOUNT_PATH },
+                { name: "server-data", mountPath: DATA_MOUNT_PATH, readOnly: true },
                 { name: "world-sync", mountPath: "/sync", readOnly: true },
+                { name: "rcon", mountPath: RCON_PASSWORD_MOUNT, readOnly: true },
               ],
             },
           ],
@@ -423,6 +606,7 @@ function buildService(
     spec: {
       type: "ClusterIP",
       selector: {
+        "app.kubernetes.io/name": "farlands-game-server",
         "farlands.dev/server-id": labels["farlands.dev/server-id"],
       },
       ports: [
@@ -501,7 +685,14 @@ function buildNetworkPolicy(
           ports: [{ protocol: "TCP", port: RCON_PORT }],
         } as unknown as k8s.V1NetworkPolicyIngressRule,
         {
-          from: [{ podSelector: {} }],
+          from: [
+            { podSelector: { matchLabels: { app: "server-backup-worker" } } },
+            {
+              podSelector: {
+                matchLabels: { "app.kubernetes.io/name": "farlands-game-server" },
+              },
+            },
+          ],
           ports: [{ protocol: "TCP", port: WORLD_SYNC_PORT }],
         } as unknown as k8s.V1NetworkPolicyIngressRule,
       ],
@@ -595,6 +786,8 @@ async function rollbackProvisionedResources(
   names: ServerResourceNames,
   createdResources: ProvisionedResource[],
   namespace: string,
+  serverId: string,
+  assertMutationAllowed: ProvisioningBackupLeaseFence,
 ): Promise<void> {
   const deleteHandlers: Record<ProvisionedResource, () => Promise<unknown>> = {
     networkPolicy: () =>
@@ -629,9 +822,35 @@ async function rollbackProvisionedResources(
       }),
   };
 
+  // Once the discovery labels are withdrawn, a scheduler that listed the PVC
+  // just before this replace will re-resolve it under its Lease and refuse the
+  // stale target. This also closes process-pause gaps between later DELETEs.
+  try {
+    await withdrawBackupDiscoveryLabels(clients, names, namespace, serverId, assertMutationAllowed);
+  } catch (error) {
+    console.error(
+      `[${names.deployment}] Rollback stopped before withdrawing backup discovery`,
+      error,
+    );
+    return;
+  }
+
   const deletionErrors: unknown[] = [];
 
   for (const resource of [...createdResources].reverse()) {
+    try {
+      await assertMutationAllowed();
+    } catch (error) {
+      // Another holder may now own the server Lease. Do not compensate through
+      // that successor's backup window; leave the remaining objects for a
+      // later, newly fenced cleanup attempt.
+      console.error(
+        `[${names.deployment}] Rollback stopped because provisioning no longer owns the backup Lease`,
+        error,
+      );
+      return;
+    }
+
     try {
       await deleteHandlers[resource]();
     } catch (error) {
@@ -651,10 +870,101 @@ async function rollbackProvisionedResources(
   }
 }
 
+async function publishBackupDiscoveryLabels(
+  clients: KubernetesClients,
+  names: ServerResourceNames,
+  namespace: string,
+  serverId: string,
+  assertMutationAllowed: ProvisioningBackupLeaseFence,
+): Promise<void> {
+  const pvc = await clients.core.readNamespacedPersistentVolumeClaim({
+    name: names.pvc,
+    namespace,
+  });
+  const labels = pvc.metadata?.labels ?? {};
+  if (labels["farlands.dev/server-id"] !== serverId) {
+    throw new Error(
+      `PVC ${namespace}/${names.pvc} is not owned by provisioning server ${serverId}`,
+    );
+  }
+  if (
+    labels["farlands.dev/backup-server-id"] !== undefined &&
+    labels["farlands.dev/backup-server-id"] !== serverId
+  ) {
+    throw new Error(`PVC ${namespace}/${names.pvc} has a conflicting backup server identity`);
+  }
+  if (
+    labels["farlands.dev/backup-strategy"] !== undefined &&
+    labels["farlands.dev/backup-strategy"] !== "minecraft-rcon"
+  ) {
+    throw new Error(`PVC ${namespace}/${names.pvc} has a conflicting backup strategy`);
+  }
+  if (!pvc.metadata?.resourceVersion) {
+    throw new Error(`PVC ${namespace}/${names.pvc} is missing a Kubernetes resource version`);
+  }
+
+  pvc.metadata.labels = {
+    ...labels,
+    "farlands.dev/backup-strategy": "minecraft-rcon",
+    "farlands.dev/backup-server-id": serverId,
+  };
+  await assertMutationAllowed();
+  await clients.core.replaceNamespacedPersistentVolumeClaim({
+    name: names.pvc,
+    namespace,
+    body: pvc,
+  });
+}
+
+async function withdrawBackupDiscoveryLabels(
+  clients: KubernetesClients,
+  names: ServerResourceNames,
+  namespace: string,
+  serverId: string,
+  assertMutationAllowed: ProvisioningBackupLeaseFence,
+): Promise<void> {
+  let pvc: k8s.V1PersistentVolumeClaim;
+  try {
+    pvc = await clients.core.readNamespacedPersistentVolumeClaim({
+      name: names.pvc,
+      namespace,
+    });
+  } catch (error) {
+    if (getKubernetesStatusCode(error) === 404) return;
+    throw error;
+  }
+
+  const labels = pvc.metadata?.labels ?? {};
+  const published =
+    labels["farlands.dev/backup-strategy"] !== undefined ||
+    labels["farlands.dev/backup-server-id"] !== undefined;
+  if (!published) return;
+  if (
+    labels["farlands.dev/server-id"] !== serverId ||
+    labels["farlands.dev/backup-server-id"] !== serverId
+  ) {
+    throw new Error(`PVC ${namespace}/${names.pvc} changed identity before rollback`);
+  }
+  if (!pvc.metadata?.resourceVersion) {
+    throw new Error(`PVC ${namespace}/${names.pvc} is missing a Kubernetes resource version`);
+  }
+
+  delete labels["farlands.dev/backup-strategy"];
+  delete labels["farlands.dev/backup-server-id"];
+  pvc.metadata.labels = labels;
+  await assertMutationAllowed();
+  await clients.core.replaceNamespacedPersistentVolumeClaim({
+    name: names.pvc,
+    namespace,
+    body: pvc,
+  });
+}
+
 async function deleteKubernetesResources(
   clients: KubernetesClients,
   names: ServerResourceNames,
   namespace: string,
+  assertMutationAllowed: () => Promise<void> = async () => {},
 ): Promise<void> {
   const deleteHandlers = {
     networkPolicy: () =>
@@ -698,6 +1008,7 @@ async function deleteKubernetesResources(
 
   for (const resource of deletionOrder) {
     try {
+      await assertMutationAllowed();
       await deleteHandlers[resource]();
     } catch (error) {
       const statusCode = getKubernetesStatusCode(error);
@@ -872,83 +1183,113 @@ export async function provisionGameServer(serverId: string): Promise<boolean> {
   } else {
     throw new Error(`No image resolver implemented for game: ${config.game}`);
   }
-  const labels = buildLabels(serverId, config.type);
+  const workloadLabels = buildLabels(serverId, config.type);
+  const backupCapableWorkloadLabels = {
+    ...workloadLabels,
+    "farlands.dev/backup-strategy": "minecraft-rcon",
+    "farlands.dev/backup-server-id": serverId,
+  };
   const resources = buildResourceSpec(config.cpuCores, config.ramMb);
   const clients = makeKubernetesClients();
-  const createdResources: ProvisionedResource[] = [];
 
-  try {
-    await ensureProvisioningResourcesDoNotExist(clients, names, namespace);
+  return withProvisioningBackupLease(namespace, serverId, async (assertLeaseHeld) => {
+    const createdResources: ProvisionedResource[] = [];
+    try {
+      await ensureProvisioningResourcesDoNotExist(clients, names, namespace);
 
-    if (!TEST_EXISTING_PVC_NAME) {
-      await clients.core.createNamespacedPersistentVolumeClaim({
+      if (!TEST_EXISTING_PVC_NAME) {
+        await assertLeaseHeld();
+        await clients.core.createNamespacedPersistentVolumeClaim({
+          namespace,
+          // The weekly selector is deliberately absent until every workload
+          // resource exists and the Deployment is ready.
+          body: buildPvc(namespace, names, workloadLabels, config.storageGb, config.storageClass),
+        });
+        createdResources.push("pvc");
+      }
+
+      await assertLeaseHeld();
+      await clients.core.createNamespacedConfigMap({
         namespace,
-        body: buildPvc(namespace, names, labels, config.storageGb, config.storageClass),
+        body: buildConfigMap(namespace, names, backupCapableWorkloadLabels, config),
       });
-      createdResources.push("pvc");
+      createdResources.push("configMap");
+
+      await assertLeaseHeld();
+      await clients.core.createNamespacedConfigMap({
+        namespace,
+        body: buildPaperGlobalConfigMap(namespace, names, backupCapableWorkloadLabels),
+      });
+      createdResources.push("filesConfigMap");
+
+      await assertLeaseHeld();
+      await clients.apps.createNamespacedDeployment({
+        namespace,
+        body: buildDeployment(namespace, names, backupCapableWorkloadLabels, image, resources),
+      });
+      createdResources.push("deployment");
+
+      await assertLeaseHeld();
+      await clients.core.createNamespacedService({
+        namespace,
+        body: buildService(namespace, names, backupCapableWorkloadLabels),
+      });
+      createdResources.push("service");
+
+      await assertLeaseHeld();
+      await clients.networking.createNamespacedNetworkPolicy({
+        namespace,
+        body: buildNetworkPolicy(namespace, names, backupCapableWorkloadLabels),
+      });
+      createdResources.push("networkPolicy");
+
+      await waitForDeploymentReplicasReady(
+        clients.apps,
+        names.deployment,
+        namespace,
+        TEST_WORKLOAD_REPLICAS,
+      );
+      // Publish the scheduler's PVC selector only after a complete, ready
+      // workload exists. If this process stops before here, weekly discovery
+      // has no target even after the short provisioning Lease expires.
+      await publishBackupDiscoveryLabels(clients, names, namespace, serverId, assertLeaseHeld);
+      await assertLeaseHeld();
+      await persistProvisioningState(serverId, names, namespace);
+
+      return true;
+    } catch (error) {
+      console.error(
+        `[${serverId}] Provisioning failed; rolling back created Kubernetes resources`,
+        error,
+      );
+
+      await rollbackProvisionedResources(
+        clients,
+        names,
+        createdResources,
+        namespace,
+        serverId,
+        assertLeaseHeld,
+      );
+
+      await db
+        .update(gameServers)
+        .set({
+          currentState: "failed",
+          statusMessage: "Provisioning failed.",
+          updatedAt: new Date(),
+        })
+        .where(eq(gameServers.id, serverId));
+
+      return false;
     }
-
-    await clients.core.createNamespacedConfigMap({
-      namespace,
-      body: buildConfigMap(namespace, names, labels, config),
-    });
-    createdResources.push("configMap");
-
-    await clients.core.createNamespacedConfigMap({
-      namespace,
-      body: buildPaperGlobalConfigMap(namespace, names, labels),
-    });
-    createdResources.push("filesConfigMap");
-
-    await clients.apps.createNamespacedDeployment({
-      namespace,
-      body: buildDeployment(namespace, names, labels, image, resources),
-    });
-    createdResources.push("deployment");
-
-    await clients.core.createNamespacedService({
-      namespace,
-      body: buildService(namespace, names, labels),
-    });
-    createdResources.push("service");
-
-    await clients.networking.createNamespacedNetworkPolicy({
-      namespace,
-      body: buildNetworkPolicy(namespace, names, labels),
-    });
-    createdResources.push("networkPolicy");
-
-    await waitForDeploymentReplicasReady(
-      clients.apps,
-      names.deployment,
-      namespace,
-      TEST_WORKLOAD_REPLICAS,
-    );
-    await persistProvisioningState(serverId, names, namespace);
-
-    return true;
-  } catch (error) {
-    console.error(
-      `[${serverId}] Provisioning failed; rolling back created Kubernetes resources`,
-      error,
-    );
-
-    await rollbackProvisionedResources(clients, names, createdResources, namespace);
-
-    await db
-      .update(gameServers)
-      .set({
-        currentState: "failed",
-        statusMessage: "Provisioning failed.",
-        updatedAt: new Date(),
-      })
-      .where(eq(gameServers.id, serverId));
-
-    return false;
-  }
+  });
 }
 
-export async function deleteGameServer(serverId: string): Promise<boolean> {
+export async function deleteGameServer(
+  serverId: string,
+  assertMutationAllowed: () => Promise<void> = async () => {},
+): Promise<boolean> {
   try {
     const k8sRecord = await db.query.serverK8s.findFirst({
       where: eq(serverK8s.serverId, serverId),
@@ -970,7 +1311,7 @@ export async function deleteGameServer(serverId: string): Promise<boolean> {
       networkPolicy: `netpol-server-${serverId}`,
     };
 
-    await deleteKubernetesResources(clients, names, k8sRecord.namespace);
+    await deleteKubernetesResources(clients, names, k8sRecord.namespace, assertMutationAllowed);
 
     return true;
   } catch (error) {
@@ -979,3 +1320,18 @@ export async function deleteGameServer(serverId: string): Promise<boolean> {
     return false;
   }
 }
+
+export const workloadManifestTestUtils = {
+  buildResourceSpec,
+  buildDeployment,
+  buildService,
+  buildNetworkPolicy,
+};
+
+export const provisioningBackupLeaseTestUtils = {
+  buildPvc,
+  publishBackupDiscoveryLabels,
+  withdrawBackupDiscoveryLabels,
+  rollbackProvisionedResources,
+  withProvisioningBackupLease,
+};

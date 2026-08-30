@@ -2,8 +2,12 @@
   "name": "farlands-backup-orchestrator",
   "version": "1.0.0",
   "private": true,
+  "scripts": {
+    "test": "bun test index.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
   "dependencies": {
-    "@kubernetes/client-node": "^1.0.0"
+    "@kubernetes/client-node": "^1.4.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

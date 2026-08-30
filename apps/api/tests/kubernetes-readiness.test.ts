@@ -4,6 +4,7 @@ import {
   type DeploymentStatusReader,
   resolveKubeconfigAwsProfile,
   waitForDeploymentReplicasReady,
+  waitForDeploymentRolloutReady,
 } from "../src/modules/provisioning/kubernetes";
 
 function makeStatusReader(
@@ -45,6 +46,58 @@ test("waits for all replicas to disappear when scaling down", async () => {
   });
 
   expect(appsApi.calls).toBe(2);
+});
+
+test("does not release a rollout wait for the previous ready generation", async () => {
+  const responses = [
+    {
+      metadata: { generation: 8 },
+      status: {
+        observedGeneration: 7,
+        replicas: 1,
+        readyReplicas: 1,
+        updatedReplicas: 1,
+        availableReplicas: 1,
+      },
+    },
+    {
+      metadata: { generation: 8 },
+      status: {
+        observedGeneration: 8,
+        replicas: 1,
+        readyReplicas: 0,
+        updatedReplicas: 1,
+        availableReplicas: 0,
+        unavailableReplicas: 1,
+      },
+    },
+    {
+      metadata: { generation: 8 },
+      status: {
+        observedGeneration: 8,
+        replicas: 1,
+        readyReplicas: 1,
+        updatedReplicas: 1,
+        availableReplicas: 1,
+        unavailableReplicas: 0,
+      },
+    },
+  ];
+  const appsApi: DeploymentStatusReader & { calls: number } = {
+    calls: 0,
+    async readNamespacedDeployment() {
+      const response = responses[Math.min(this.calls, responses.length - 1)];
+      this.calls += 1;
+      return response;
+    },
+  };
+
+  await waitForDeploymentRolloutReady(appsApi, "deploy-server-test", "infra-team", 1, 8, {
+    timeoutMs: 1_000,
+    intervalMs: 0,
+  });
+
+  expect(appsApi.calls).toBe(3);
 });
 
 test("preserves the selected kubeconfig AWS profile unless explicitly overridden", () => {

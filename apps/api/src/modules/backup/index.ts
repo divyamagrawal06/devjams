@@ -1,7 +1,6 @@
 import { Elysia } from "elysia";
 import z from "zod";
 import { AuthService } from "../auth/service";
-import { ServerService } from "../servers/service";
 import { BackupModel } from "./model";
 import { BackupService } from "./service";
 
@@ -17,7 +16,7 @@ const backupParams = z.object({
 export const BackupModule = new Elysia({ prefix: "/backups" })
   .use(BackupModel)
   .derive(async ({ headers }) => ({
-    userId: await AuthService.requireUserId(headers.cookie ?? ""),
+    userId: await AuthService.requireUserIdFromHeaders(headers),
   }))
 
   .get(
@@ -31,15 +30,20 @@ export const BackupModule = new Elysia({ prefix: "/backups" })
 
   .get(
     "/schedule",
-    async ({ params: { serverId }, userId, set }) => {
-      await ServerService.requireOwnership(userId, serverId);
-      set.status = 503;
-      return {
-        success: false,
-        error: "Backup scheduling is not configured for this server.",
-      };
+    async ({ params: { serverId }, userId }) => {
+      const schedule = await BackupService.getSchedule(userId, serverId);
+      return { success: true, data: schedule };
     },
     { params: serverParams },
+  )
+
+  .get(
+    "/:backupId/download",
+    async ({ params: { serverId, backupId }, userId }) => {
+      const download = await BackupService.getDownload(userId, serverId, backupId);
+      return Response.redirect(download.url, 302);
+    },
+    { params: backupParams },
   )
 
   .get(
@@ -66,11 +70,11 @@ export const BackupModule = new Elysia({ prefix: "/backups" })
 
   .post(
     "/:backupId/restore",
-    async ({ params: { serverId, backupId }, userId }) => {
-      const result = await BackupService.restore(backupId, serverId, userId);
+    async ({ params: { serverId, backupId }, body, userId }) => {
+      const result = await BackupService.restore(backupId, serverId, userId, body);
       return { success: true, data: result };
     },
-    { params: backupParams },
+    { params: backupParams, body: "backup.restore" },
   )
 
   .delete(

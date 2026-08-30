@@ -9,10 +9,12 @@
     "verify:cutover:eks": "bun scripts/verify-cutover-adapters-eks.ts",
     "dev": "bun run --watch src/index.ts",
     "migrate": "bun scripts/migrate.ts",
+    "reconcile:backups": "bun scripts/reconcile-backup-workloads.ts",
     "ping-db": "bun scripts/ping-db.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1083.0",
+    "@aws-sdk/s3-request-presigner": "^3.1083.0",
     "@elysiajs/eden": "^1.4.9",
     "@farlands/authoring": "workspace:*",
     "@farlands/contracts": "workspace:*",

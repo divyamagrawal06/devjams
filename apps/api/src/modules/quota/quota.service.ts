@@ -61,6 +61,7 @@ async function readBackupUsage(userId: string) {
       backups,
       and(
         eq(backups.serverId, gameServers.id),
+        eq(backups.source, "manual"),
         ne(backups.status, "deleted"),
         ne(backups.status, "failed"),
       ),
@@ -68,6 +69,13 @@ async function readBackupUsage(userId: string) {
     .where(eq(userQuotas.userId, userId))
     .groupBy(userQuotas.userId, userQuotas.backupsLimit);
   return result ?? null;
+}
+
+export function backupCountsTowardManualQuota(
+  source: "manual" | "scheduled",
+  status: "pending" | "in_progress" | "completed" | "failed" | "deleted",
+): boolean {
+  return source === "manual" && status !== "deleted" && status !== "failed";
 }
 
 export abstract class QuotaService {

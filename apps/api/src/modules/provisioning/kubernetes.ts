@@ -14,13 +14,21 @@ export type KubernetesClients = {
   core: k8s.CoreV1Api;
   apps: k8s.AppsV1Api;
   networking: k8s.NetworkingV1Api;
+  rbac: k8s.RbacAuthorizationV1Api;
 };
 
 export type DeploymentStatusReader = {
   readNamespacedDeployment(request: { name: string; namespace: string }): Promise<{
+    metadata?: {
+      generation?: number;
+    };
     status?: {
+      observedGeneration?: number;
       replicas?: number;
       readyReplicas?: number;
+      updatedReplicas?: number;
+      availableReplicas?: number;
+      unavailableReplicas?: number;
     };
   }>;
 };
@@ -185,6 +193,7 @@ export function makeKubernetesClients(): KubernetesClients {
     core: new k8s.CoreV1Api(clientConfig),
     apps: new k8s.AppsV1Api(clientConfig),
     networking: new k8s.NetworkingV1Api(clientConfig),
+    rbac: new k8s.RbacAuthorizationV1Api(clientConfig),
   };
 }
 
@@ -210,6 +219,40 @@ export async function waitForDeploymentReplicasReady(
   }
 
   throw new Error(`Timed out waiting for deployment to reach ${target} replicas`);
+}
+
+export async function waitForDeploymentRolloutReady(
+  appsApi: DeploymentStatusReader,
+  deploymentName: string,
+  namespace: string,
+  target: number,
+  minimumGeneration: number,
+  { timeoutMs = 180_000, intervalMs = 2_000 } = {},
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const deployment = await appsApi.readNamespacedDeployment({
+      name: deploymentName,
+      namespace,
+    });
+    const status = deployment.status;
+    const controllerObservedRestart = (status?.observedGeneration ?? 0) >= minimumGeneration;
+    const rolloutReady =
+      target === 0
+        ? (status?.replicas ?? 0) === 0
+        : status?.readyReplicas === target &&
+          status.updatedReplicas === target &&
+          status.availableReplicas === target &&
+          (status.unavailableReplicas ?? 0) === 0;
+
+    if (controllerObservedRestart && rolloutReady) return;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+
+  throw new Error(
+    `Timed out waiting for deployment rollout generation ${minimumGeneration} to reach ${target} replicas`,
+  );
 }
 
 export function getKubernetesStatusCode(error: unknown): number | undefined {

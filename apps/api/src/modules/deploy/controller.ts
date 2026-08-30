@@ -3,6 +3,7 @@ import type { DeploymentState, DeploymentView, VelocityTransferAck } from "@farl
 import { digestsEqual, PRE_CUTOVER_STATES } from "@farlands/contracts";
 
 import {
+  assertCandidateConfigCurrent,
   deleteCandidate,
   provisionCandidate,
   startPaperOnCandidate,
@@ -15,6 +16,8 @@ import { type DeploymentArtifact, RulesService } from "../rules/service";
 import { type RouteRoster, routeRosterService } from "../velocity/roster";
 import { issueTransfer, waitForAck } from "../velocity/transfers";
 import {
+  CutoverJobStateUncertainError,
+  type CutoverLeaseFence,
   candidateProxyTarget,
   cleanupCutoverResources,
   ensureLiveSavesEnabled,
@@ -22,7 +25,9 @@ import {
   restoreLiveDeployment,
   retireLiveAndPromoteCandidate,
   routePort,
+  suspendLiveWeeklyBackup,
   switchServerRoute,
+  withCutoverBackupLease,
 } from "./cutover";
 import { type DurableDeploymentQueue, deploymentQueue } from "./queue";
 import {
@@ -143,8 +148,14 @@ function requireSuccessfulTransfer(outcome: TransferOutcome): void {
 }
 
 type Candidate = Awaited<ReturnType<typeof provisionCandidate>>;
+type LeaseFence = CutoverLeaseFence;
 
 export interface DeploymentMachineRuntime {
+  withServerLease<T>(
+    row: DeploymentRecord,
+    operation: (assertLeaseHeld: LeaseFence) => Promise<T>,
+  ): Promise<T>;
+  validateCandidateConfig(row: DeploymentRecord): Promise<void>;
   resolveArtifact(row: DeploymentRecord): Promise<DeploymentArtifact>;
   verifyArtifact(artifact: DeploymentArtifact): Promise<void>;
   reserveHeadroom(row: DeploymentRecord): Promise<void>;
@@ -159,11 +170,12 @@ export interface DeploymentMachineRuntime {
     sourcePlayers: string[];
   }): Promise<VelocityTransferAck>;
   stopCandidate(row: DeploymentRecord): Promise<void>;
-  freezeDelta(row: DeploymentRecord): Promise<void>;
-  ensureSaveOn(row: DeploymentRecord): Promise<void>;
-  cleanupCutover(row: DeploymentRecord): Promise<void>;
+  freezeDelta(row: DeploymentRecord, assertLeaseHeld: LeaseFence): Promise<void>;
+  ensureSaveOn(row: DeploymentRecord, assertLeaseHeld: LeaseFence): Promise<void>;
+  cleanupCutover(row: DeploymentRecord, assertLeaseHeld: LeaseFence): Promise<void>;
   startCandidate(row: DeploymentRecord): Promise<void>;
   verifyCandidate(row: DeploymentRecord): Promise<void>;
+  suspendWeeklyBackup(row: DeploymentRecord): Promise<void>;
   switchRoute(row: DeploymentRecord, target: "candidate" | "live"): Promise<Date>;
   waitForRoute(row: DeploymentRecord, target: "candidate" | "live", after: Date): Promise<void>;
   restoreLive(row: DeploymentRecord): Promise<void>;
@@ -173,6 +185,13 @@ export interface DeploymentMachineRuntime {
 }
 
 const productionRuntime: DeploymentMachineRuntime = {
+  withServerLease: (row, operation) => withCutoverBackupLease(row, operation),
+  validateCandidateConfig: (row) =>
+    assertCandidateConfigCurrent({
+      serverId: row.serverId,
+      namespace: row.namespace,
+      candidateDeployment: row.candidatePod,
+    }),
   resolveArtifact: (row) =>
     RulesService.resolveDeploymentArtifact({
       serverId: row.serverId,
@@ -207,9 +226,9 @@ const productionRuntime: DeploymentMachineRuntime = {
     return waitForAck(transferId, 90_000);
   },
   stopCandidate: (row) => stopCandidateForDelta(row.namespace ?? "", row.candidatePod ?? ""),
-  freezeDelta: (row) => freezeAndSyncDelta(row),
-  ensureSaveOn: (row) => ensureLiveSavesEnabled(row),
-  cleanupCutover: (row) => cleanupCutoverResources(row),
+  freezeDelta: (row, assertLeaseHeld) => freezeAndSyncDelta(row, assertLeaseHeld),
+  ensureSaveOn: (row, assertLeaseHeld) => ensureLiveSavesEnabled(row, assertLeaseHeld),
+  cleanupCutover: (row, assertLeaseHeld) => cleanupCutoverResources(row, assertLeaseHeld),
   startCandidate: (row) => startPaperOnCandidate(row.namespace ?? "", row.candidatePod ?? ""),
   async verifyCandidate(row) {
     if (!row.artifactDigest) throw new Error("Deployment is missing artifact digest");
@@ -220,6 +239,7 @@ const productionRuntime: DeploymentMachineRuntime = {
       artifactDigest: row.artifactDigest,
     });
   },
+  suspendWeeklyBackup: (row) => suspendLiveWeeklyBackup(row),
   switchRoute(row, target) {
     const proxyTarget = target === "candidate" ? candidateProxyTarget(row) : row.liveProxyTarget;
     if (!proxyTarget) throw new Error("Deployment is missing a route target");
@@ -274,7 +294,9 @@ async function moveAndCheckpointLobby(
   row: DeploymentRecord,
   runtime: DeploymentMachineRuntime,
   store: DeploymentStore,
+  assertLeaseHeld: LeaseFence,
 ): Promise<DeploymentRecord> {
+  await assertLeaseHeld();
   const liability = await machineTransition(
     store,
     row.id,
@@ -283,6 +305,7 @@ async function moveAndCheckpointLobby(
     "source roster durably marked as a lobby-transfer recovery liability",
     ["freezing"],
   );
+  await assertLeaseHeld();
   const ack = await runtime.movePlayers({
     deploymentId: liability.id,
     fromRoute: liability.serverId,
@@ -312,12 +335,19 @@ async function runPostCutover(
   runtime: DeploymentMachineRuntime,
   store: DeploymentStore,
   workerId: string,
+  assertLeaseHeld: LeaseFence,
 ): Promise<void> {
   let row = await store.find(id);
   if (!row) throw new Error("Deployment not found");
 
   if (row.state === "cutover") {
+    // Disable old-A discovery before the route can move. A crash before this
+    // leaves A authoritative; a crash after it causes a safe skipped backup
+    // until candidate B is promoted.
+    await assertLeaseHeld();
+    await runtime.suspendWeeklyBackup(row);
     if (!row.routeSwitched) {
+      await assertLeaseHeld();
       const switchedAt = await runtime.switchRoute(row, "candidate");
       await runtime.waitForRoute(row, "candidate", switchedAt);
       row = await machineTransition(
@@ -330,6 +360,7 @@ async function runPostCutover(
       );
     }
 
+    await assertLeaseHeld();
     const ack = await runtime.movePlayers({
       deploymentId: row.id,
       fromRoute: LOBBY_ROUTE,
@@ -349,6 +380,7 @@ async function runPostCutover(
     );
 
     if (!row.toVersion) throw new Error("Deployment is missing the target version");
+    await assertLeaseHeld();
     row = await store.commitCutover({
       serverId: row.serverId,
       deploymentId: row.id,
@@ -363,6 +395,7 @@ async function runPostCutover(
     throw new Error("Post-cutover reconciliation requires cutover or draining state");
   }
 
+  await assertLeaseHeld();
   const snapshotId = await runtime.retireLive(row);
   row = await machineTransition(
     store,
@@ -372,7 +405,9 @@ async function runPostCutover(
     "server A scaled to zero and its PVC retained",
     ["draining"],
   );
-  await runtime.cleanupCutover(row);
+  await assertLeaseHeld();
+  await runtime.cleanupCutover(row, assertLeaseHeld);
+  await assertLeaseHeld();
   await runtime.releaseHeadroom(id);
   await machineTransition(
     store,
@@ -405,7 +440,12 @@ export async function executeDeploymentMachine(
   const leaseOwner = workerId ?? row.workerId;
   if (!leaseOwner) throw new Error("Deployment is missing its durable queue owner");
   if (row.state === "cutover" || row.state === "draining") {
-    await runPostCutover(id, runtime, store, leaseOwner);
+    const resumedRow = row;
+    await runtime.withServerLease(resumedRow, async (assertLeaseHeld) => {
+      await assertLeaseHeld();
+      await runtime.validateCandidateConfig(resumedRow);
+      await runPostCutover(id, runtime, store, leaseOwner, assertLeaseHeld);
+    });
     return;
   }
   if (row.queueStatus !== "running" || row.state !== "queued") return;
@@ -429,58 +469,24 @@ export async function executeDeploymentMachine(
     ["building"],
   );
 
-  row = await machineTransition(
-    store,
-    id,
-    "staging",
-    { presyncCompletedAt: runtime.now().toISOString() },
-    "recorded the pre-sync lower bound and reserved candidate headroom",
-    ["building"],
-  );
-  await runtime.reserveHeadroom(row);
-  const candidate = await runtime.provision(row, artifact);
-  const provisionedRow: DeploymentRecord = {
-    ...row,
-    candidatePod: candidate.deploymentName,
-    candidateService: candidate.serviceName,
-    candidatePvc: candidate.pvcName,
-    namespace: candidate.namespace,
-    liveDeployment: candidate.liveDeploymentName,
-    liveService: candidate.liveServiceName,
-    livePvc: candidate.livePvcName,
-    liveProxyTarget: candidate.liveProxyTarget,
-  };
-  if (renewLease) {
-    const retained = await fenceProvisionedCandidate({
-      renew: renewLease,
-      cleanup: () => runtime.removeCandidate(provisionedRow),
-      recordCleanupRetry: async (error) => {
-        const current = await store.find(id);
-        if (!current) return;
-        await store.transition(
-          id,
-          current.state,
-          {
-            candidatePod: candidate.deploymentName,
-            candidateService: candidate.serviceName,
-            candidatePvc: candidate.pvcName,
-            namespace: candidate.namespace,
-            error: `candidate cleanup pending: ${errorMessage(error)}`,
-          },
-          "candidate cleanup persisted for retry after lease loss",
-          [current.state],
-          true,
-        );
-      },
-      releaseHeadroom: () => runtime.releaseHeadroom(id),
-    });
-    if (!retained) return;
-  }
-  row = await machineTransition(
-    store,
-    id,
-    "staging",
-    {
+  const leaseEntryRow = row;
+  await runtime.withServerLease(leaseEntryRow, async (assertLeaseHeld) => {
+    let leasedRow = leaseEntryRow;
+    await assertLeaseHeld();
+    leasedRow = await machineTransition(
+      store,
+      id,
+      "staging",
+      { presyncCompletedAt: runtime.now().toISOString() },
+      "recorded the pre-sync lower bound and reserved candidate headroom",
+      ["building"],
+    );
+    await assertLeaseHeld();
+    await runtime.reserveHeadroom(leasedRow);
+    await assertLeaseHeld();
+    const candidate = await runtime.provision(leasedRow, artifact);
+    const provisionedRow: DeploymentRecord = {
+      ...leasedRow,
       candidatePod: candidate.deploymentName,
       candidateService: candidate.serviceName,
       candidatePvc: candidate.pvcName,
@@ -489,77 +495,132 @@ export async function executeDeploymentMachine(
       liveService: candidate.liveServiceName,
       livePvc: candidate.livePvcName,
       liveProxyTarget: candidate.liveProxyTarget,
-    },
-    "candidate B provisioned in held state after pre-sync",
-    ["staging"],
-  );
+    };
+    if (renewLease) {
+      const retained = await fenceProvisionedCandidate({
+        renew: renewLease,
+        cleanup: async () => {
+          await assertLeaseHeld();
+          await runtime.removeCandidate(provisionedRow);
+        },
+        recordCleanupRetry: async (error) => {
+          const current = await store.find(id);
+          if (!current) return;
+          await store.transition(
+            id,
+            current.state,
+            {
+              candidatePod: candidate.deploymentName,
+              candidateService: candidate.serviceName,
+              candidatePvc: candidate.pvcName,
+              namespace: candidate.namespace,
+              error: `candidate cleanup pending: ${errorMessage(error)}`,
+            },
+            "candidate cleanup persisted for retry after lease loss",
+            [current.state],
+            true,
+          );
+        },
+        releaseHeadroom: () => runtime.releaseHeadroom(id),
+      });
+      if (!retained) return;
+    }
+    leasedRow = await machineTransition(
+      store,
+      id,
+      "staging",
+      {
+        candidatePod: candidate.deploymentName,
+        candidateService: candidate.serviceName,
+        candidatePvc: candidate.pvcName,
+        namespace: candidate.namespace,
+        liveDeployment: candidate.liveDeploymentName,
+        liveService: candidate.liveServiceName,
+        livePvc: candidate.livePvcName,
+        liveProxyTarget: candidate.liveProxyTarget,
+      },
+      "candidate B provisioned in held state after pre-sync",
+      ["staging"],
+    );
 
-  row = await machineTransition(
-    store,
-    id,
-    "presync",
-    {},
-    "candidate pre-sync completed from the durable lower bound; A remains authoritative",
-    ["staging"],
-  );
+    leasedRow = await machineTransition(
+      store,
+      id,
+      "presync",
+      {},
+      "candidate pre-sync completed from the durable lower bound; A remains authoritative",
+      ["staging"],
+    );
 
-  const roster = await runtime.sourceRoster(row);
-  const sourcePlayers = normalizedPlayers(roster.players);
-  row = await machineTransition(
-    store,
-    id,
-    "freezing",
-    {
-      sourcePlayers,
-      sourcePlayerCount: sourcePlayers.length,
-    },
-    "captured a fresh source-route roster",
-    ["presync"],
-  );
-  row = await moveAndCheckpointLobby(row, runtime, store);
+    await assertLeaseHeld();
+    await runtime.validateCandidateConfig(leasedRow);
+    await assertLeaseHeld();
+    const roster = await runtime.sourceRoster(leasedRow);
+    const sourcePlayers = normalizedPlayers(roster.players);
+    leasedRow = await machineTransition(
+      store,
+      id,
+      "freezing",
+      {
+        sourcePlayers,
+        sourcePlayerCount: sourcePlayers.length,
+      },
+      "captured a fresh source-route roster",
+      ["presync"],
+    );
+    leasedRow = await moveAndCheckpointLobby(leasedRow, runtime, store, assertLeaseHeld);
 
-  await runtime.stopCandidate(row);
-  row = await machineTransition(
-    store,
-    id,
-    "freezing",
-    { savesDisabled: true },
-    "candidate volume detached; starting bounded freeze and delta",
-    ["freezing"],
-  );
-  await runtime.freezeDelta(row);
-  row = await machineTransition(
-    store,
-    id,
-    "freezing",
-    { savesDisabled: false },
-    "save-on confirmed after manifest-aware delta sync",
-    ["freezing"],
-    true,
-  );
-  if (row.abortRequestedAt) throw new DeploymentInterruptedError(row.id, row.state);
+    await assertLeaseHeld();
+    await runtime.stopCandidate(leasedRow);
+    leasedRow = await machineTransition(
+      store,
+      id,
+      "freezing",
+      { savesDisabled: true },
+      "candidate volume detached; starting bounded freeze and delta",
+      ["freezing"],
+    );
+    await assertLeaseHeld();
+    await runtime.freezeDelta(leasedRow, assertLeaseHeld);
+    leasedRow = await machineTransition(
+      store,
+      id,
+      "freezing",
+      { savesDisabled: false },
+      "save-on confirmed after manifest-aware delta sync",
+      ["freezing"],
+      true,
+    );
+    if (leasedRow.abortRequestedAt) {
+      throw new DeploymentInterruptedError(leasedRow.id, leasedRow.state);
+    }
 
-  await runtime.cleanupCutover(row);
-  await runtime.startCandidate(row);
-  await runtime.verifyCandidate(row);
-  row = await machineTransition(
-    store,
-    id,
-    "verifying",
-    { candidateHealthy: true },
-    "candidate passed readiness, artifact, plugin, and startup-log predicates",
-    ["freezing"],
-  );
+    await assertLeaseHeld();
+    await runtime.cleanupCutover(leasedRow, assertLeaseHeld);
+    await assertLeaseHeld();
+    await runtime.startCandidate(leasedRow);
+    await assertLeaseHeld();
+    await runtime.verifyCandidate(leasedRow);
+    leasedRow = await machineTransition(
+      store,
+      id,
+      "verifying",
+      { candidateHealthy: true },
+      "candidate passed readiness, artifact, plugin, and startup-log predicates",
+      ["freezing"],
+    );
 
-  row = await machineTransition(
-    store,
-    id,
-    "cutover",
-    {},
-    "candidate verified; entering non-abortable route cutover",
-    ["verifying"],
-  );
-  await runPostCutover(row.id, runtime, store, leaseOwner);
+    await assertLeaseHeld();
+    leasedRow = await machineTransition(
+      store,
+      id,
+      "cutover",
+      {},
+      "candidate verified; entering non-abortable route cutover",
+      ["verifying"],
+    );
+    await runPostCutover(leasedRow.id, runtime, store, leaseOwner, assertLeaseHeld);
+  });
 }
 
 async function compensatePreCutover(
@@ -568,104 +629,117 @@ async function compensatePreCutover(
   runtime: DeploymentMachineRuntime,
   store: DeploymentStore,
 ): Promise<DeploymentRecord> {
-  let row = await store.find(id);
+  const row = await store.find(id);
   if (!row) throw new Error("Deployment not found");
   assertPreCutover(row);
 
-  if (row.savesDisabled) {
-    await runtime.cleanupCutover(row);
-    await runtime.ensureSaveOn(row);
-    row = await machineTransition(
+  const leaseEntryRow = row;
+  return runtime.withServerLease(leaseEntryRow, async (assertLeaseHeld) => {
+    let leasedRow = leaseEntryRow;
+    if (leasedRow.savesDisabled) {
+      await assertLeaseHeld();
+      await runtime.cleanupCutover(leasedRow, assertLeaseHeld);
+      await assertLeaseHeld();
+      await runtime.ensureSaveOn(leasedRow, assertLeaseHeld);
+      leasedRow = await machineTransition(
+        store,
+        id,
+        leasedRow.state,
+        { savesDisabled: false },
+        "save-on recovery confirmed during abort",
+        [leasedRow.state],
+        true,
+      );
+    }
+
+    if (leasedRow.routeSwitched) {
+      await assertLeaseHeld();
+      await runtime.restoreLive(leasedRow);
+      await assertLeaseHeld();
+      const switchedAt = await runtime.switchRoute(leasedRow, "live");
+      await runtime.waitForRoute(leasedRow, "live", switchedAt);
+      leasedRow = await machineTransition(
+        store,
+        id,
+        leasedRow.state,
+        { routeSwitched: false },
+        "restored route to authoritative server A",
+        [leasedRow.state],
+        true,
+      );
+    }
+
+    if (leasedRow.lobbyPlayers.length) {
+      await assertLeaseHeld();
+      const pendingAck = await runtime.movePlayers({
+        deploymentId: leasedRow.id,
+        fromRoute: leasedRow.serverId,
+        toRoute: LOBBY_ROUTE,
+        message: "Brief safety move while the reviewed world change is prepared",
+        sourcePlayers: leasedRow.sourcePlayers,
+      });
+      const pendingOutcome = validateTransferOutcome(leasedRow.sourcePlayers, pendingAck);
+      leasedRow = await machineTransition(
+        store,
+        id,
+        leasedRow.state,
+        { lobbyPlayers: pendingOutcome.movedPlayers },
+        "settled the durable source-to-lobby instruction before compensation",
+        [leasedRow.state],
+        true,
+      );
+    }
+
+    if (leasedRow.lobbyPlayers.length) {
+      await assertLeaseHeld();
+      const ack = await runtime.movePlayers({
+        deploymentId: leasedRow.id,
+        fromRoute: LOBBY_ROUTE,
+        toRoute: leasedRow.serverId,
+        message: "Returning to the unchanged server after a safe abort",
+        sourcePlayers: leasedRow.lobbyPlayers,
+      });
+      const outcome = validateTransferOutcome(leasedRow.lobbyPlayers, ack);
+      leasedRow = await machineTransition(
+        store,
+        id,
+        leasedRow.state,
+        { lobbyPlayers: outcome.failures.map((failure) => failure.player) },
+        "all still-connected recovery players accounted for",
+        [leasedRow.state],
+        true,
+      );
+      requireSuccessfulTransfer(outcome);
+    }
+
+    await assertLeaseHeld();
+    await runtime.cleanupCutover(leasedRow, assertLeaseHeld);
+    await assertLeaseHeld();
+    await runtime.removeCandidate(leasedRow);
+    await assertLeaseHeld();
+    await runtime.releaseHeadroom(id);
+    return machineTransition(
       store,
       id,
-      row.state,
-      { savesDisabled: false },
-      "save-on recovery confirmed during abort",
-      [row.state],
-      true,
-    );
-  }
-
-  if (row.routeSwitched) {
-    await runtime.restoreLive(row);
-    const switchedAt = await runtime.switchRoute(row, "live");
-    await runtime.waitForRoute(row, "live", switchedAt);
-    row = await machineTransition(
-      store,
-      id,
-      row.state,
-      { routeSwitched: false },
-      "restored route to authoritative server A",
-      [row.state],
-      true,
-    );
-  }
-
-  if (row.lobbyPlayers.length) {
-    const pendingAck = await runtime.movePlayers({
-      deploymentId: row.id,
-      fromRoute: row.serverId,
-      toRoute: LOBBY_ROUTE,
-      message: "Brief safety move while the reviewed world change is prepared",
-      sourcePlayers: row.sourcePlayers,
-    });
-    const pendingOutcome = validateTransferOutcome(row.sourcePlayers, pendingAck);
-    row = await machineTransition(
-      store,
-      id,
-      row.state,
-      { lobbyPlayers: pendingOutcome.movedPlayers },
-      "settled the durable source-to-lobby instruction before compensation",
-      [row.state],
-      true,
-    );
-  }
-
-  if (row.lobbyPlayers.length) {
-    const ack = await runtime.movePlayers({
-      deploymentId: row.id,
-      fromRoute: LOBBY_ROUTE,
-      toRoute: row.serverId,
-      message: "Returning to the unchanged server after a safe abort",
-      sourcePlayers: row.lobbyPlayers,
-    });
-    const outcome = validateTransferOutcome(row.lobbyPlayers, ack);
-    row = await machineTransition(
-      store,
-      id,
-      row.state,
-      { lobbyPlayers: outcome.failures.map((failure) => failure.player) },
-      "all still-connected recovery players accounted for",
-      [row.state],
-      true,
-    );
-    requireSuccessfulTransfer(outcome);
-  }
-
-  await runtime.cleanupCutover(row);
-  await runtime.removeCandidate(row);
-  await runtime.releaseHeadroom(id);
-  return machineTransition(
-    store,
-    id,
-    "aborted",
-    {
+      "aborted",
+      {
+        error,
+        finishedAt: runtime.now().toISOString(),
+        candidatePod: null,
+        candidateService: null,
+        candidatePvc: null,
+        sourcePlayers: [],
+        lobbyPlayers: [],
+        savesDisabled: false,
+        queueStatus: "complete",
+        workerId: null,
+        leaseExpiresAt: null,
+      },
       error,
-      finishedAt: runtime.now().toISOString(),
-      candidatePod: null,
-      candidateService: null,
-      candidatePvc: null,
-      sourcePlayers: [],
-      lobbyPlayers: [],
-      savesDisabled: false,
-      queueStatus: "complete",
-      workerId: null,
-      leaseExpiresAt: null,
-    },
-    error,
-    PRE_CUTOVER_STATES,
-    true,
-  );
+      PRE_CUTOVER_STATES,
+      true,
+    );
+  });
 }
 
 async function requestAndCompensate(
@@ -879,6 +953,26 @@ function startMachine(id: string): void {
         activeMachines.delete(id);
         return;
       }
+      if (error instanceof CutoverJobStateUncertainError) {
+        try {
+          await deploymentStore.transition(
+            id,
+            row.state,
+            { error: error.message },
+            "cutover Job state uncertain; compensation deferred until its server Lease expires",
+            [row.state],
+            true,
+          );
+        } catch (recordError) {
+          console.error(
+            `[deploy ${id}] failed to persist uncertain cutover Job state`,
+            recordError,
+          );
+        }
+        activeMachines.delete(id);
+        scheduleReconcileAt(error.retryAt.getTime());
+        return;
+      }
       if (PRE_CUTOVER_STATES.includes(row.state as (typeof PRE_CUTOVER_STATES)[number])) {
         try {
           await requestAndCompensate(id, error instanceof Error ? error.message : String(error));
@@ -1045,7 +1139,17 @@ export async function completeCutover(id: string): Promise<void> {
     throw new Error("Cutover is automatic and has not reached the post-cutover boundary");
   }
   if (row.state !== "idle") {
-    await runPostCutover(id, productionRuntime, deploymentStore, deploymentQueue.workerId);
+    await productionRuntime.withServerLease(row, async (assertLeaseHeld) => {
+      await assertLeaseHeld();
+      await productionRuntime.validateCandidateConfig(row);
+      await runPostCutover(
+        id,
+        productionRuntime,
+        deploymentStore,
+        deploymentQueue.workerId,
+        assertLeaseHeld,
+      );
+    });
   }
 }
 

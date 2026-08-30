@@ -6,6 +6,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test tests/ test/",
+    "verify:cutover:eks": "bun scripts/verify-cutover-adapters-eks.ts",
     "dev": "bun run --watch src/index.ts",
     "migrate": "bun scripts/migrate.ts",
     "ping-db": "bun scripts/ping-db.ts"

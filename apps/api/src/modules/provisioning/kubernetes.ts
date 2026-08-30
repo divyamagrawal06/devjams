@@ -25,6 +25,21 @@ export type DeploymentStatusReader = {
   }>;
 };
 
+export function resolveKubeconfigAwsProfile(
+  kubeConfig: k8s.KubeConfig,
+  context: k8s.Context,
+  explicitProfile = process.env.AWS_PROFILE,
+): string | undefined {
+  const explicit = explicitProfile?.trim();
+  if (explicit) return explicit;
+  const configuredUser = kubeConfig.getUser(context.user);
+  const execEnvironment = (
+    configuredUser?.exec as { env?: Array<{ name: string; value: string }> } | undefined
+  )?.env;
+  const configured = execEnvironment?.find((entry) => entry.name === "AWS_PROFILE")?.value?.trim();
+  return configured || undefined;
+}
+
 class NodeHttpLibrary implements k8s.HttpLibrary {
   send(request: k8s.RequestContext): k8s.Observable<k8s.ResponseContext> {
     return new k8s.Observable(
@@ -116,9 +131,10 @@ export function loadFarlandsKubeConfig(): k8s.KubeConfig {
   }
 
   kubeConfig.setCurrentContext(context.name);
+  const awsProfile = resolveKubeconfigAwsProfile(kubeConfig, context, AWS_PROFILE);
   const tokenArgs = ["eks", "get-token", "--cluster-name", CLUSTER_NAME, "--region", AWS_REGION];
-  if (AWS_PROFILE) {
-    tokenArgs.push("--profile", AWS_PROFILE);
+  if (awsProfile) {
+    tokenArgs.push("--profile", awsProfile);
   }
 
   if (USE_LOCAL_ASSUME_ROLE) {

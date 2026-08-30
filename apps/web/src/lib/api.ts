@@ -126,14 +126,18 @@ export type BackupListResponse = {
 
 export type BackupSchedule = {
   enabled: boolean;
+  supported: boolean;
   frequency: "weekly";
+  health: "healthy" | "pending" | "degraded" | "disabled";
   timezone: "UTC";
   dayOfWeek: number;
   hour: number;
   minute: number;
   retentionCount: number;
+  lastAttemptAt: string | null;
   nextRunAt: string | null;
   lastSuccessfulAt: string | null;
+  statusMessage: string;
 };
 
 export type BackupScheduleResponse = {

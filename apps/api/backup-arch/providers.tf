@@ -1,4 +1,6 @@
 terraform {
+  required_version = ">= 1.6.0"
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -10,18 +12,18 @@ terraform {
       version = "~> 2.26.0"
     }
 
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.6"
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
     }
   }
 }
 
 provider "aws" {
-  region = "ap-south-1"
+  region = var.aws_region
 }
 
 provider "kubernetes" {
-  config_path    = "~/.kube/config"
-  config_context = "arn:aws:eks:ap-south-1:963957629631:cluster/farlands-dev"
+  config_path    = var.kubeconfig_path
+  config_context = var.kubeconfig_context
 }

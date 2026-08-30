@@ -1,6 +1,8 @@
 import "./load-env";
 import type { Elysia } from "elysia";
 import { app } from "./app";
+import { startBackupSyncLoop } from "./backup-sync";
+import { BackupService } from "./modules/backup/service";
 import { reconcileInFlight, startDeploymentLeaseReaper } from "./modules/deploy/controller";
 import { type RollupStore, telemetryPlugin } from "./modules/telemetry/index.ts";
 
@@ -16,10 +18,15 @@ export function registerTelemetry<T extends Elysia>(instance: T, store: RollupSt
 }
 
 export async function start() {
+  const resumedBackupOperations = await BackupService.resumeOperationMonitors();
+  if (resumedBackupOperations > 0) {
+    console.info(`[backup] Resumed reconciliation for ${resumedBackupOperations} operation(s)`);
+  }
   await reconcileInFlight();
   startDeploymentLeaseReaper();
 
   app.listen(process.env.PORT || 3001);
+  startBackupSyncLoop();
 
   console.log(`🦊 Elysia is running at ${app.server?.hostname}:${app.server?.port}`);
   return app;

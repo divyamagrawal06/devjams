@@ -1058,6 +1058,10 @@ a.backup-secondary-action:hover,
   background: oklch(0.91 0.025 67);
 }
 
+.backup-schedule-panel.degraded .backup-schedule-primary {
+  background: oklch(0.92 0.035 41);
+}
+
 .backup-schedule-icon {
   display: grid;
   width: 42px;
@@ -1071,6 +1075,11 @@ a.backup-secondary-action:hover,
 
 .backup-schedule-panel.disabled .backup-schedule-icon {
   color: var(--ink-soft);
+}
+
+.backup-schedule-panel.degraded .backup-schedule-icon {
+  color: var(--clay-deep);
+  border-color: oklch(0.69 0.08 42);
 }
 
 .backup-schedule-primary div {
@@ -1090,7 +1099,7 @@ a.backup-secondary-action:hover,
 
 .backup-schedule-facts {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   margin: 0;
   background: var(--paper-raised);
 }

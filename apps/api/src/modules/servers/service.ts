@@ -10,8 +10,30 @@ import {
 import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import { status } from "elysia";
 import { db, type TransactionType } from "../../db";
+import {
+  acquireBackupLease,
+  assertBackupLeaseFence,
+  assertBackupLeaseRenewalFence,
+  BackupOperationBusyError,
+  releaseBackupLeaseWithRetry,
+  SYNCHRONOUS_SERVER_OPERATION_LEASE_SECONDS,
+} from "../backup/lock";
+import {
+  BACKUP_RESTORE_RECOVERY_REQUIRED_MESSAGE,
+  backupRestoreRecoveryRequired,
+} from "../backup/model";
+import {
+  assertNoActiveServerBackup,
+  assertNoPendingServerCutover,
+  ServerBackupInProgressError,
+  ServerCutoverInProgressError,
+} from "../deploy/guard";
 import { deleteGameServer, provisionGameServer } from "../provisioning";
-import { makeKubernetesClients, waitForDeploymentReplicasReady } from "../provisioning/kubernetes";
+import {
+  makeKubernetesClients,
+  waitForDeploymentReplicasReady,
+  waitForDeploymentRolloutReady,
+} from "../provisioning/kubernetes";
 import { calculateContainerMemory } from "../provisioning/utils";
 import { assertAllocationFits, QuotaService } from "../quota/quota.service";
 import {
@@ -23,6 +45,150 @@ import {
 import { getMinecraftRouteHostname } from "./routing";
 
 const ACTIVE_SERVER_NAME_INDEX = "game_servers_user_active_name_idx";
+const SERVER_BACKUP_LEASE_RENEW_INTERVAL_MS = Math.max(
+  1_000,
+  Math.floor((SYNCHRONOUS_SERVER_OPERATION_LEASE_SECONDS * 1_000) / 3),
+);
+type ServerBackupLeaseFence = () => Promise<void>;
+
+async function withServerBackupLease<T>(
+  namespace: string,
+  serverId: string,
+  operation: string,
+  run: (assertLeaseHeld: ServerBackupLeaseFence) => Promise<T>,
+): Promise<T> {
+  const holder = `${operation}:${crypto.randomUUID()}`;
+  let confirmedUntil: number;
+  try {
+    confirmedUntil = (
+      await acquireBackupLease(
+        namespace,
+        serverId,
+        holder,
+        SYNCHRONOUS_SERVER_OPERATION_LEASE_SECONDS,
+      )
+    ).getTime();
+    assertBackupLeaseFence(confirmedUntil);
+  } catch (error) {
+    if (error instanceof BackupOperationBusyError) {
+      throw status(409, "Wait for the active backup or restore operation to finish");
+    }
+    throw error;
+  }
+
+  let renewalInFlight: Promise<void> | null = null;
+  let renewalFailure: unknown = null;
+  let renewalsStopped = false;
+  const renewOnce = (): Promise<void> => {
+    if (renewalsStopped) {
+      return Promise.reject(new Error("Server backup Lease renewal has stopped"));
+    }
+    if (renewalInFlight) return renewalInFlight;
+
+    const previousConfirmedUntil = confirmedUntil;
+    const requestStartedAt = Date.now();
+    try {
+      assertBackupLeaseFence(previousConfirmedUntil, requestStartedAt);
+    } catch (error) {
+      renewalFailure = error;
+      return Promise.reject(error);
+    }
+    let activeRenewal!: Promise<void>;
+    activeRenewal = (async () => {
+      try {
+        const renewedUntil = await acquireBackupLease(
+          namespace,
+          serverId,
+          holder,
+          SYNCHRONOUS_SERVER_OPERATION_LEASE_SECONDS,
+        );
+        const responseReceivedAt = Date.now();
+        assertBackupLeaseRenewalFence(
+          previousConfirmedUntil,
+          renewedUntil.getTime(),
+          requestStartedAt,
+          responseReceivedAt,
+        );
+        confirmedUntil = renewedUntil.getTime();
+        renewalFailure = null;
+      } catch (error) {
+        renewalFailure = error;
+        throw error;
+      } finally {
+        if (renewalInFlight === activeRenewal) renewalInFlight = null;
+      }
+    })();
+    renewalInFlight = activeRenewal;
+    return activeRenewal;
+  };
+
+  const settleRenewal = async (): Promise<void> => {
+    const activeRenewal = renewalInFlight;
+    if (activeRenewal) {
+      try {
+        await activeRenewal;
+      } catch (error) {
+        renewalFailure = error;
+      }
+    }
+    if (renewalFailure !== null) {
+      // Retry a transient renewal only while the last authoritative ownership
+      // window remains live. renewOnce checks the old deadline before issuing
+      // a request and rejects any response that arrives after that deadline.
+      assertBackupLeaseFence(confirmedUntil);
+      await renewOnce();
+    }
+    assertBackupLeaseFence(confirmedUntil);
+  };
+
+  const assertLeaseHeld: ServerBackupLeaseFence = async () => {
+    await settleRenewal();
+    // Old API Jobs did not take the Lease. Re-check their durable database
+    // claims at every mutation boundary, not only when this request entered.
+    await assertNoActiveServerBackup(serverId);
+    await assertNoPendingServerCutover(serverId);
+    await settleRenewal();
+  };
+
+  const renewalTimer = setInterval(() => {
+    if (renewalsStopped) return;
+    void renewOnce().catch((error) => {
+      console.error(`[${serverId}] Failed to renew ${operation} backup lease:`, error);
+    });
+  }, SERVER_BACKUP_LEASE_RENEW_INTERVAL_MS);
+  renewalTimer.unref?.();
+
+  const awaitInFlightRenewalBeforeRelease = async (): Promise<void> => {
+    const activeRenewal = renewalInFlight;
+    if (!activeRenewal) return;
+    await activeRenewal.catch((error: unknown) => {
+      console.error(
+        `[${serverId}] ${operation} Lease renewal failed before release completed:`,
+        error,
+      );
+    });
+  };
+
+  try {
+    await assertLeaseHeld();
+    return await run(assertLeaseHeld);
+  } catch (error) {
+    if (error instanceof ServerBackupInProgressError) {
+      throw status(409, "Wait for the active backup or restore operation to finish");
+    }
+    if (error instanceof ServerCutoverInProgressError) {
+      throw status(409, "Wait for the active deployment cutover to finish");
+    }
+    throw error;
+  } finally {
+    renewalsStopped = true;
+    clearInterval(renewalTimer);
+    await awaitInFlightRenewalBeforeRelease();
+    await releaseBackupLeaseWithRetry(namespace, serverId, holder).catch((error) => {
+      console.error(`[${serverId}] Failed to release ${operation} backup lease:`, error);
+    });
+  }
+}
 
 function isActiveNameConflict(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
@@ -79,6 +245,7 @@ async function restoreServerAfterFailedDeletion(
   serverId: string,
   previousState: StateType,
   previousDesiredState: DesiredStateType,
+  previousStatusMessage: string | null,
 ) {
   const [server] = await db
     .select({ name: gameServers.name })
@@ -96,6 +263,11 @@ async function restoreServerAfterFailedDeletion(
 
   const renamedMessage =
     "Failed to delete server resources and the original name was taken. Server restored under a new name. Please contact support.";
+  const preservedRestoreMessage =
+    previousStatusMessage === "Restoring backup" ||
+    backupRestoreRecoveryRequired(previousStatusMessage)
+      ? previousStatusMessage
+      : null;
 
   const candidates = buildRestoreNameCandidates(server.name, serverId);
 
@@ -107,11 +279,18 @@ async function restoreServerAfterFailedDeletion(
           ...baseRestore,
           name: candidateName,
           statusMessage:
-            index === 0
+            preservedRestoreMessage ??
+            (index === 0
               ? "Failed to delete server resources. Please contact support."
-              : renamedMessage,
+              : renamedMessage),
         })
-        .where(eq(gameServers.id, serverId));
+        .where(
+          and(
+            eq(gameServers.id, serverId),
+            eq(gameServers.currentState, "deleted"),
+            eq(gameServers.desiredState, "deleted"),
+          ),
+        );
       return;
     } catch (error) {
       if (!isActiveNameConflict(error)) {
@@ -128,9 +307,15 @@ async function restoreServerAfterFailedDeletion(
         .set({
           ...baseRestore,
           name: buildRandomFallbackServerName("restore"),
-          statusMessage: renamedMessage,
+          statusMessage: preservedRestoreMessage ?? renamedMessage,
         })
-        .where(eq(gameServers.id, serverId));
+        .where(
+          and(
+            eq(gameServers.id, serverId),
+            eq(gameServers.currentState, "deleted"),
+            eq(gameServers.desiredState, "deleted"),
+          ),
+        );
       return;
     } catch (error) {
       if (!isActiveNameConflict(error)) {
@@ -294,6 +479,7 @@ export abstract class ServerService {
     const [server] = await db
       .select({
         id: gameServers.id,
+        game: gameServers.game,
         currentState: gameServers.currentState,
         desiredState: gameServers.desiredState,
         statusMessage: gameServers.statusMessage,
@@ -389,7 +575,9 @@ export abstract class ServerService {
     deploymentName: string,
     namespace: string,
     replicas: number,
+    assertLeaseHeld: ServerBackupLeaseFence,
   ) {
+    await assertLeaseHeld();
     return appsApi.patchNamespacedDeployment({
       name: deploymentName,
       namespace,
@@ -398,9 +586,15 @@ export abstract class ServerService {
     });
   }
 
-  private static async triggerRollingRestart(deploymentName: string, namespace: string) {
+  private static async triggerRollingRestart(
+    deploymentName: string,
+    namespace: string,
+    targetReplicas: number,
+    assertLeaseHeld: ServerBackupLeaseFence,
+  ) {
     const appsApi = getAppsApi();
-    await appsApi.patchNamespacedDeployment({
+    await assertLeaseHeld();
+    const restartedDeployment = await appsApi.patchNamespacedDeployment({
       name: deploymentName,
       namespace,
       body: [
@@ -414,6 +608,18 @@ export abstract class ServerService {
       ],
       fieldManager: "farlands-backend",
     });
+    const restartGeneration = restartedDeployment.metadata?.generation;
+    if (!restartGeneration) {
+      throw new Error("Kubernetes did not return a restart generation");
+    }
+
+    await waitForDeploymentRolloutReady(
+      appsApi,
+      deploymentName,
+      namespace,
+      targetReplicas,
+      restartGeneration,
+    );
   }
 
   private static async settleState(
@@ -467,10 +673,12 @@ export abstract class ServerService {
     namespace: string,
     cpuCores: string,
     ramMb: number,
+    assertLeaseHeld: ServerBackupLeaseFence,
   ) {
     const appsApi = getAppsApi();
     const containerMemory = calculateContainerMemory(ramMb);
     const quantities = { cpu: cpuCores, memory: `${containerMemory}Mi` };
+    await assertLeaseHeld();
     return appsApi.patchNamespacedDeployment({
       name: deploymentName,
       namespace,
@@ -488,6 +696,7 @@ export abstract class ServerService {
     configMapName: string,
     namespace: string,
     gameConfigJson: NonNullable<UpdateServerConfigInput["gameConfigJson"]>,
+    assertLeaseHeld: ServerBackupLeaseFence,
   ) {
     const coreApi = makeKubernetesClients().core;
     const data: Record<string, string> = {};
@@ -505,6 +714,7 @@ export abstract class ServerService {
       value,
     }));
 
+    await assertLeaseHeld();
     return coreApi.patchNamespacedConfigMap({
       name: configMapName,
       namespace,
@@ -513,117 +723,170 @@ export abstract class ServerService {
     });
   }
 
+  private static async resolveDeploymentConfigMap(
+    deploymentName: string,
+    namespace: string,
+  ): Promise<string> {
+    const deployment = await getAppsApi().readNamespacedDeployment({
+      name: deploymentName,
+      namespace,
+    });
+    const gameContainer = deployment.spec?.template.spec?.containers.find(
+      (container) => container.name === "game-server",
+    );
+    const configMapName = gameContainer?.envFrom
+      ?.map((source) => source.configMapRef?.name)
+      .find((name): name is string => Boolean(name));
+    if (!configMapName) {
+      throw new Error(
+        `Active Deployment '${namespace}/${deploymentName}' has no game-server ConfigMap`,
+      );
+    }
+    return configMapName;
+  }
+
   static async updateServerConfig(serverId: string, userId: string, data: UpdateServerConfigInput) {
     await this.requireOwnership(userId, serverId);
-    const k8sRecord = await this.getK8sRecord(serverId);
-    const persistedAt = new Date();
-    const { previousConfig, newCpuCores, newRamMb } = await db.transaction(async (tx) => {
-      // Every allocation mutation for an owner takes the same quota-row lock,
-      // so two concurrent workload expansions cannot both admit against the
-      // same stale aggregate.
-      const quota = await QuotaService.getResourceLimits(userId, tx);
-      if (!quota) throw status(404, "No quota found for this account.");
+    const initialK8sRecord = await this.getK8sRecord(serverId);
+    return withServerBackupLease(
+      initialK8sRecord.namespace,
+      serverId,
+      "server-config",
+      async (assertLeaseHeld) => {
+        // A start or stop may have completed while this request waited for the
+        // Lease, and a cutover may have promoted a new Deployment. Resolve both
+        // desired state and Kubernetes target only after serialization.
+        const leasedServer = await this.requireOwnership(userId, serverId);
+        const k8sRecord = await this.getK8sRecord(serverId);
+        if (k8sRecord.namespace !== initialK8sRecord.namespace) {
+          throw status(409, "The server Kubernetes target changed; retry the configuration update");
+        }
+        const configMapName =
+          data.gameConfigJson === undefined
+            ? null
+            : await this.resolveDeploymentConfigMap(k8sRecord.deploymentName, k8sRecord.namespace);
+        await assertLeaseHeld();
+        const persistedAt = new Date();
+        const { previousConfig, newCpuCores, newRamMb } = await db.transaction(async (tx) => {
+          // Every allocation mutation for an owner takes the same quota-row lock,
+          // so two concurrent workload expansions cannot both admit against the
+          // same stale aggregate.
+          const quota = await QuotaService.getResourceLimits(userId, tx);
+          if (!quota) throw status(404, "No quota found for this account.");
 
-      const [previousConfig] = await tx
-        .select()
-        .from(serverConfigs)
-        .where(eq(serverConfigs.serverId, serverId))
-        .for("update");
-      if (!previousConfig) throw status(404, "Server configuration not found");
+          const [previousConfig] = await tx
+            .select()
+            .from(serverConfigs)
+            .where(eq(serverConfigs.serverId, serverId))
+            .for("update");
+          if (!previousConfig) throw status(404, "Server configuration not found");
 
-      const newCpuCores = data.cpuCores ?? Number(previousConfig.cpuCores);
-      const newRamMb = data.ramMb ?? previousConfig.ramMb;
-      const newStorageGb = data.storageGb ?? previousConfig.storageGb;
+          const newCpuCores = data.cpuCores ?? Number(previousConfig.cpuCores);
+          const newRamMb = data.ramMb ?? previousConfig.ramMb;
+          const newStorageGb = data.storageGb ?? previousConfig.storageGb;
 
-      // Storage can be increased but not shrunk — PVCs are immutable in that direction.
-      if (newStorageGb < previousConfig.storageGb) {
-        throw status(
-          400,
-          `Storage cannot be reduced. Current size is ${previousConfig.storageGb}GB.`,
-        );
-      }
-      if (newStorageGb > previousConfig.storageGb) {
-        throw status(400, "Storage increases are not yet supported.");
-      }
+          // Storage can be increased but not shrunk — PVCs are immutable in that direction.
+          if (newStorageGb < previousConfig.storageGb) {
+            throw status(
+              400,
+              `Storage cannot be reduced. Current size is ${previousConfig.storageGb}GB.`,
+            );
+          }
+          if (newStorageGb > previousConfig.storageGb) {
+            throw status(400, "Storage increases are not yet supported.");
+          }
 
-      const expandsAllocation =
-        newCpuCores > Number(previousConfig.cpuCores) ||
-        newRamMb > previousConfig.ramMb ||
-        newStorageGb > previousConfig.storageGb;
-      if (expandsAllocation) {
-        assertAllocationFits(quota.limits, {
-          servers: quota.used.servers,
-          cpu: quota.used.cpu - Number(previousConfig.cpuCores) + newCpuCores,
-          ramMb: quota.used.ramMb - previousConfig.ramMb + newRamMb,
-          storageGb: quota.used.storageGb - previousConfig.storageGb + newStorageGb,
+          const expandsAllocation =
+            newCpuCores > Number(previousConfig.cpuCores) ||
+            newRamMb > previousConfig.ramMb ||
+            newStorageGb > previousConfig.storageGb;
+          if (expandsAllocation) {
+            assertAllocationFits(quota.limits, {
+              servers: quota.used.servers,
+              cpu: quota.used.cpu - Number(previousConfig.cpuCores) + newCpuCores,
+              ramMb: quota.used.ramMb - previousConfig.ramMb + newRamMb,
+              storageGb: quota.used.storageGb - previousConfig.storageGb + newStorageGb,
+            });
+          }
+
+          await tx
+            .update(serverConfigs)
+            .set({
+              cpuCores: String(newCpuCores),
+              ramMb: newRamMb,
+              storageGb: newStorageGb,
+              gameConfigJson: data.gameConfigJson
+                ? {
+                    ...(previousConfig.gameConfigJson as Record<string, unknown>),
+                    ...data.gameConfigJson,
+                  }
+                : previousConfig.gameConfigJson,
+              updatedAt: persistedAt,
+            })
+            .where(eq(serverConfigs.serverId, serverId));
+
+          return { previousConfig, newCpuCores, newRamMb, newStorageGb };
         });
-      }
 
-      await tx
-        .update(serverConfigs)
-        .set({
-          cpuCores: String(newCpuCores),
-          ramMb: newRamMb,
-          storageGb: newStorageGb,
-          gameConfigJson: data.gameConfigJson
-            ? {
-                ...(previousConfig.gameConfigJson as Record<string, unknown>),
-                ...data.gameConfigJson,
-              }
-            : previousConfig.gameConfigJson,
-          updatedAt: persistedAt,
-        })
-        .where(eq(serverConfigs.serverId, serverId));
+        // Apply to K8s. If anything fails, revert the DB write above.
+        try {
+          if (data.cpuCores !== undefined || data.ramMb !== undefined) {
+            await this.patchDeploymentResources(
+              k8sRecord.deploymentName,
+              k8sRecord.namespace,
+              String(newCpuCores),
+              newRamMb,
+              assertLeaseHeld,
+            );
+          }
 
-      return { previousConfig, newCpuCores, newRamMb, newStorageGb };
-    });
+          if (data.gameConfigJson !== undefined) {
+            await this.patchConfigMap(
+              configMapName!,
+              k8sRecord.namespace,
+              data.gameConfigJson,
+              assertLeaseHeld,
+            );
+          }
 
-    // Apply to K8s. If anything fails, revert the DB write above.
-    try {
-      if (data.cpuCores !== undefined || data.ramMb !== undefined) {
-        await this.patchDeploymentResources(
-          k8sRecord.deploymentName,
-          k8sRecord.namespace,
-          String(newCpuCores),
-          newRamMb,
-        );
-      }
+          // Recreate workloads have a real down/up gap. Keep the server Lease
+          // until the controller observes this generation and the desired pod is
+          // ready, so a weekly worker cannot raw-mount the PVC mid-restart.
+          await this.triggerRollingRestart(
+            k8sRecord.deploymentName,
+            k8sRecord.namespace,
+            leasedServer.desiredState === "running" ? 1 : 0,
+            assertLeaseHeld,
+          );
 
-      if (data.gameConfigJson !== undefined) {
-        await this.patchConfigMap(
-          `cm-server-${serverId}`,
-          k8sRecord.namespace,
-          data.gameConfigJson,
-        );
-      }
+          return { success: true, message: "Server configuration updated" };
+        } catch (error) {
+          console.error(`[${serverId}] K8s config patch failed, reverting server_configs:`, error);
 
-      // Trigger rolling restart so config changes take effect without manual intervention.
-      await this.triggerRollingRestart(k8sRecord.deploymentName, k8sRecord.namespace);
+          // Revert DB to the snapshot taken before the update.
+          const reverted = await db
+            .update(serverConfigs)
+            .set({
+              cpuCores: previousConfig.cpuCores,
+              ramMb: previousConfig.ramMb,
+              storageGb: previousConfig.storageGb,
+              gameConfigJson: previousConfig.gameConfigJson,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(eq(serverConfigs.serverId, serverId), eq(serverConfigs.updatedAt, persistedAt)),
+            )
+            .returning({ id: serverConfigs.id });
+          if (!reverted.length) {
+            console.error(
+              `[${serverId}] Config rollback skipped because a newer database revision exists`,
+            );
+          }
 
-      return { success: true, message: "Server configuration updated" };
-    } catch (error) {
-      console.error(`[${serverId}] K8s config patch failed, reverting server_configs:`, error);
-
-      // Revert DB to the snapshot taken before the update.
-      const reverted = await db
-        .update(serverConfigs)
-        .set({
-          cpuCores: previousConfig.cpuCores,
-          ramMb: previousConfig.ramMb,
-          storageGb: previousConfig.storageGb,
-          gameConfigJson: previousConfig.gameConfigJson,
-          updatedAt: new Date(),
-        })
-        .where(and(eq(serverConfigs.serverId, serverId), eq(serverConfigs.updatedAt, persistedAt)))
-        .returning({ id: serverConfigs.id });
-      if (!reverted.length) {
-        console.error(
-          `[${serverId}] Config rollback skipped because a newer database revision exists`,
-        );
-      }
-
-      throw status(500, "Failed to apply configuration change to server.");
-    }
+          throw status(500, "Failed to apply configuration change to server.");
+        }
+      },
+    );
   }
 
   private static publicReceipt(row: typeof operatorReceipts.$inferSelect, reused: boolean) {
@@ -778,7 +1041,8 @@ export abstract class ServerService {
     if (
       previousState.currentState === "restarting" &&
       previousState.desiredState === "stopped" &&
-      previousState.statusMessage === "Restoring backup"
+      (previousState.statusMessage === "Restoring backup" ||
+        backupRestoreRecoveryRequired(previousState.statusMessage))
     ) {
       // A backend restart can interrupt the in-process restore monitor after
       // Kubernetes has already finished. Recover that durable Job state before
@@ -788,82 +1052,152 @@ export abstract class ServerService {
       previousState = await this.requireOwnership(userId, serverId);
     }
 
-    await this.claimTransition(userId, serverId, action);
+    if (action === "start" && backupRestoreRecoveryRequired(previousState.statusMessage)) {
+      throw status(409, BACKUP_RESTORE_RECOVERY_REQUIRED_MESSAGE);
+    }
 
-    const k8sRecord = await this.getK8sRecord(serverId);
-    const { deploymentName, namespace } = k8sRecord;
-    const appsApi = getAppsApi();
-
-    if (action === "restart") {
-      let scaledDown = false;
-      try {
-        await this.setReplicas(appsApi, deploymentName, namespace, 0);
-        scaledDown = true;
-
-        await waitForDeploymentReplicasReady(appsApi, deploymentName, namespace, 0);
-
-        await this.setReplicas(appsApi, deploymentName, namespace, 1);
-        await db
-          .update(gameServers)
-          .set({ currentState: "starting", updatedAt: new Date() })
-          .where(eq(gameServers.id, serverId));
-
-        await waitForDeploymentReplicasReady(appsApi, deploymentName, namespace, 1);
-        await this.settleState(serverId, "running", "running");
-
-        return { success: true, action, status: "running" };
-      } catch (err) {
-        console.error(`[${serverId}] Failed to perform ${action}:`, err);
-
-        if (!scaledDown) {
-          await this.rollbackToPreviousState(serverId, previousState);
-          throw status(500, `Failed to ${action} server`);
+    const initialK8sRecord = await this.getK8sRecord(serverId);
+    return withServerBackupLease(
+      initialK8sRecord.namespace,
+      serverId,
+      `server-action:${action}`,
+      async (assertLeaseHeld) => {
+        // The preflight above can become stale while this request waits for a
+        // restore or cutover Lease. Re-read state and the active Deployment under
+        // the Lease so a queued request cannot operate on retained server A.
+        previousState = await this.requireOwnership(userId, serverId);
+        const k8sRecord = await this.getK8sRecord(serverId);
+        if (k8sRecord.namespace !== initialK8sRecord.namespace) {
+          throw status(409, "The server Kubernetes target changed; retry the power action");
         }
+        const { deploymentName, namespace } = k8sRecord;
+        if (action === "start" && backupRestoreRecoveryRequired(previousState.statusMessage)) {
+          throw status(409, BACKUP_RESTORE_RECOVERY_REQUIRED_MESSAGE);
+        }
+        await assertLeaseHeld();
+        await this.claimTransition(userId, serverId, action);
+        const appsApi = getAppsApi();
+
+        if (action === "restart") {
+          let scaledDown = false;
+          try {
+            await this.setReplicas(appsApi, deploymentName, namespace, 0, assertLeaseHeld);
+            scaledDown = true;
+
+            await waitForDeploymentReplicasReady(appsApi, deploymentName, namespace, 0);
+
+            await this.setReplicas(appsApi, deploymentName, namespace, 1, assertLeaseHeld);
+            await assertLeaseHeld();
+            await db
+              .update(gameServers)
+              .set({ currentState: "starting", updatedAt: new Date() })
+              .where(eq(gameServers.id, serverId));
+
+            await waitForDeploymentReplicasReady(appsApi, deploymentName, namespace, 1);
+            await assertLeaseHeld();
+            await this.settleState(serverId, "running", "running");
+
+            return { success: true, action, status: "running" };
+          } catch (err) {
+            console.error(`[${serverId}] Failed to perform ${action}:`, err);
+
+            if (!scaledDown) {
+              await assertLeaseHeld();
+              await this.rollbackToPreviousState(serverId, previousState);
+              throw status(500, `Failed to ${action} server`);
+            }
+
+            let compensated = false;
+            try {
+              await this.setReplicas(appsApi, deploymentName, namespace, 0, assertLeaseHeld);
+              await waitForDeploymentReplicasReady(appsApi, deploymentName, namespace, 0);
+              compensated = true;
+            } catch (compensateErr) {
+              console.error(
+                `[${serverId}] Failed to compensate with scale-down after restart error:`,
+                compensateErr,
+              );
+            }
+            if (compensated) {
+              await assertLeaseHeld();
+              await this.rollbackToStopped(serverId);
+            } else {
+              await assertLeaseHeld();
+              await db
+                .update(gameServers)
+                .set({
+                  currentState: "failed",
+                  desiredState: "stopped",
+                  statusMessage: "Restart failed and the workload could not be confirmed stopped",
+                  updatedAt: new Date(),
+                })
+                .where(eq(gameServers.id, serverId));
+            }
+            throw status(500, `Failed to ${action} server`);
+          }
+        }
+
+        // start / stop
+        const replicas = REPLICA_TARGET[action];
+        const finalState = action === "start" ? "running" : "stopped";
 
         try {
-          await this.setReplicas(appsApi, deploymentName, namespace, 0);
-        } catch (compensateErr) {
-          console.error(
-            `[${serverId}] Failed to compensate with scale-down after restart error:`,
-            compensateErr,
-          );
+          await this.setReplicas(appsApi, deploymentName, namespace, replicas, assertLeaseHeld);
+          await waitForDeploymentReplicasReady(appsApi, deploymentName, namespace, replicas);
+          await assertLeaseHeld();
+          await this.settleState(serverId, finalState, finalState);
+
+          return { success: true, action, status: finalState };
+        } catch (err) {
+          console.error(`[${serverId}] Failed to perform ${action}:`, err);
+
+          if (action === "start") {
+            try {
+              await this.setReplicas(appsApi, deploymentName, namespace, 0, assertLeaseHeld);
+              await waitForDeploymentReplicasReady(appsApi, deploymentName, namespace, 0);
+              await assertLeaseHeld();
+              await this.settleState(serverId, "stopped", "stopped");
+            } catch (compensateErr) {
+              console.error(
+                `[${serverId}] Failed to compensate with scale-down after start error:`,
+                compensateErr,
+              );
+              await assertLeaseHeld();
+              await db
+                .update(gameServers)
+                .set({
+                  currentState: "failed",
+                  desiredState: "stopped",
+                  statusMessage: "Start failed and the workload could not be confirmed stopped",
+                  updatedAt: new Date(),
+                })
+                .where(eq(gameServers.id, serverId));
+            }
+            throw status(500, `Failed to ${action} server`);
+          }
+
+          try {
+            const deployment = await appsApi.readNamespacedDeployment({
+              name: deploymentName,
+              namespace,
+            });
+            const liveReplicas = deployment.status?.readyReplicas ?? 0;
+            const liveState = liveReplicas > 0 ? "running" : "stopped";
+            await assertLeaseHeld();
+            await this.settleState(serverId, liveState, liveState);
+          } catch (reconcileErr) {
+            console.error(
+              `[${serverId}] Failed to reconcile live K8s state after ${action} error:`,
+              reconcileErr,
+            );
+            await assertLeaseHeld();
+            await this.rollbackToPreviousState(serverId, previousState);
+          }
+
+          throw status(500, `Failed to ${action} server`);
         }
-        await this.rollbackToStopped(serverId);
-        throw status(500, `Failed to ${action} server`);
-      }
-    }
-
-    // start / stop
-    const replicas = REPLICA_TARGET[action];
-    const finalState = action === "start" ? "running" : "stopped";
-
-    try {
-      await this.setReplicas(appsApi, deploymentName, namespace, replicas);
-      await waitForDeploymentReplicasReady(appsApi, deploymentName, namespace, replicas);
-      await this.settleState(serverId, finalState, finalState);
-
-      return { success: true, action, status: finalState };
-    } catch (err) {
-      console.error(`[${serverId}] Failed to perform ${action}:`, err);
-
-      try {
-        const deployment = await appsApi.readNamespacedDeployment({
-          name: deploymentName,
-          namespace,
-        });
-        const liveReplicas = deployment.status?.readyReplicas ?? 0;
-        const liveState = liveReplicas > 0 ? "running" : "stopped";
-        await this.settleState(serverId, liveState, liveState);
-      } catch (reconcileErr) {
-        console.error(
-          `[${serverId}] Failed to reconcile live K8s state after ${action} error:`,
-          reconcileErr,
-        );
-        await this.rollbackToPreviousState(serverId, previousState);
-      }
-
-      throw status(500, `Failed to ${action} server`);
-    }
+      },
+    );
   }
 
   static async getStatus(serverId: string, userId: string) {
@@ -970,62 +1304,98 @@ export abstract class ServerService {
   }
 
   static async delete(userId: string, serverId: string) {
-    let previousState: StateType;
-    let previousDesiredState: DesiredStateType;
-    await db.transaction(async (tx: TransactionType) => {
-      const [server] = await tx
-        .select({
-          id: gameServers.id,
-          currentState: gameServers.currentState,
-          desiredState: gameServers.desiredState,
-        })
-        .from(gameServers)
-        .where(and(eq(gameServers.id, serverId), eq(gameServers.userId, userId)))
-        .for("update");
-
-      if (!server) throw status(404, "Server not found");
-
-      if (server.currentState === "deleted" || server.currentState === "provisioning") {
-        throw status(409, `Cannot delete server in state: ${server.currentState}`);
-      }
-      previousState = server.currentState;
-      previousDesiredState = server.desiredState;
-      // TODO: create a current state named "deleting"
-      // Setting the current state to deleted early for now.
-      await tx
-        .update(gameServers)
-        .set({
-          currentState: "deleted",
-          desiredState: "deleted",
-          updatedAt: new Date(),
-        })
-        .where(eq(gameServers.id, serverId));
+    await this.requireOwnership(userId, serverId);
+    const k8sRecord = await db.query.serverK8s.findFirst({
+      where: eq(serverK8s.serverId, serverId),
     });
-
-    try {
-      console.info(`[${serverId}] Initiating Kubernetes teardown...`);
-
-      const k8sCleaned = await deleteGameServer(serverId);
-
-      if (!k8sCleaned) {
-        throw new Error("One or more Kubernetes resources failed to delete.");
+    const runDelete = async (assertLeaseHeld: ServerBackupLeaseFence) => {
+      if (k8sRecord) {
+        const leasedK8sRecord = await this.getK8sRecord(serverId);
+        if (leasedK8sRecord.namespace !== k8sRecord.namespace) {
+          throw status(409, "The server Kubernetes target changed; retry deletion");
+        }
       }
-      await db
-        .update(gameServers)
-        .set({
-          currentState: "deleted",
-          updatedAt: new Date(),
-        })
-        .where(eq(gameServers.id, serverId));
+      let previousState: StateType;
+      let previousDesiredState: DesiredStateType;
+      let previousStatusMessage: string | null;
+      await assertLeaseHeld();
+      await db.transaction(async (tx: TransactionType) => {
+        const [server] = await tx
+          .select({
+            id: gameServers.id,
+            currentState: gameServers.currentState,
+            desiredState: gameServers.desiredState,
+            statusMessage: gameServers.statusMessage,
+          })
+          .from(gameServers)
+          .where(and(eq(gameServers.id, serverId), eq(gameServers.userId, userId)))
+          .for("update");
 
-      console.info(`[${serverId}] Server fully deleted from system`);
-      return { deletedServerId: serverId };
-    } catch (error) {
-      console.error(`[${serverId}] Deletion process failed:`, error);
+        if (!server) throw status(404, "Server not found");
 
-      await restoreServerAfterFailedDeletion(serverId, previousState!, previousDesiredState!);
+        if (
+          server.currentState === "deleted" ||
+          server.currentState === "provisioning" ||
+          (server.currentState === "restarting" &&
+            (server.statusMessage === "Restoring backup" ||
+              backupRestoreRecoveryRequired(server.statusMessage)))
+        ) {
+          throw status(409, `Cannot delete server in state: ${server.currentState}`);
+        }
+        previousState = server.currentState;
+        previousDesiredState = server.desiredState;
+        previousStatusMessage = server.statusMessage;
+        // TODO: create a current state named "deleting"
+        // Setting the current state to deleted early for now.
+        await tx
+          .update(gameServers)
+          .set({
+            currentState: "deleted",
+            desiredState: "deleted",
+            updatedAt: new Date(),
+          })
+          .where(eq(gameServers.id, serverId));
+      });
 
-      throw status(500, "Failed to fully delete server resources.");
-    }
+      try {
+        console.info(`[${serverId}] Initiating Kubernetes teardown...`);
+
+        await assertLeaseHeld();
+        const k8sCleaned = await deleteGameServer(serverId, assertLeaseHeld);
+
+        if (!k8sCleaned) {
+          throw new Error("One or more Kubernetes resources failed to delete.");
+        }
+        await assertLeaseHeld();
+        await db
+          .update(gameServers)
+          .set({
+            currentState: "deleted",
+            updatedAt: new Date(),
+          })
+          .where(eq(gameServers.id, serverId));
+
+        console.info(`[${serverId}] Server fully deleted from system`);
+        return { deletedServerId: serverId };
+      } catch (error) {
+        console.error(`[${serverId}] Deletion process failed:`, error);
+
+        await restoreServerAfterFailedDeletion(
+          serverId,
+          previousState!,
+          previousDesiredState!,
+          previousStatusMessage!,
+        );
+
+        throw status(500, "Failed to fully delete server resources.");
+      }
+    };
+
+    return k8sRecord
+      ? withServerBackupLease(k8sRecord.namespace, serverId, "server-delete", runDelete)
+      : runDelete(async () => {
+          await assertNoActiveServerBackup(serverId);
+          await assertNoPendingServerCutover(serverId);
+        });
   }
 }

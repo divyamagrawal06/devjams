@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { Elysia } from "elysia";
 
 import { maintenanceBounds, operatorModule, windowsOverlap } from "../src/modules/operator/http";
-import { allocationViolations } from "../src/modules/quota/quota.service";
+import {
+  allocationViolations,
+  backupCountsTowardManualQuota,
+} from "../src/modules/quota/quota.service";
 import { serversModule } from "../src/modules/servers";
 import { operatorReceiptDisposition } from "../src/modules/servers/service";
 
@@ -54,6 +58,25 @@ describe("aggregate quota and operator safety", () => {
     );
     expect(operatorReceiptDisposition(base, "server-b", "stop")).toBe("conflict");
     expect(operatorReceiptDisposition(base, "server-a", "restart")).toBe("conflict");
+  });
+
+  test("automatic recovery points never consume the manual backup quota", () => {
+    expect(backupCountsTowardManualQuota("manual", "completed")).toBe(true);
+    expect(backupCountsTowardManualQuota("manual", "pending")).toBe(true);
+    expect(backupCountsTowardManualQuota("scheduled", "completed")).toBe(false);
+    expect(backupCountsTowardManualQuota("scheduled", "pending")).toBe(false);
+    expect(backupCountsTowardManualQuota("manual", "failed")).toBe(false);
+    expect(backupCountsTowardManualQuota("manual", "deleted")).toBe(false);
+
+    const quotaService = readFileSync(
+      new URL("../src/modules/quota/quota.service.ts", import.meta.url),
+      "utf8",
+    );
+    const backupUsageQuery = quotaService.slice(
+      quotaService.indexOf("async function readBackupUsage("),
+      quotaService.indexOf("export function backupCountsTowardManualQuota("),
+    );
+    expect(backupUsageQuery).toContain('eq(backups.source, "manual")');
   });
 
   test("all operator and workload catalogue routes fail closed without a session", async () => {

@@ -1,5 +1,21 @@
-import { bigint, index, jsonb, pgTable, text, timestamp } from "drizzle-orm/pg-core";
-import { backupEventTypeEnum, backupStatusEnum, logLevelEnum } from "./enums";
+import { sql } from "drizzle-orm";
+import {
+  bigint,
+  check,
+  index,
+  jsonb,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+} from "drizzle-orm/pg-core";
+import {
+  backupEventTypeEnum,
+  backupOperationEnum,
+  backupSourceEnum,
+  backupStatusEnum,
+  logLevelEnum,
+} from "./enums";
 import { gameServers } from "./servers";
 
 export const backups = pgTable(
@@ -14,6 +30,10 @@ export const backups = pgTable(
     storagePath: text("storage_path").notNull(),
     sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
     status: backupStatusEnum("status").notNull().default("pending"),
+    source: backupSourceEnum("source").notNull().default("manual"),
+    activeOperation: backupOperationEnum("active_operation"),
+    activeOperationAttemptId: text("active_operation_attempt_id"),
+    activeOperationStartedAt: timestamp("active_operation_started_at", { withTimezone: true }),
 
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 
@@ -24,6 +44,17 @@ export const backups = pgTable(
     index("backups_server_id_idx").on(table.serverId),
     index("backups_status_idx").on(table.status),
     index("backups_expires_at_idx").on(table.expiresAt),
+    uniqueIndex("backups_storage_path_unique_idx")
+      .on(table.storagePath)
+      .where(sql`${table.storagePath} <> ''`),
+    check(
+      "backups_active_operation_attempt_check",
+      sql`(
+        (${table.activeOperation} IS NULL AND ${table.activeOperationAttemptId} IS NULL AND ${table.activeOperationStartedAt} IS NULL)
+        OR
+        (${table.activeOperation} IS NOT NULL AND ${table.activeOperationAttemptId} IS NOT NULL AND ${table.activeOperationStartedAt} IS NOT NULL)
+      )`,
+    ),
   ],
 );
 

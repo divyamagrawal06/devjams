@@ -1,4 +1,7 @@
-import type { Backup, BackupSchedule } from "./api";
+import type { Backup, BackupSchedule, LiveServer } from "./api";
+
+export const BACKUP_RESTORE_RECOVERY_REQUIRED_MESSAGE =
+  "Backup restore requires manual recovery before this server can start";
 
 const DAYS = [
   "Sunday",
@@ -73,5 +76,16 @@ export function backupStatusTone(
 export function backupIsBusy(backup: Pick<Backup, "activeOperation" | "status">): boolean {
   return (
     backup.activeOperation != null || backup.status === "pending" || backup.status === "in_progress"
+  );
+}
+
+export function serverCanRestoreBackup(
+  server: Pick<LiveServer, "currentState" | "statusMessage">,
+): boolean {
+  return (
+    server.currentState === "ready" ||
+    server.currentState === "stopped" ||
+    (server.currentState === "failed" &&
+      server.statusMessage === BACKUP_RESTORE_RECOVERY_REQUIRED_MESSAGE)
   );
 }

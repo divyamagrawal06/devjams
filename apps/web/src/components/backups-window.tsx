@@ -29,6 +29,7 @@ import {
   backupStatusTone,
   formatBytes,
   formatUtcDateTime,
+  serverCanRestoreBackup,
   weeklyScheduleLabel,
 } from "@/lib/backups";
 import { type OperatorReceiptStatus, operatorReceiptOutcome } from "@/lib/operator-receipts";
@@ -282,8 +283,10 @@ export function BackupsWindow({
 
   const backupRows = backups.data?.data ?? [];
   const busyBackup = backupRows.find((backup) => backupIsBusy(backup));
+  const scheduleData = schedule.data?.data;
+  const backupsSupported = scheduleData?.supported ?? selectedServer.game === "minecraft";
   const serverRunning = selectedServer.currentState === "running";
-  const serverStopped = ["ready", "stopped"].includes(selectedServer.currentState);
+  const serverStopped = serverCanRestoreBackup(selectedServer);
   const serverCanStop = selectedServer.currentState === "running";
   const stopReceiptStatus = stopRealm.data?.data.receipt.status;
   const stopReceiptOutcome = stopReceiptStatus ? operatorReceiptOutcome(stopReceiptStatus) : null;
@@ -293,13 +296,13 @@ export function BackupsWindow({
     Boolean(stopReceiptOutcome?.pending || stopReceiptOutcome?.completed);
   const createDisabled =
     !recoveryControlsAvailable ||
+    !backupsSupported ||
     !serverRunning ||
     Boolean(busyBackup) ||
     createBackup.isPending ||
     stopRealm.isPending;
   const actionError =
     createBackup.error ?? stopRealm.error ?? restoreBackup.error ?? deleteBackup.error;
-  const scheduleData = schedule.data?.data;
 
   return (
     <div className="backups-view">
@@ -362,11 +365,13 @@ export function BackupsWindow({
               createBackup.mutate(selectedServer.id);
             }}
             title={
-              !serverRunning
-                ? "The workload must be running before a manual snapshot can start."
-                : busyBackup
-                  ? "Wait for the current backup operation to finish."
-                  : undefined
+              !backupsSupported
+                ? "Backups currently support Minecraft Java workloads only."
+                : !serverRunning
+                  ? "The workload must be running before a manual snapshot can start."
+                  : busyBackup
+                    ? "Wait for the current backup operation to finish."
+                    : undefined
             }
             type="button"
           >
@@ -374,11 +379,13 @@ export function BackupsWindow({
             {createBackup.isPending ? "Starting backup…" : "Back up now"}
           </button>
           <p>
-            {!serverRunning
-              ? `Manual snapshots require a running workload. Current state: ${humanizeState(selectedServer.currentState)}.`
-              : busyBackup
-                ? `${backupStatusLabel(busyBackup)} ${busyBackup.name}.`
-                : "Create an additional recovery point now."}
+            {!backupsSupported
+              ? "Backups currently support Minecraft Java workloads only."
+              : !serverRunning
+                ? `Manual snapshots require a running workload. Current state: ${humanizeState(selectedServer.currentState)}.`
+                : busyBackup
+                  ? `${backupStatusLabel(busyBackup)} ${busyBackup.name}.`
+                  : "Create an additional recovery point now."}
           </p>
         </div>
       </div>
@@ -416,43 +423,57 @@ export function BackupsWindow({
         ) : null}
 
         {scheduleData ? (
-          <div className={`backup-schedule-panel ${scheduleData.enabled ? "enabled" : "disabled"}`}>
+          <div
+            className={`backup-schedule-panel ${scheduleData.enabled ? "enabled" : "disabled"} ${scheduleData.health}`}
+          >
             <div className="backup-schedule-primary">
               <span className="backup-schedule-icon" aria-hidden="true">
                 <CalendarClock size={22} />
               </span>
-              <div>
+              <div role="status" aria-atomic="true" aria-live="polite">
                 <strong>
-                  {scheduleData.enabled ? "Weekly backups are on" : "Weekly backups are off"}
+                  {!scheduleData.supported
+                    ? "Backups unavailable for this workload"
+                    : scheduleData.health === "degraded"
+                      ? "Weekly backups need attention"
+                      : scheduleData.enabled
+                        ? "Weekly backups are on"
+                        : "Weekly backups are off"}
                 </strong>
                 <span className="backup-schedule-description">
-                  {scheduleData.enabled
+                  {scheduleData.health === "healthy"
                     ? weeklyScheduleLabel(scheduleData)
-                    : "No automatic snapshot will be created for this workload."}
+                    : scheduleData.statusMessage}
                 </span>
               </div>
             </div>
-            <dl className="backup-schedule-facts">
-              <div>
-                <dt>Next backup</dt>
-                <dd>
-                  {scheduleData.enabled
-                    ? formatUtcDateTime(scheduleData.nextRunAt)
-                    : "Not scheduled"}
-                </dd>
-              </div>
-              <div>
-                <dt>Last successful</dt>
-                <dd>{formatUtcDateTime(scheduleData.lastSuccessfulAt)}</dd>
-              </div>
-              <div>
-                <dt>Retention</dt>
-                <dd>
-                  {scheduleData.retentionCount} most recent{" "}
-                  {scheduleData.retentionCount === 1 ? "backup" : "backups"}
-                </dd>
-              </div>
-            </dl>
+            {scheduleData.supported ? (
+              <dl className="backup-schedule-facts">
+                <div>
+                  <dt>Next backup</dt>
+                  <dd>
+                    {scheduleData.enabled
+                      ? formatUtcDateTime(scheduleData.nextRunAt)
+                      : "Not scheduled"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Last attempt</dt>
+                  <dd>{formatUtcDateTime(scheduleData.lastAttemptAt)}</dd>
+                </div>
+                <div>
+                  <dt>Last successful</dt>
+                  <dd>{formatUtcDateTime(scheduleData.lastSuccessfulAt)}</dd>
+                </div>
+                <div>
+                  <dt>Retention</dt>
+                  <dd>
+                    {scheduleData.retentionCount} most recent{" "}
+                    {scheduleData.retentionCount === 1 ? "backup" : "backups"}
+                  </dd>
+                </div>
+              </dl>
+            ) : null}
           </div>
         ) : null}
       </section>
@@ -494,12 +515,20 @@ export function BackupsWindow({
             <Archive aria-hidden="true" size={29} />
             <h3>No backups yet</h3>
             <p>
-              {scheduleData?.enabled
-                ? "The first weekly archive will appear after its scheduled run. "
-                : scheduleData
-                  ? "Automatic backups are currently off. "
-                  : "No automatic backup run has been verified yet. "}
-              You can create a manual backup while the realm is running.
+              {!backupsSupported ? (
+                "Backups currently support Minecraft Java workloads only."
+              ) : (
+                <>
+                  {scheduleData?.health === "degraded"
+                    ? "Weekly backups need attention; check the scheduler status above. "
+                    : scheduleData?.enabled
+                      ? "The first weekly archive will appear after its scheduled run. "
+                      : scheduleData
+                        ? "Automatic backups are currently off. "
+                        : "No automatic backup run has been verified yet. "}
+                  You can create a manual backup while the realm is running.
+                </>
+              )}
             </p>
           </div>
         ) : null}
@@ -589,6 +618,7 @@ export function BackupsWindow({
                       className="backup-secondary-action"
                       disabled={
                         !recoveryControlsAvailable ||
+                        !backupsSupported ||
                         !completed ||
                         restoreMutationBusy(restoreBackup, deleteBackup)
                       }

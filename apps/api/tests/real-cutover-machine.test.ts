@@ -76,6 +76,21 @@ class TestRuntime implements DeploymentMachineRuntime {
 
   constructor(private readonly artifactDigest = DIGEST) {}
 
+  async withServerLease<T>(
+    _row: DeploymentRecord,
+    operation: (assertLeaseHeld: (requiredRemainingMs?: number) => Promise<number>) => Promise<T>,
+  ): Promise<T> {
+    this.calls.push("server-lease");
+    return operation(async () => {
+      this.calls.push("lease-fence");
+      return Number.MAX_SAFE_INTEGER;
+    });
+  }
+
+  async validateCandidateConfig() {
+    this.calls.push("validate-config");
+  }
+
   async resolveArtifact() {
     this.calls.push("resolve");
     return {
@@ -177,6 +192,10 @@ class TestRuntime implements DeploymentMachineRuntime {
     this.calls.push("verify-b");
   }
 
+  async suspendWeeklyBackup() {
+    this.calls.push("suspend-weekly");
+  }
+
   async switchRoute(_row: DeploymentRecord, target: "candidate" | "live") {
     this.calls.push("switch:" + target);
     return new Date("2026-08-30T12:00:01.000Z");
@@ -259,6 +278,7 @@ describe("real cutover state machine", () => {
       "freeze-delta",
       "start-b",
       "verify-b",
+      "suspend-weekly",
       "switch:candidate",
       "wait-route:candidate",
       "move:lobby->srv_alpha",

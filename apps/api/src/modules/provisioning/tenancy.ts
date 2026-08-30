@@ -49,6 +49,10 @@ export function buildArtifactServiceAccount(
     automountServiceAccountToken: false,
   };
 }
+export const BACKUP_WORKER_ROLE_ANNOTATION = "eks.amazonaws.com/role-arn";
+export const DEFAULT_BACKUP_WORKER_SERVICE_ACCOUNT = "backup-orchestrator";
+export const BACKUP_TENANT_WORKER_CLUSTER_ROLE = "farlands-backup-tenant-worker";
+export const BACKUP_ORCHESTRATOR_ROLE_BINDING = "farlands-backup-orchestrator";
 
 export type TenantQuotaMirror = {
   cpuLimit: string;
@@ -97,6 +101,175 @@ function alreadyExists(error: unknown): boolean {
 
 function notFound(error: unknown): boolean {
   return getKubernetesStatusCode(error) === 404;
+}
+
+export type BackupWorkerIdentityConfig = {
+  roleArn: string;
+  serviceAccount: string;
+};
+
+const IAM_ROLE_ARN = /^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role\/[A-Za-z0-9+=,.@_/-]+$/;
+
+export function resolveBackupWorkerIdentityConfig(
+  environment: Record<string, string | undefined> = process.env,
+): BackupWorkerIdentityConfig {
+  const roleArn = environment.FARLANDS_BACKUP_WORKER_ROLE_ARN?.trim();
+  if (!roleArn) {
+    throw new Error(
+      "Minecraft provisioning is disabled until FARLANDS_BACKUP_WORKER_ROLE_ARN is configured; a realm cannot be created without weekly backup credentials",
+    );
+  }
+  if (roleArn.length > 512 || !IAM_ROLE_ARN.test(roleArn)) {
+    throw new Error("FARLANDS_BACKUP_WORKER_ROLE_ARN must be a valid IAM role ARN");
+  }
+
+  const serviceAccount =
+    environment.FARLANDS_BACKUP_WORKER_SERVICE_ACCOUNT?.trim() ||
+    DEFAULT_BACKUP_WORKER_SERVICE_ACCOUNT;
+  if (!/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(serviceAccount) || serviceAccount.length > 63) {
+    throw new Error(
+      "FARLANDS_BACKUP_WORKER_SERVICE_ACCOUNT must be a valid Kubernetes ServiceAccount name",
+    );
+  }
+
+  return { roleArn, serviceAccount };
+}
+
+export function buildBackupWorkerServiceAccount(
+  namespace: string,
+  config: BackupWorkerIdentityConfig,
+): k8s.V1ServiceAccount {
+  return {
+    metadata: {
+      name: config.serviceAccount,
+      namespace,
+      labels: {
+        "app.kubernetes.io/name": "server-backup-worker",
+        "app.kubernetes.io/part-of": "farlands",
+        "app.kubernetes.io/component": "backup",
+      },
+      annotations: { [BACKUP_WORKER_ROLE_ANNOTATION]: config.roleArn },
+    },
+    automountServiceAccountToken: false,
+  };
+}
+
+export function buildBackupOrchestratorRoleBinding(
+  namespace: string,
+  environment: Record<string, string | undefined> = process.env,
+): k8s.V1RoleBinding {
+  const orchestratorNamespace =
+    environment.BACKUP_NAMESPACE?.trim() ||
+    environment.FARLANDS_PROXY_NAMESPACE?.trim() ||
+    PROXY_NAMESPACE;
+  const orchestratorServiceAccount =
+    environment.BACKUP_ORCHESTRATOR_SERVICE_ACCOUNT?.trim() ||
+    DEFAULT_BACKUP_WORKER_SERVICE_ACCOUNT;
+
+  return {
+    metadata: {
+      name: BACKUP_ORCHESTRATOR_ROLE_BINDING,
+      namespace,
+      labels: {
+        "app.kubernetes.io/name": "server-backup-orchestrator",
+        "app.kubernetes.io/part-of": "farlands",
+        "app.kubernetes.io/component": "backup",
+      },
+    },
+    roleRef: {
+      apiGroup: "rbac.authorization.k8s.io",
+      kind: "ClusterRole",
+      name: BACKUP_TENANT_WORKER_CLUSTER_ROLE,
+    },
+    subjects: [
+      {
+        kind: "ServiceAccount",
+        name: orchestratorServiceAccount,
+        namespace: orchestratorNamespace,
+      },
+    ],
+  };
+}
+
+export async function ensureBackupOrchestratorAccess(
+  rbac: k8s.RbacAuthorizationV1Api,
+  namespace: string,
+): Promise<void> {
+  if (!namespace.startsWith("fl-")) {
+    throw new Error(
+      `Refusing to grant backup orchestrator access outside an fl-* namespace: ${namespace}`,
+    );
+  }
+
+  const desired = buildBackupOrchestratorRoleBinding(namespace);
+  try {
+    await rbac.createNamespacedRoleBinding({ namespace, body: desired });
+    return;
+  } catch (error) {
+    if (!alreadyExists(error)) throw error;
+  }
+
+  const existing = await rbac.readNamespacedRoleBinding({
+    name: BACKUP_ORCHESTRATOR_ROLE_BINDING,
+    namespace,
+  });
+  desired.metadata!.resourceVersion = existing.metadata?.resourceVersion;
+  await rbac.replaceNamespacedRoleBinding({
+    name: BACKUP_ORCHESTRATOR_ROLE_BINDING,
+    namespace,
+    body: desired,
+  });
+}
+
+function assertBackupWorkerServiceAccount(
+  serviceAccount: k8s.V1ServiceAccount,
+  namespace: string,
+  config: BackupWorkerIdentityConfig,
+): void {
+  const actualRole = serviceAccount.metadata?.annotations?.[BACKUP_WORKER_ROLE_ANNOTATION];
+  if (actualRole !== config.roleArn || serviceAccount.automountServiceAccountToken !== false) {
+    throw new Error(
+      `Backup worker identity '${namespace}/${config.serviceAccount}' is not the managed IRSA identity; apply the backup Terraform stack before provisioning this realm`,
+    );
+  }
+}
+
+export async function ensureBackupWorkerIdentity(
+  core: k8s.CoreV1Api,
+  namespace: string,
+  config: BackupWorkerIdentityConfig = resolveBackupWorkerIdentityConfig(),
+): Promise<void> {
+  if (!namespace.startsWith("fl-")) {
+    throw new Error(
+      `Refusing to create a tenant backup identity outside an fl-* namespace: ${namespace}`,
+    );
+  }
+
+  try {
+    const existing = await core.readNamespacedServiceAccount({
+      name: config.serviceAccount,
+      namespace,
+    });
+    assertBackupWorkerServiceAccount(existing, namespace, config);
+    return;
+  } catch (error) {
+    if (!notFound(error)) throw error;
+  }
+
+  try {
+    await core.createNamespacedServiceAccount({
+      namespace,
+      body: buildBackupWorkerServiceAccount(namespace, config),
+    });
+  } catch (error) {
+    if (!alreadyExists(error)) throw error;
+
+    const existing = await core.readNamespacedServiceAccount({
+      name: config.serviceAccount,
+      namespace,
+    });
+    assertBackupWorkerServiceAccount(existing, namespace, config);
+  }
 }
 
 async function ensureNamespace(
@@ -307,11 +480,16 @@ async function copyVelocitySecret(core: k8s.CoreV1Api, namespace: string): Promi
   });
 }
 
-export function buildWorldSyncScripts(): { sender: string; receiver: string } {
-  const sender = `#!/usr/bin/env python3
-import http.server, io, json, os, stat, sys, tarfile, time, urllib.parse
+export function buildWorldSyncSenderScript(): string {
+  return `#!/usr/bin/env python3
+import http.server, io, json, os, socket, stat, struct, subprocess, sys, tarfile, threading, time, urllib.parse
 PORT = int(os.environ.get("WORLD_SYNC_PORT", "8080"))
 ROOT = os.path.realpath(os.environ.get("WORLD_ROOT", "/data"))
+BACKUP_ROOT = os.path.realpath(os.environ.get("BACKUP_ROOT", "/data"))
+RCON_HOST = os.environ.get("RCON_HOST", "127.0.0.1")
+RCON_PORT = int(os.environ.get("RCON_PORT", "25575"))
+RCON_PASSWORD_FILE = os.environ.get("RCON_PASSWORD_FILE", "/run/secrets/rcon/password")
+BACKUP_LOCK = threading.Lock()
 
 def managed_names():
     names = []
@@ -326,6 +504,76 @@ def managed_names():
     return tuple(names)
 
 NAMES = managed_names()
+
+def recv_exact(sock, length):
+    chunks = []
+    remaining = length
+    while remaining:
+        chunk = sock.recv(remaining)
+        if not chunk: raise ConnectionError("RCON connection closed")
+        chunks.append(chunk); remaining -= len(chunk)
+    return b"".join(chunks)
+
+def encode_packet(request_id, packet_type, body):
+    payload = struct.pack("<ii", request_id, packet_type) + body.encode("utf-8") + b"\\x00\\x00"
+    return struct.pack("<i", len(payload)) + payload
+
+class Rcon:
+    def __init__(self):
+        with open(RCON_PASSWORD_FILE, "r", encoding="utf-8") as handle:
+            password = handle.read().strip()
+        self.sock = socket.create_connection((RCON_HOST, RCON_PORT), timeout=10)
+        self.sock.settimeout(30)
+        self.request_id = 1
+        self.sock.sendall(encode_packet(self.request_id, 3, password))
+        response_id, _ = self._read()
+        if response_id == -1:
+            self.close(); raise PermissionError("RCON authentication failed")
+    def _read(self):
+        size = struct.unpack("<i", recv_exact(self.sock, 4))[0]
+        payload = recv_exact(self.sock, size)
+        request_id, packet_type = struct.unpack("<ii", payload[:8])
+        return request_id, payload[8:-2].decode("utf-8", errors="replace")
+    def send(self, command):
+        self.request_id += 1
+        self.sock.sendall(encode_packet(self.request_id, 2, command))
+        response_id, body = self._read()
+        if response_id != self.request_id: raise RuntimeError("RCON response mismatch")
+        return body
+    def close(self):
+        try: self.sock.close()
+        except Exception: pass
+
+def force_save_on():
+    client = Rcon()
+    try: client.send("save-on")
+    finally: client.close()
+
+def restore_saves(client, timeout_seconds=120):
+    deadline = time.monotonic() + timeout_seconds
+    last_error = None
+    if client is not None:
+        try:
+            client.send("save-on"); return
+        except Exception as error:
+            last_error = error
+    while time.monotonic() < deadline:
+        try:
+            force_save_on(); return
+        except Exception as error:
+            last_error = error
+            time.sleep(1)
+    raise RuntimeError("save-on could not be restored before the deadline") from last_error
+
+def recover_saves_on_startup():
+    # A request may have disabled saves immediately before this container was
+    # restarted. Keep retrying until Minecraft accepts save-on; otherwise a
+    # long RCON outage could leave the live world unsaved indefinitely.
+    while True:
+        try:
+            force_save_on(); return
+        except Exception:
+            time.sleep(1)
 
 def source_manifest():
     paths = []
@@ -354,16 +602,24 @@ def parse_since_ns(value):
     return parsed
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\\n" % (self.address_string(), fmt % args))
+    def send_bytes(self, status, body):
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
     def do_GET(self):
         if urllib.parse.urlparse(self.path).path == "/health":
-            self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return
-        self.send_response(404); self.end_headers()
+            self.send_bytes(200, b"ok"); return
+        self.send_bytes(404, b"not found")
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/backup":
+            self.stream_consistent_backup(); return
         if parsed.path != "/stream":
-            self.send_response(404); self.end_headers(); return
+            self.send_bytes(404, b"not found"); return
         try:
             query = urllib.parse.parse_qs(parsed.query, strict_parsing=True) if parsed.query else {}
             if set(query) - {"delta", "since_ns"}:
@@ -373,7 +629,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise ValueError("delta must equal 1")
             since_ns = parse_since_ns(query.get("since_ns", [None])[0]) if delta else None
         except (ValueError, TypeError) as error:
-            self.send_response(400); self.end_headers(); self.wfile.write(str(error).encode()); return
+            self.send_bytes(400, str(error).encode()); return
 
         snapshot_started_ns = time.time_ns()
         entries = source_manifest()
@@ -381,7 +637,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/x-tar")
         self.send_header("X-Farlands-Snapshot-Started-Ns", str(snapshot_started_ns))
+        self.send_header("Connection", "close")
         self.end_headers()
+        self.close_connection = True
         with tarfile.open(fileobj=self.wfile, mode="w|") as archive:
             info = tarfile.TarInfo(".farlands-source-manifest.json")
             info.size = len(manifest); info.mode = 0o600
@@ -397,8 +655,75 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     continue
                 archive.add(full_path, arcname=relative, recursive=False)
 
+    def stream_consistent_backup(self):
+        if not BACKUP_LOCK.acquire(blocking=False):
+            self.send_bytes(409, b"backup already active"); return
+        client = None
+        response_started = False
+        archive_complete = False
+        save_on_error = None
+        try:
+            if not os.path.isdir(BACKUP_ROOT): raise FileNotFoundError("backup root is missing")
+            rollback_root = os.path.join(BACKUP_ROOT, ".farlands-restore-rollback")
+            if os.path.isdir(rollback_root) and any(os.scandir(rollback_root)):
+                raise RuntimeError("manual restore recovery data must be resolved before backup")
+            client = Rcon()
+            client.send("save-off")
+            client.send("save-all flush")
+            proc = subprocess.Popen(
+                [
+                    "tar", "-C", BACKUP_ROOT,
+                    "--exclude=./.farlands-restore-staging",
+                    "--exclude=./.farlands-restore-rollback",
+                    "-czf", "-", "."
+                ],
+                stdout=subprocess.PIPE,
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers(); response_started = True
+            assert proc.stdout is not None
+            try:
+                while True:
+                    chunk = proc.stdout.read(1024 * 256)
+                    if not chunk: break
+                    self.wfile.write(("%X\\r\\n" % len(chunk)).encode("ascii"))
+                    self.wfile.write(chunk); self.wfile.write(b"\\r\\n")
+            finally:
+                proc.stdout.close(); proc.wait()
+            if proc.returncode != 0: raise RuntimeError("backup tar failed with exit %s" % proc.returncode)
+            archive_complete = True
+        except Exception as error:
+            sys.stderr.write("consistent backup failed: %s\\n" % error)
+            if not response_started:
+                self.send_bytes(503, b"backup unavailable")
+        finally:
+            try:
+                restore_saves(client)
+            except Exception as error:
+                save_on_error = error
+                sys.stderr.write("failed to restore save-on: %s\\n" % error)
+            if client is not None: client.close()
+            BACKUP_LOCK.release()
+        if response_started:
+            if archive_complete and save_on_error is None:
+                self.wfile.write(b"0\\r\\n\\r\\n"); self.wfile.flush()
+            else:
+                self.close_connection = True
+        if save_on_error is not None:
+            sys.stderr.write("restarting sidecar after save-on recovery failure\\n")
+            os._exit(1)
+
+# Do not accept backup or cutover streams until save-on is confirmed. Serving
+# concurrently with startup recovery could re-enable saving during an archive.
+recover_saves_on_startup()
 http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 `;
+}
+
+export function buildWorldSyncScripts(): { sender: string; receiver: string } {
+  const sender = buildWorldSyncSenderScript();
 
   const receiver = `#!/usr/bin/env python3
 import json, os, posixpath, sys, tarfile, urllib.parse, urllib.request
@@ -530,7 +855,10 @@ mark_complete(boundary)
   return { sender, receiver };
 }
 
-async function ensureWorldSyncConfigMap(core: k8s.CoreV1Api, namespace: string): Promise<void> {
+export async function ensureWorldSyncConfigMap(
+  core: k8s.CoreV1Api,
+  namespace: string,
+): Promise<void> {
   const { sender, receiver } = buildWorldSyncScripts();
 
   const body: k8s.V1ConfigMap = {
@@ -545,10 +873,27 @@ async function ensureWorldSyncConfigMap(core: k8s.CoreV1Api, namespace: string):
     await core.createNamespacedConfigMap({ namespace, body });
   } catch (error) {
     if (!alreadyExists(error)) throw error;
+    const existing = await core.readNamespacedConfigMap({
+      name: "cm-world-sync",
+      namespace,
+    });
+    const desiredData = {
+      ...existing.data,
+      ...body.data,
+    };
+    if (
+      existing.data?.["sender.py"] === desiredData["sender.py"] &&
+      existing.data?.["receiver.py"] === desiredData["receiver.py"]
+    ) {
+      return;
+    }
     await core.replaceNamespacedConfigMap({
       name: "cm-world-sync",
       namespace,
-      body,
+      body: {
+        ...existing,
+        data: desiredData,
+      },
     });
   }
 }
@@ -556,18 +901,37 @@ async function ensureWorldSyncConfigMap(core: k8s.CoreV1Api, namespace: string):
 export async function ensureTenantNamespace(
   userId: string,
   clients: KubernetesClients = makeKubernetesClients(),
+  assertMutationAllowed: () => Promise<void> = async () => {},
 ): Promise<string> {
   const namespace = tenantNamespace(userId);
   const quota = await quotaMirrorForUser(userId);
 
+  await assertMutationAllowed();
   await ensureNamespace(clients.core, namespace, userId);
+  await assertMutationAllowed();
+  await ensureBackupWorkerIdentity(clients.core, namespace);
+  await assertMutationAllowed();
+  await ensureBackupOrchestratorAccess(clients.rbac, namespace);
+  await assertMutationAllowed();
   await upsertQuota(clients.core, namespace, quota);
+  await assertMutationAllowed();
   await ensureLimitRange(clients.core, namespace);
+  await assertMutationAllowed();
   await ensureDefaultDeny(clients.networking, namespace);
+  await assertMutationAllowed();
   await ensureArtifactServiceAccount(clients.core, namespace);
+  await assertMutationAllowed();
   await ensureRconSecret(clients.core, namespace);
+  await assertMutationAllowed();
   await copyVelocitySecret(clients.core, namespace);
+  await assertMutationAllowed();
   await ensureWorldSyncConfigMap(clients.core, namespace);
 
   return namespace;
 }
+
+export const tenancyManifestTestUtils = {
+  buildResourceQuota,
+  buildLimitRange,
+  buildBackupWorkerServiceAccount,
+};

@@ -133,6 +133,8 @@ export function makeKubernetesClients() {
       apps: kubeConfig.makeApiClient(k8s.AppsV1Api),
       networking: kubeConfig.makeApiClient(k8s.NetworkingV1Api),
       batch: kubeConfig.makeApiClient(k8s.BatchV1Api),
+      coordination: kubeConfig.makeApiClient(k8s.CoordinationV1Api),
+      rbac: kubeConfig.makeApiClient(k8s.RbacAuthorizationV1Api),
     };
   }
 
@@ -148,5 +150,7 @@ export function makeKubernetesClients() {
     apps: new k8s.AppsV1Api(clientConfig),
     networking: new k8s.NetworkingV1Api(clientConfig),
     batch: new k8s.BatchV1Api(clientConfig),
+    coordination: new k8s.CoordinationV1Api(clientConfig),
+    rbac: new k8s.RbacAuthorizationV1Api(clientConfig),
   };
 }

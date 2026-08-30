@@ -6,6 +6,7 @@ import {
   backupStatusTone,
   formatBytes,
   formatUtcDateTime,
+  serverCanRestoreBackup,
   weeklyScheduleLabel,
 } from "./backups";
 
@@ -32,5 +33,17 @@ describe("backup presentation helpers", () => {
     );
     expect(formatUtcDateTime("2026-08-30T03:05:00.000Z")).toContain("UTC");
     expect(formatUtcDateTime(null)).toBe("Not yet");
+  });
+
+  test("allows a failed restore to retry without allowing the server to start", () => {
+    expect(
+      serverCanRestoreBackup({
+        currentState: "failed",
+        statusMessage: "Backup restore requires manual recovery before this server can start",
+      }),
+    ).toBe(true);
+    expect(
+      serverCanRestoreBackup({ currentState: "failed", statusMessage: "Provisioning failed" }),
+    ).toBe(false);
   });
 });

@@ -1,3 +1,4 @@
+import type * as k8s from "@kubernetes/client-node";
 import { gameServers, serverConfigs, serverK8s, serverRoutes } from "@repo/db/schema";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
@@ -89,15 +90,23 @@ export async function provisionCandidate(input: {
   const image = await MinecraftUtils.getRuntimeImage(config.version ?? "latest");
   const mem = calculateContainerMemory(config.ramMb);
   const labels = {
+    // Keep candidate Pods outside every live Service selector. The separate
+    // backup-server-id label lets weekly discovery follow this workload only
+    // after its PVC is marked active during promotion.
     "app.kubernetes.io/name": "farlands-candidate",
     "app.kubernetes.io/managed-by": "farlands-backend",
     "farlands.dev/server-id": `${input.liveServerId}-cand`,
+    "farlands.dev/backup-server-id": input.liveServerId,
     "farlands.dev/live-server-id": input.liveServerId,
     "farlands.dev/deployment-id": input.deploymentId,
     "farlands.dev/role": "candidate",
     "farlands.dev/artifact": input.artifactDigest.slice("sha256:".length, 19),
   };
-  const annotations = { "farlands.dev/rule-artifact-digest": input.artifactDigest };
+  const annotations = {
+    "farlands.dev/rule-artifact-digest": input.artifactDigest,
+    "farlands.dev/server-config-version": config.updatedAt.toISOString(),
+    "farlands.dev/backup-service": names.service,
+  };
   const artifactLoader = buildArtifactLoader(input);
   const worldSyncImage = requiredPinnedImage("FARLANDS_WORLD_SYNC_IMAGE");
 
@@ -205,6 +214,7 @@ export async function provisionCandidate(input: {
                   },
                 ],
               },
+              buildCandidateWorldSyncSidecar(),
             ],
             volumes: [
               {
@@ -239,6 +249,11 @@ export async function provisionCandidate(input: {
     },
   });
 
+  await clients.networking.createNamespacedNetworkPolicy({
+    namespace,
+    body: buildCandidateNetworkPolicy(namespace, names.networkPolicy, labels, input.deploymentId),
+  });
+
   await waitForDeploymentReplicasReady(clients.apps, names.deployment, namespace, 1, {
     timeoutMs: 240_000,
   });
@@ -252,6 +267,126 @@ export async function provisionCandidate(input: {
     liveServiceName: k8sRow.serviceName,
     livePvcName: k8sRow.pvcName,
     liveProxyTarget: routeRow.proxyTarget,
+  };
+}
+
+export async function assertCandidateConfigCurrent(input: {
+  serverId: string;
+  namespace: string | null;
+  candidateDeployment: string | null;
+}): Promise<void> {
+  if (!input.namespace || !input.candidateDeployment) {
+    throw new Error("Candidate configuration checkpoints are incomplete");
+  }
+  const [current] = await db
+    .select({ updatedAt: serverConfigs.updatedAt })
+    .from(serverConfigs)
+    .where(eq(serverConfigs.serverId, input.serverId))
+    .limit(1);
+  if (!current) throw new Error(`Server ${input.serverId} has no current config`);
+
+  const { apps } = makeKubernetesClients();
+  const candidate = await apps.readNamespacedDeployment({
+    name: input.candidateDeployment,
+    namespace: input.namespace,
+  });
+  const snapshottedAt = candidate.metadata?.annotations?.["farlands.dev/server-config-version"];
+  if (snapshottedAt !== current.updatedAt.toISOString()) {
+    throw new Error(
+      "Server configuration changed after candidate provisioning; rebuild the candidate before cutover",
+    );
+  }
+}
+
+export function buildCandidateWorldSyncSidecar() {
+  return {
+    name: "world-sync",
+    image: requiredPinnedImage("FARLANDS_WORLD_SYNC_IMAGE"),
+    imagePullPolicy: "IfNotPresent" as const,
+    command: ["python3", "/sync/sender.py"],
+    ports: [{ name: "world-sync", containerPort: WORLD_SYNC_PORT, protocol: "TCP" }],
+    env: [
+      { name: "WORLD_SYNC_PORT", value: String(WORLD_SYNC_PORT) },
+      { name: "WORLD_ROOT", value: WORLD_SYNC_ROOT },
+      { name: "WORLD_NAMES", value: WORLD_SYNC_NAMES },
+      { name: "BACKUP_ROOT", value: "/data" },
+      { name: "RCON_HOST", value: "127.0.0.1" },
+      { name: "RCON_PORT", value: "25575" },
+      { name: "RCON_PASSWORD_FILE", value: "/run/secrets/rcon/password" },
+      { name: "PYTHONDONTWRITEBYTECODE", value: "1" },
+    ],
+    resources: {
+      requests: { cpu: "50m", memory: "64Mi" },
+      limits: { cpu: "200m", memory: "128Mi" },
+    },
+    securityContext: {
+      allowPrivilegeEscalation: false,
+      capabilities: { drop: ["ALL"] },
+      readOnlyRootFilesystem: true,
+      runAsNonRoot: true,
+      runAsUser: 1000,
+      runAsGroup: 1000,
+    },
+    volumeMounts: [
+      { name: "server-data", mountPath: "/data", readOnly: true },
+      { name: "world-sync", mountPath: "/sync", readOnly: true },
+      { name: "rcon", mountPath: "/run/secrets/rcon", readOnly: true },
+    ],
+  } satisfies k8s.V1Container;
+}
+
+function buildCandidateNetworkPolicy(
+  namespace: string,
+  name: string,
+  labels: Record<string, string>,
+  deploymentId: string,
+): k8s.V1NetworkPolicy {
+  const sharedFrom = {
+    namespaceSelector: { matchLabels: { "farlands.dev/shared": "true" } },
+  };
+  return {
+    metadata: { name, namespace, labels },
+    spec: {
+      podSelector: { matchLabels: { "farlands.dev/deployment-id": deploymentId } },
+      policyTypes: ["Ingress"],
+      ingress: [
+        {
+          from: [
+            {
+              namespaceSelector: {
+                matchLabels: { "kubernetes.io/metadata.name": "infra-team" },
+              },
+              podSelector: { matchLabels: { app: "velocity-proxy" } },
+            },
+            sharedFrom,
+          ],
+          ports: [{ protocol: "TCP", port: SERVER_PORT }],
+        } as unknown as k8s.V1NetworkPolicyIngressRule,
+        {
+          from: [
+            {
+              namespaceSelector: {
+                matchLabels: { "kubernetes.io/metadata.name": "dev-deployment" },
+              },
+              podSelector: { matchLabels: { app: "farlands-backend" } },
+            },
+            sharedFrom,
+          ],
+          ports: [{ protocol: "TCP", port: 25575 }],
+        } as unknown as k8s.V1NetworkPolicyIngressRule,
+        {
+          from: [
+            { podSelector: { matchLabels: { app: "server-backup-worker" } } },
+            {
+              podSelector: {
+                matchLabels: { "app.kubernetes.io/name": "farlands-game-server" },
+              },
+            },
+          ],
+          ports: [{ protocol: "TCP", port: WORLD_SYNC_PORT }],
+        } as unknown as k8s.V1NetworkPolicyIngressRule,
+      ],
+    },
   };
 }
 

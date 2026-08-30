@@ -4,7 +4,7 @@ metadata:
   name: farlands-live-backend
 rules:
   - apiGroups: [""]
-    resources: [namespaces, secrets, configmaps, services, pods, pods/log, persistentvolumeclaims, resourcequotas, limitranges]
+    resources: [namespaces, serviceaccounts, secrets, configmaps, services, pods, pods/log, persistentvolumeclaims, resourcequotas, limitranges]
     verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups: [apps]
     resources: [deployments]
@@ -13,8 +13,14 @@ rules:
     resources: [networkpolicies]
     verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups: [batch]
-    resources: [jobs]
+    resources: [jobs, cronjobs]
     verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update, delete]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [rolebindings]
+    verbs: [get, create, update, patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

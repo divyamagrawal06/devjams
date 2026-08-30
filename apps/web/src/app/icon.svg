@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>indexd map mark</title>
+  <rect width="64" height="64" rx="10" fill="#34271f"/>
+  <path fill="#efe1bf" d="M12 14h12v6h8v-6h20v38H40v-6h-8v6H12z"/>
+  <path fill="#7d9b54" d="M18 20h14v20H18zm22 0h6v26h-6z"/>
+  <path fill="#bf704f" d="M24 26h8v8h-8zm16 8h6v6h-6z"/>
+</svg>

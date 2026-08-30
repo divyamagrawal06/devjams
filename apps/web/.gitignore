@@ -1,0 +1,6 @@
+.vercel
+.next
+.next-*
+.playwright-cli
+output
+.env.local

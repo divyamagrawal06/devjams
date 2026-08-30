@@ -25,6 +25,7 @@ import {
 } from "@/lib/api";
 import {
   backupIsBusy,
+  backupRestoreAllowed,
   backupStatusLabel,
   backupStatusTone,
   formatBytes,
@@ -283,7 +284,7 @@ export function BackupsWindow({
   const backupRows = backups.data?.data ?? [];
   const busyBackup = backupRows.find((backup) => backupIsBusy(backup));
   const serverRunning = selectedServer.currentState === "running";
-  const serverStopped = ["ready", "stopped"].includes(selectedServer.currentState);
+  const serverStopped = backupRestoreAllowed(selectedServer.currentState);
   const serverCanStop = selectedServer.currentState === "running";
   const stopReceiptStatus = stopRealm.data?.data.receipt.status;
   const stopReceiptOutcome = stopReceiptStatus ? operatorReceiptOutcome(stopReceiptStatus) : null;
@@ -639,8 +640,18 @@ export function BackupsWindow({
                       {!serverStopped ? (
                         <div className="restore-prerequisite">
                           <p>
-                            <strong>Stop the workload first.</strong> Stopping disconnects current
-                            players. It does not begin the restore.
+                            {selectedServer.currentState === "ready" ? (
+                              <>
+                                <strong>Start, then stop the workload first.</strong> Restore stays
+                                locked until the control plane has observed the exact stopped state
+                                required by the backend.
+                              </>
+                            ) : (
+                              <>
+                                <strong>Stop the workload first.</strong> Stopping disconnects
+                                current players. It does not begin the restore.
+                              </>
+                            )}
                           </p>
                           <button
                             className="backup-stop-action"
@@ -667,7 +678,9 @@ export function BackupsWindow({
                                   ? "Stop completed; refreshing"
                                   : serverCanStop
                                     ? `Stop ${selectedServer.name}`
-                                    : `Wait for ${humanizeState(selectedServer.currentState)}`}
+                                    : selectedServer.currentState === "ready"
+                                      ? "Start in Operator Home first"
+                                      : `Wait for ${humanizeState(selectedServer.currentState)}`}
                           </button>
                         </div>
                       ) : (

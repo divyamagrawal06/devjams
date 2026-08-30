@@ -4,10 +4,8 @@ import { useQuery } from "@tanstack/react-query";
 import { motion, type PanInfo, useDragControls, useReducedMotion } from "framer-motion";
 import {
   Archive,
-  Check,
   ChevronRight,
   CircleAlert,
-  Clipboard,
   ClipboardCheck,
   Cpu,
   Database,
@@ -27,12 +25,13 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { api, joinAddress, type LiveListResponse, type LiveServer } from "@/lib/api";
+import { api, type LiveListResponse, type QuotaResponse } from "@/lib/api";
 import { authClient } from "@/lib/auth-client";
 import { desktopWindowForRoute, isDesktopApp } from "@/lib/routes";
 import { AllayCompanion } from "./allay-companion";
 import { BackupsWindow } from "./backups-window";
 import { BillingPanel } from "./billing-panel";
+import { OperatorHome } from "./operator-home";
 import { PanoramaBackground } from "./panorama-background";
 import { ReviewQueueWindow } from "./review-queue-window";
 import { RuleForgeWindow } from "./rule-forge-window";
@@ -53,23 +52,6 @@ type HealthResponse = {
   db?: string;
 };
 
-type QuotaUsage = {
-  cpuLimit: string | number;
-  cpuUsed: string | number;
-  ramLimitMb: number;
-  ramUsedMb: number;
-  storageLimitGb: number;
-  storageUsedGb: number;
-  serversLimit: number;
-  serversUsed: number;
-  deploymentHeadroomReserved?: boolean;
-};
-
-type QuotaResponse = {
-  success: boolean;
-  data: QuotaUsage;
-};
-
 type WindowState = {
   appId: AppId;
   x: number;
@@ -85,18 +67,6 @@ const initialWindows: WindowState[] = [
 
 function nextWindowZ(items: WindowState[]) {
   return Math.max(0, ...items.map((item) => item.z)) + 1;
-}
-
-function stateTone(state: string) {
-  const normalized = state.toLowerCase();
-  if (normalized === "running" || normalized === "ready") return "good";
-  if (normalized === "failed" || normalized === "error") return "bad";
-  if (normalized === "stopped" || normalized === "sleeping") return "quiet";
-  return "working";
-}
-
-function humanize(value: string) {
-  return value.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 function firstName(name: string | null | undefined, email: string | undefined) {
@@ -168,98 +138,11 @@ function DesktopClock() {
   );
 }
 
-function LoadingRows() {
-  return (
-    <div className="realm-list" role="status">
-      <span className="sr-only">Loading realms</span>
-      {[0, 1, 2].map((item) => (
-        <div className="realm-skeleton" key={item}>
-          <span />
-          <div>
-            <span />
-            <span />
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function RealmRow({
-  copied,
-  copyError,
-  onBackups,
-  onCopy,
-  server,
-}: {
-  copied: boolean;
-  copyError: boolean;
-  onBackups: (server: LiveServer) => void;
-  onCopy: (server: LiveServer) => void;
-  server: LiveServer;
-}) {
-  const address = joinAddress(server);
-  const routable = Boolean(server.hostname);
-  const detail = [server.type, server.version, server.game].filter(Boolean).join(" · ");
-  const desiredDiffers = server.desiredState && server.desiredState !== server.currentState;
-
-  return (
-    <article className="realm-row">
-      <span className={`status-dot ${stateTone(server.currentState)}`} aria-hidden="true" />
-      <div className="realm-main">
-        <div className="realm-name-line">
-          <h3>{server.name}</h3>
-          <span className={`state-label ${stateTone(server.currentState)}`}>
-            {humanize(server.currentState)}
-          </span>
-        </div>
-        <p className={routable ? "realm-address" : "realm-address pending"}>{address}</p>
-        <p className="realm-meta">
-          {detail || "Server details pending"}
-          {desiredDiffers ? ` · Target ${humanize(server.desiredState)}` : ""}
-        </p>
-        {server.statusMessage ? <p className="realm-message">{server.statusMessage}</p> : null}
-      </div>
-      <div className="realm-actions">
-        <button
-          aria-label={
-            routable ? `Copy address for ${server.name}` : `Address pending for ${server.name}`
-          }
-          className="copy-button"
-          disabled={!routable}
-          onClick={() => onCopy(server)}
-          type="button"
-        >
-          {copied ? <Check size={16} /> : <Clipboard size={16} />}
-          <span>{copied ? "Copied" : routable ? "Copy" : "Pending"}</span>
-        </button>
-        <button
-          aria-label={`Open backups for ${server.name}`}
-          className="copy-button"
-          onClick={() => onBackups(server)}
-          type="button"
-        >
-          <Archive aria-hidden="true" size={16} />
-          <span>Backups</span>
-        </button>
-      </div>
-      {copyError ? (
-        <span className="copy-error" role="alert">
-          Copy failed
-        </span>
-      ) : null}
-    </article>
-  );
-}
-
 type WindowBodyProps = {
   appId: AppId;
-  copiedServerId: string | null;
-  copyErrorServerId: string | null;
   health: ReturnType<typeof useQuery<HealthResponse>>;
   onOpenBackups: (serverId: string) => void;
   onOpenReview: (changeId: string) => void;
-  onCopy: (server: LiveServer) => void;
   onSelectChange: (changeId: string) => void;
   onSelectBackupServer: (serverId: string) => void;
   quota: ReturnType<typeof useQuery<QuotaResponse>>;
@@ -278,10 +161,7 @@ type WindowBodyProps = {
 
 function WindowBody({
   appId,
-  copiedServerId,
-  copyErrorServerId,
   health,
-  onCopy,
   onOpenBackups,
   onOpenReview,
   onSelectChange,
@@ -296,66 +176,23 @@ function WindowBody({
   user,
 }: WindowBodyProps) {
   if (appId === "realms") {
-    const realmCount = servers.data?.data.length;
     return (
-      <>
-        <div className="window-hero">
-          <p className="eyebrow">
-            {realmCount === undefined
-              ? "Checking your realm scope"
-              : `${realmCount} ${realmCount === 1 ? "realm" : "realms"} assigned`}
-          </p>
-          <h2>Welcome, {firstName(user?.name, user?.email)}.</h2>
-          <p>
-            {health.isError
-              ? "The connector is unavailable, so realm status may not be loaded."
-              : health.data?.status === "ok"
-                ? "Status below comes directly from the live control plane."
-                : "Opening a secure connection to the control plane."}
-          </p>
-        </div>
-
-        {servers.isPending ? <LoadingRows /> : null}
-
-        {servers.isError ? (
-          <div className="query-state error-state" role="alert">
-            <WifiOff aria-hidden="true" size={24} />
-            <div>
-              <h3>Realm data could not be loaded</h3>
-              <p>Your session is still active. Retry the connector without signing in again.</p>
-            </div>
-            <button className="inline-action" onClick={() => void servers.refetch()} type="button">
-              <RefreshCw size={15} /> Retry
-            </button>
-          </div>
-        ) : null}
-
-        {servers.data?.data.length === 0 ? (
-          <div className="empty-state">
-            <Server aria-hidden="true" size={29} />
-            <h3>No realms assigned to this account</h3>
-            <p>
-              When a realm is created for this Google account, its live state and join address will
-              appear here.
-            </p>
-          </div>
-        ) : null}
-
-        {servers.data?.data.length ? (
-          <div className="realm-list">
-            {servers.data.data.map((server) => (
-              <RealmRow
-                copied={copiedServerId === server.id}
-                copyError={copyErrorServerId === server.id}
-                key={server.id}
-                onBackups={(selectedServer) => onOpenBackups(selectedServer.id)}
-                onCopy={onCopy}
-                server={server}
-              />
-            ))}
-          </div>
-        ) : null}
-      </>
+      <OperatorHome
+        connectorState={
+          health.isError ? "unavailable" : health.data?.status === "ok" ? "connected" : "checking"
+        }
+        onOpenRecovery={onOpenBackups}
+        operatorName={firstName(user?.name, user?.email)}
+        quota={quota.data?.data ?? null}
+        quotaError={quota.isError}
+        quotaPending={quota.isPending}
+        refreshQuota={() => quota.refetch()}
+        refreshServers={() => servers.refetch()}
+        servers={servers.data?.data ?? []}
+        serversError={servers.isError}
+        serversObservedAt={servers.dataUpdatedAt}
+        serversPending={servers.isPending}
+      />
     );
   }
 
@@ -466,7 +303,7 @@ function WindowBody({
           <dl className="quota-list">
             <div>
               <dt>
-                <Server aria-hidden="true" size={17} /> Realms
+                <Server aria-hidden="true" size={17} /> Workloads
               </dt>
               <dd>
                 {quotaData.serversUsed} of {quotaData.serversLimit}
@@ -623,8 +460,6 @@ export function Desktop() {
   const [windows, setWindows] = useState<WindowState[]>(initialWindows);
   const [selectedBackupServerId, setSelectedBackupServerId] = useState<string | null>(null);
   const [selectedChangeId, setSelectedChangeId] = useState<string | null>(null);
-  const [copiedServerId, setCopiedServerId] = useState<string | null>(null);
-  const [copyErrorServerId, setCopyErrorServerId] = useState<string | null>(null);
   const [signingOut, setSigningOut] = useState(false);
   const [signOutError, setSignOutError] = useState<string | null>(null);
 
@@ -708,18 +543,18 @@ export function Desktop() {
     return [
       {
         id: "realms",
-        label: "My Realms",
+        label: "Operator Home",
         detail:
           realmCount === undefined
             ? "Checking…"
-            : `${realmCount} ${realmCount === 1 ? "realm" : "realms"}`,
+            : `${realmCount} ${realmCount === 1 ? "workload" : "workloads"}`,
         icon: Server,
         color: "oklch(0.55 0.09 54)",
       },
       {
         id: "backups",
-        label: "Backups",
-        detail: realmCount === 0 ? "No realms" : "Recovery points",
+        label: "Recovery Center",
+        detail: realmCount === 0 ? "No workloads" : "Snapshots and rollback",
         icon: Archive,
         color: "oklch(0.58 0.09 86)",
       },
@@ -833,19 +668,6 @@ export function Desktop() {
       }),
     );
 
-  async function copyAddress(server: LiveServer) {
-    if (!server.hostname) return;
-    setCopyErrorServerId(null);
-    try {
-      await navigator.clipboard.writeText(joinAddress(server));
-      setCopiedServerId(server.id);
-      window.setTimeout(() => setCopiedServerId(null), 2_000);
-    } catch {
-      setCopyErrorServerId(server.id);
-      window.setTimeout(() => setCopyErrorServerId(null), 3_000);
-    }
-  }
-
   async function signOut() {
     setSigningOut(true);
     setSignOutError(null);
@@ -873,8 +695,8 @@ export function Desktop() {
       ? totalCount === undefined
         ? "Control plane connected"
         : totalCount === 0
-          ? "Connected, no realms yet"
-          : `${runningCount} of ${totalCount} realms running`
+          ? "Connected, no workloads yet"
+          : `${runningCount} of ${totalCount} workloads running`
       : "Connecting to control plane";
 
   return (
@@ -946,10 +768,7 @@ export function Desktop() {
             >
               <WindowBody
                 appId={windowState.appId}
-                copiedServerId={copiedServerId}
-                copyErrorServerId={copyErrorServerId}
                 health={health}
-                onCopy={copyAddress}
                 onOpenBackups={openBackups}
                 onOpenReview={openReview}
                 onSelectChange={setSelectedChangeId}
@@ -979,7 +798,7 @@ export function Desktop() {
 
       <footer className="desktop-taskbar">
         <button className="start-button" onClick={() => open("realms")} type="button">
-          <ChevronRight aria-hidden="true" size={16} /> My Realms
+          <ChevronRight aria-hidden="true" size={16} /> Operator Home
         </button>
         <div className="taskbar-apps" aria-label="Open applications" role="toolbar">
           {windows.map((windowState) => {
@@ -1007,9 +826,6 @@ export function Desktop() {
           Checking account…
         </div>
       ) : null}
-      <span className="sr-only" aria-live="polite">
-        {copiedServerId ? "Server address copied" : ""}
-      </span>
     </main>
   );
 }

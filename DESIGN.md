@@ -97,6 +97,32 @@ and error behavior when those states apply.
 - Approval surfaces show the exact principal, operation, target, digest, expiry, and redemption
   status.
 
+### Operator Home and Onboarding
+
+- Operator Home is the first-workload and daily-control surface. It reports the last successful
+  observation separately from connection health and disables power controls when that observation
+  is stale.
+- Workload creation reads the backend capability catalogue. Unavailable dedicated-game, Node, and
+  bounded-container connectors remain visible but cannot be selected.
+- Before creation, show the account-wide projected workload, CPU, memory, and storage totals. A
+  failed workload still owns capacity until it is deleted.
+- Start, stop, and restart requests use a stable browser request key and return a durable receipt.
+  A transport error keeps the key for safe retry.
+- Maintenance windows are planning records only. Scheduling one never executes or approves an
+  operation. Notification preferences are in-app only until an external delivery connector exists.
+
+### Recovery and Billing
+
+- Recovery Center names snapshot restore and rule rollback as separate systems. Snapshot restore
+  replaces world data and requires an explicit data-loss acknowledgement; rule rollback follows
+  the reviewed deployment ledger.
+- Billing state changes only from a verified provider webhook. Checkout return URLs are status
+  hints, never entitlement authority.
+- Billing surfaces distinguish active, bounded grace, starter, over-quota, and reconciliation
+  states. Downgrades preserve existing workloads and block only new allocation until usage fits.
+- An uncertain checkout remains visible and reuses its request key. Never offer a second invisible
+  checkout while the first provider outcome is unknown.
+
 ### Review and Trust Surfaces
 
 - Rule Forge creates a bounded Minecraft rule draft and never deploys it.

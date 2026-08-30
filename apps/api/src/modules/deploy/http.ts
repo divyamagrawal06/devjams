@@ -8,7 +8,13 @@ import {
 import { AuthService } from "../auth/service";
 import { RulesService } from "../rules/service";
 import { ServerService } from "../servers/service";
-import { abortDeployment, enqueueDeploy, getDeployment, rollbackServer } from "./controller";
+import {
+  abortDeployment,
+  enqueueDeploy,
+  getDeployment,
+  rollbackServer,
+  rollbackTargetError,
+} from "./controller";
 
 export async function ownsDeploymentTarget(
   userId: string,
@@ -115,6 +121,16 @@ export const deployModule = new Elysia({ name: "authenticated-deployments" })
       if (!(await ownsDeploymentTarget(identity.userId, params.id))) {
         set.status = 404;
         return notFound({ tool: "rollback", resource: `server ${params.id}` });
+      }
+
+      const targetError = await rollbackTargetError(
+        params.id,
+        String(body.rule_set_version),
+        body.content_digest,
+      );
+      if (targetError) {
+        set.status = 409;
+        return { error: targetError };
       }
 
       try {

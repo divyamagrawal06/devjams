@@ -118,6 +118,10 @@ test("freeze protocol has exact save ordering and deletion-aware delta provenanc
     join(root, "apps", "api", "src", "modules", "provisioning", "tenancy.ts"),
     "utf8",
   );
+  const cutover = readFileSync(
+    join(root, "apps", "api", "src", "modules", "deploy", "cutover.ts"),
+    "utf8",
+  );
   expect(freeze.indexOf('client.command("save-off")')).toBeLessThan(
     freeze.indexOf('client.command("save-all flush")'),
   );
@@ -128,7 +132,12 @@ test("freeze protocol has exact save ordering and deletion-aware delta provenanc
     freeze.lastIndexOf('client.command("save-on")'),
   );
   expect(tenancy).toContain(".farlands-source-manifest.json");
-  expect(tenancy).toContain('query.get("since"');
+  expect(tenancy).toContain('query.get("since_ns"');
+  expect(tenancy).toContain("metadata.st_mtime_ns <= since_ns");
+  expect(tenancy).toContain('response.headers.get("X-Farlands-Snapshot-Started-Ns"');
+  expect(cutover).toContain('name: "WORLD_SYNC_SINCE_FILE"');
+  expect(cutover).toContain('"/data/.farlands-presync-complete"');
+  expect(cutover).not.toContain('checkpoint(row, "presyncCompletedAt")');
   expect(tenancy).toContain("relative not in expected");
   expect(tenancy).toContain('MARKER = os.environ.get("WORLD_SYNC_MARKER")');
   expect(tenancy).toContain('WORLD_SYNC_NAMES = "world,world_nether,world_the_end"');

@@ -41,7 +41,6 @@ export function describeDocumentChange(
 
   return paths
     .filter((path) => previous.get(path) !== next.get(path))
-    .slice(0, 100)
     .map((path) => {
       const oldValue = previous.get(path) ?? null;
       const newValue = next.get(path) ?? null;

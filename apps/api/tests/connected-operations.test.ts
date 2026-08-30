@@ -45,6 +45,17 @@ describe("connected change review", () => {
     ]);
   });
 
+  test("never hides changed paths behind a presentation cap", () => {
+    const document = Object.fromEntries(
+      Array.from({ length: 125 }, (_, index) => [`field_${String(index).padStart(3, "0")}`, index]),
+    );
+    const diff = describeDocumentChange(null, document);
+
+    expect(diff).toHaveLength(125);
+    expect(diff[0]?.path).toBe("document.field_000");
+    expect(diff.at(-1)?.path).toBe("document.field_124");
+  });
+
   test("approval accepts only a strong exact artifact digest precondition", () => {
     const digest = `sha256:${"a".repeat(64)}`;
     expect(reviewedDigestFromIfMatch(digest)).toBe(digest);
@@ -102,7 +113,7 @@ describe("connected change review", () => {
     expect(migration).toContain("control_plane_events_server_id_idx");
   });
 
-  test("commits approval and the runnable queue record on one database transaction", () => {
+  test("commits approval redemption and the runnable queue record on one database transaction", () => {
     const service = readFileSync(
       join(import.meta.dir, "..", "src", "modules", "changes", "service.ts"),
       "utf8",
@@ -113,9 +124,27 @@ describe("connected change review", () => {
     );
 
     expect(service).toContain("createDeploymentRecordInTransaction(");
+    expect(service).toContain("redeemOperationApprovalInTransaction(tx");
+    expect(service).not.toContain("operationApprovalService.redeem(");
     expect(service).toContain("await admitQueuedDeployments();");
     expect(service).not.toContain("await enqueueDeploy(");
     expect(store).toContain("Inserts the queue row and both receipt streams");
+  });
+
+  test("queries a change timeline by durable identity before ordering", () => {
+    const service = readFileSync(
+      join(import.meta.dir, "..", "src", "modules", "changes", "service.ts"),
+      "utf8",
+    );
+    const timelineQuery = service.slice(
+      service.indexOf("const timelineIdentity"),
+      service.indexOf("return {", service.indexOf("const timelineIdentity")),
+    );
+
+    expect(timelineQuery).toContain("controlPlaneEvents.data}->>'change_id'");
+    expect(timelineQuery).toContain("controlPlaneEvents.data}->>'deployment_id'");
+    expect(timelineQuery).not.toContain(".limit(500)");
+    expect(timelineQuery).not.toContain(".filter(");
   });
 });
 

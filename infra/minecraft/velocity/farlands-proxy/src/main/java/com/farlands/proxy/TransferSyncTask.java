@@ -65,14 +65,15 @@ public final class TransferSyncTask implements Runnable {
             );
             if (transfers == null) return;
             for (TransferInstruction transfer : transfers) {
-                if (transfer.transferId == null) continue;
-                AckBody cached = completed.get(transfer.transferId);
+                if (transfer.transferId == null || transfer.attempt < 1) continue;
+                String attemptKey = attemptKey(transfer.transferId, transfer.attempt);
+                AckBody cached = completed.get(attemptKey);
                 if (cached != null) {
                     ack(transfer.transferId, cached);
                     continue;
                 }
                 AckBody result = execute(transfer);
-                remember(transfer.transferId, result);
+                remember(attemptKey, result);
                 ack(transfer.transferId, result);
             }
         } catch (Exception ex) {
@@ -198,6 +199,13 @@ public final class TransferSyncTask implements Runnable {
         failure.player = player;
         failure.reason = reason;
         return failure;
+    }
+
+    static String attemptKey(String transferId, int attempt) {
+        if (transferId == null || transferId.isBlank() || attempt < 1) {
+            throw new IllegalArgumentException("transfer id and positive attempt are required");
+        }
+        return transferId + ":" + attempt;
     }
 
     static final class RosterBody {

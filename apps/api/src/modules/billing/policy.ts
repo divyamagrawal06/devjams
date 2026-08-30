@@ -35,3 +35,33 @@ export function webhookBindingValid(input: {
       (!input.conflictingUserId || input.conflictingUserId === input.userId),
   );
 }
+
+/**
+ * A signed event may change products through the provider portal without
+ * changing the subscription/customer owner binding. The checkout's original
+ * requested plan is intentionally not part of this durable-binding check.
+ */
+export function subscriptionWebhookBindingValid(input: {
+  userId: string | null;
+  suppliedUserId: string | null;
+  mappedPlan: PaidBillingPlan | null;
+  providerSubscriptionId: string | null;
+  providerCustomerId: string | null;
+  subscription: {
+    userId: string;
+    providerSubscriptionId: string;
+    providerCustomerId: string;
+  } | null;
+}): boolean {
+  return Boolean(
+    input.userId &&
+      input.mappedPlan &&
+      input.providerSubscriptionId &&
+      input.providerCustomerId &&
+      input.subscription &&
+      input.subscription.userId === input.userId &&
+      (!input.suppliedUserId || input.suppliedUserId === input.userId) &&
+      input.subscription.providerSubscriptionId === input.providerSubscriptionId &&
+      input.subscription.providerCustomerId === input.providerCustomerId,
+  );
+}

@@ -6,7 +6,7 @@ import {
   userQuotas,
   users,
 } from "@repo/db";
-import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 
 import { db } from "../../db";
 import { QuotaService } from "../quota/quota.service";
@@ -19,7 +19,12 @@ import {
   quotaValuesForPlan,
   readBillingConfig,
 } from "./config";
-import { type CheckoutState, checkoutDisposition, webhookBindingValid } from "./policy";
+import {
+  type CheckoutState,
+  checkoutDisposition,
+  subscriptionWebhookBindingValid,
+  webhookBindingValid,
+} from "./policy";
 import {
   decideSubscriptionProjection,
   effectivePlan,
@@ -31,6 +36,7 @@ import {
   ProviderDefinitiveError,
   ProviderUncertainError,
 } from "./provider";
+import { reconcileTimeBoundEntitlement } from "./reconciliation";
 import type { VerifiedBillingEvent } from "./webhook";
 
 export class BillingOperationError extends Error {
@@ -90,39 +96,6 @@ function quotaMatchesPlan(quota: typeof userQuotas.$inferSelect, plan: BillingPl
     quota.storageLimitGb === expected.storageLimitGb &&
     quota.backupsLimit === expected.backupsLimit
   );
-}
-
-async function reconcileTimeBoundEntitlement(userId: string, now: Date): Promise<void> {
-  await db.transaction(async (tx) => {
-    const [row] = await tx
-      .select()
-      .from(billingSubscriptions)
-      .where(eq(billingSubscriptions.userId, userId))
-      .for("update");
-    if (!row) return;
-
-    const projection = rowProjection(row);
-    const expiredGrace =
-      projection.entitlementState === "grace" &&
-      projection.graceUntil !== null &&
-      projection.graceUntil <= now;
-    const endedCancellation =
-      projection.entitlementState === "active" &&
-      projection.status === "cancelled" &&
-      projection.cancelAtNextBillingDate &&
-      projection.nextBillingDate !== null &&
-      projection.nextBillingDate <= now;
-    if (!expiredGrace && !endedCancellation) return;
-
-    await tx
-      .update(billingSubscriptions)
-      .set({ entitlementState: "starter", graceUntil: null, updatedAt: now })
-      .where(eq(billingSubscriptions.userId, userId));
-    await tx
-      .update(userQuotas)
-      .set({ ...quotaValuesForPlan("starter"), updatedAt: now })
-      .where(eq(userQuotas.userId, userId));
-  });
 }
 
 export type BillingProviderFactory = (config: BillingConfig) => BillingProvider;
@@ -393,52 +366,80 @@ export abstract class BillingService {
       const mappedPlan = event.providerProductId
         ? planForProduct(event.providerProductId, config.products)
         : null;
-      const requiredFields =
-        event.userId &&
-        event.checkoutId &&
-        event.requestedPlan &&
+      const hasProviderIdentity = Boolean(
         mappedPlan &&
-        event.providerSubscriptionId &&
-        event.providerCustomerId &&
-        event.providerProductId &&
-        event.status;
+          event.providerSubscriptionId &&
+          event.providerCustomerId &&
+          event.providerProductId &&
+          event.status,
+      );
+
+      // Subscription/customer identifiers are provider-signed durable owner
+      // bindings. They let portal plan changes project even when their retained
+      // checkout metadata still names the originally purchased plan.
+      const [subscriptionByProviderId] = hasProviderIdentity
+        ? await tx
+            .select()
+            .from(billingSubscriptions)
+            .where(eq(billingSubscriptions.providerSubscriptionId, event.providerSubscriptionId!))
+            .limit(1)
+        : [];
+      const [subscriptionByCustomerId] = hasProviderIdentity
+        ? await tx
+            .select()
+            .from(billingSubscriptions)
+            .where(eq(billingSubscriptions.providerCustomerId, event.providerCustomerId!))
+            .limit(1)
+        : [];
+      const boundOwnerIds = new Set(
+        [subscriptionByProviderId?.userId, subscriptionByCustomerId?.userId].filter(
+          (candidate): candidate is string => Boolean(candidate),
+        ),
+      );
+      const [inferredBoundOwner] = boundOwnerIds;
+      const suppliedOwnerConflicts = Boolean(
+        event.userId && [...boundOwnerIds].some((boundOwner) => boundOwner !== event.userId),
+      );
+      const providerBindingsConflict = boundOwnerIds.size > 1;
+      const resolvedUserId =
+        suppliedOwnerConflicts || providerBindingsConflict
+          ? null
+          : (event.userId ?? inferredBoundOwner ?? null);
 
       // Events for one owner must project serially. A row-level lock is not
       // sufficient before that owner's first subscription row exists.
-      if (requiredFields && event.userId) {
+      if (hasProviderIdentity && resolvedUserId) {
         await tx.execute(
-          sql`SELECT pg_advisory_xact_lock(hashtext(${`billing-subscription:${event.userId}`}))`,
+          sql`SELECT pg_advisory_xact_lock(hashtext(${`billing-subscription:${resolvedUserId}`}))`,
         );
       }
 
-      const [checkout] = requiredFields
+      const [priorRow] = resolvedUserId
+        ? await tx
+            .select()
+            .from(billingSubscriptions)
+            .where(eq(billingSubscriptions.userId, resolvedUserId))
+            .for("update")
+        : [];
+      const hasCheckoutIdentity = Boolean(
+        hasProviderIdentity && resolvedUserId && event.checkoutId && event.requestedPlan,
+      );
+      const [checkout] = hasCheckoutIdentity
         ? await tx
             .select()
             .from(billingCheckoutSessions)
             .where(
               and(
                 eq(billingCheckoutSessions.id, event.checkoutId!),
-                eq(billingCheckoutSessions.userId, event.userId!),
+                eq(billingCheckoutSessions.userId, resolvedUserId!),
                 eq(billingCheckoutSessions.plan, event.requestedPlan!),
                 inArray(billingCheckoutSessions.state, ["created", "creating", "uncertain"]),
               ),
             )
             .limit(1)
         : [];
-      const [conflictingBinding] = requiredFields
-        ? await tx
-            .select({ userId: billingSubscriptions.userId })
-            .from(billingSubscriptions)
-            .where(
-              or(
-                eq(billingSubscriptions.providerSubscriptionId, event.providerSubscriptionId!),
-                eq(billingSubscriptions.providerCustomerId, event.providerCustomerId!),
-              ),
-            )
-            .limit(1)
-        : [];
-      const bindingValid = webhookBindingValid({
-        userId: event.userId,
+      const checkoutBindingValid = webhookBindingValid({
+        userId: resolvedUserId,
         requestedPlan: event.requestedPlan,
         mappedPlan,
         checkout: checkout
@@ -448,16 +449,24 @@ export abstract class BillingService {
               state: checkout.state as "creating" | "created" | "uncertain",
             }
           : null,
-        conflictingUserId: conflictingBinding?.userId ?? null,
+        conflictingUserId:
+          [...boundOwnerIds].find((boundOwner) => boundOwner !== resolvedUserId) ?? null,
       });
-
-      const [priorRow] = event.userId
-        ? await tx
-            .select()
-            .from(billingSubscriptions)
-            .where(eq(billingSubscriptions.userId, event.userId))
-            .for("update")
-        : [];
+      const durableSubscriptionBindingValid = subscriptionWebhookBindingValid({
+        userId: resolvedUserId,
+        suppliedUserId: event.userId,
+        mappedPlan,
+        providerSubscriptionId: event.providerSubscriptionId,
+        providerCustomerId: event.providerCustomerId,
+        subscription: priorRow
+          ? {
+              userId: priorRow.userId,
+              providerSubscriptionId: priorRow.providerSubscriptionId,
+              providerCustomerId: priorRow.providerCustomerId,
+            }
+          : null,
+      });
+      const bindingValid = checkoutBindingValid || durableSubscriptionBindingValid;
       const decision = decideSubscriptionProjection(
         {
           eventId: event.eventId,
@@ -481,25 +490,32 @@ export abstract class BillingService {
         .update(billingWebhookEvents)
         .set({
           outcome: decision.outcome,
-          userId: bindingValid ? event.userId : null,
+          userId: bindingValid ? resolvedUserId : null,
           processedAt: new Date(),
         })
         .where(eq(billingWebhookEvents.eventId, event.eventId));
       if (decision.outcome !== "applied") return { outcome: decision.outcome };
 
       const projection = decision.projection;
-      await tx
-        .update(billingCheckoutSessions)
-        .set({
-          state: sql`CASE WHEN ${billingCheckoutSessions.state} = 'creating' THEN 'uncertain' ELSE ${billingCheckoutSessions.state} END`,
-          errorCode: sql`CASE WHEN ${billingCheckoutSessions.state} = 'creating' THEN 'reconciled_by_webhook' ELSE ${billingCheckoutSessions.errorCode} END`,
-          updatedAt: new Date(),
-        })
-        .where(eq(billingCheckoutSessions.id, event.checkoutId!));
+      if (event.checkoutId) {
+        await tx
+          .update(billingCheckoutSessions)
+          .set({
+            state: sql`CASE WHEN ${billingCheckoutSessions.state} = 'creating' THEN 'uncertain' ELSE ${billingCheckoutSessions.state} END`,
+            errorCode: sql`CASE WHEN ${billingCheckoutSessions.state} = 'creating' THEN 'reconciled_by_webhook' ELSE ${billingCheckoutSessions.errorCode} END`,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(billingCheckoutSessions.id, event.checkoutId),
+              eq(billingCheckoutSessions.userId, resolvedUserId!),
+            ),
+          );
+      }
       await tx
         .insert(billingSubscriptions)
         .values({
-          userId: event.userId!,
+          userId: resolvedUserId!,
           providerSubscriptionId: projection.providerSubscriptionId,
           providerCustomerId: projection.providerCustomerId,
           providerProductId: projection.providerProductId,
@@ -533,7 +549,7 @@ export abstract class BillingService {
       const entitledPlan = effectivePlan(projection);
       await tx
         .insert(userQuotas)
-        .values({ userId: event.userId!, ...quotaValuesForPlan(entitledPlan) })
+        .values({ userId: resolvedUserId!, ...quotaValuesForPlan(entitledPlan) })
         .onConflictDoUpdate({
           target: userQuotas.userId,
           set: { ...quotaValuesForPlan(entitledPlan), updatedAt: new Date() },

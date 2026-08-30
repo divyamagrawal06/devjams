@@ -112,7 +112,8 @@ export type Backup = {
   sizeBytes: number;
   status: BackupStatus;
   source: BackupSource;
-  activeOperation: BackupOperation | null;
+  /** Omitted by older API projections when no operation metadata is available. */
+  activeOperation?: BackupOperation | null;
   createdAt: string;
   completedAt: string | null;
   expiresAt: string | null;

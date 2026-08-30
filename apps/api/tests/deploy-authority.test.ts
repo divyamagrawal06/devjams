@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { buildRuleJar, readStaticRule } from "@farlands/plugin-builder";
 import { Elysia } from "elysia";
-
-import { assertApprovedArtifactDigest } from "../src/modules/deploy/controller";
+import {
+  assertApprovedArtifactDigest,
+  rollbackTargetError,
+} from "../src/modules/deploy/controller";
 import { deployModule, ownsDeploymentTarget } from "../src/modules/deploy/http";
 
 const deployApp = new Elysia().use(deployModule);
@@ -56,11 +59,27 @@ describe("deployment authority boundary", () => {
     expect(`${controller}\n${http}`).not.toContain("approvals-stub");
   });
 
-  test("refuses any artifact whose digest differs from the reviewed digest", () => {
+  test("refuses any artifact whose digest differs from the reviewed digest", async () => {
     const approved = `sha256:${"a".repeat(64)}`;
     expect(() => assertApprovedArtifactDigest(approved, approved)).not.toThrow();
     expect(() => assertApprovedArtifactDigest(approved, `sha256:${"b".repeat(64)}`)).toThrow(
       /human-approved content digest/,
     );
+
+    const built = await buildRuleJar(readStaticRule());
+    expect(built.contentDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(() =>
+      assertApprovedArtifactDigest(built.contentDigest, built.contentDigest),
+    ).not.toThrow();
+  });
+
+  test("checks rollback targets before a single-use approval is redeemed", () => {
+    expect(rollbackTargetError("server-one", "7", () => undefined)).toBe(
+      "No rollback target recorded for this server",
+    );
+    expect(rollbackTargetError("server-one", "7", () => "6")).toBe(
+      "Rollback target does not match the recorded previous version",
+    );
+    expect(rollbackTargetError("server-one", "7", () => "7")).toBeNull();
   });
 });

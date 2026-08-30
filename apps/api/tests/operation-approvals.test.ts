@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { authorizeDeployApprovalMint } from "../src/modules/agent/approval-http";
+import { authorizeDeployApprovalMint, ruleApprovalClaim } from "../src/modules/agent/approval-http";
 import {
   type ApprovalRepository,
   canonicalApprovalDigest,
@@ -159,6 +159,20 @@ describe("durable operation approvals", () => {
         claim: approved,
       }),
     ).resolves.toBeNull();
+  });
+
+  test("can mint a rollback-specific claim without weakening the deploy default", () => {
+    const input = {
+      server_id: "srv_alpha",
+      rule_set_version: 7,
+      content_digest: `sha256:${"a".repeat(64)}`,
+      issued_to: `mtk_${"b".repeat(32)}`,
+    };
+
+    expect(ruleApprovalClaim(input).operation).toBe("deploy_rules");
+    expect(ruleApprovalClaim({ ...input, operation: "rollback_rules" }).operation).toBe(
+      "rollback_rules",
+    );
   });
 
   test("binds the grant to its principal without spending it on mismatch", async () => {

@@ -2,14 +2,25 @@ import { Elysia, t } from "elysia";
 import { machineTokenService } from "../auth/machine-tokens";
 import { AuthService } from "../auth/service";
 import { ServerService } from "../servers/service";
-import { deployRulesApprovalClaim, operationApprovalService } from "./approvals";
+import {
+  deployRulesApprovalClaim,
+  operationApprovalService,
+  rollbackRulesApprovalClaim,
+} from "./approvals";
 
 export type DeployApprovalMintRequest = {
   server_id: string;
   rule_set_version: number;
   content_digest: string;
   issued_to: string;
+  operation?: "deploy_rules" | "rollback_rules";
 };
+
+export function ruleApprovalClaim(input: DeployApprovalMintRequest) {
+  const claimFactory =
+    input.operation === "rollback_rules" ? rollbackRulesApprovalClaim : deployRulesApprovalClaim;
+  return claimFactory(input.server_id, input.rule_set_version, input.content_digest);
+}
 
 type MintAuthority = {
   ownsServer(userId: string, serverId: string): Promise<boolean>;
@@ -48,11 +59,7 @@ export const operationApprovalModule = new Elysia({ name: "operation-approval-mi
         return { error: "Approval recipient is not an active credential owned by this account" };
       }
 
-      const claim = deployRulesApprovalClaim(
-        body.server_id,
-        body.rule_set_version,
-        body.content_digest,
-      );
+      const claim = ruleApprovalClaim(body);
       const minted = await operationApprovalService.mint({
         issuedTo: body.issued_to,
         issuedBy: userId,
@@ -62,6 +69,7 @@ export const operationApprovalModule = new Elysia({ name: "operation-approval-mi
       return {
         token: minted.token,
         expires_at: minted.expiresAt.toISOString(),
+        operation: claim.operation,
         content_digest: body.content_digest,
       };
     },
@@ -72,6 +80,7 @@ export const operationApprovalModule = new Elysia({ name: "operation-approval-mi
           rule_set_version: t.Integer({ minimum: 1 }),
           content_digest: t.String({ pattern: "^sha256:[0-9a-f]{64}$" }),
           issued_to: t.String({ minLength: 1, maxLength: 128 }),
+          operation: t.Optional(t.Union([t.Literal("deploy_rules"), t.Literal("rollback_rules")])),
         },
         { additionalProperties: false },
       ),

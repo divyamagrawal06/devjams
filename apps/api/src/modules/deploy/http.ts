@@ -13,6 +13,7 @@ import {
   getDeployment,
   reconcileInFlight,
   rollbackServer,
+  rollbackTargetError,
 } from "./controller";
 
 export async function ownsDeploymentTarget(
@@ -106,6 +107,12 @@ export const deployModule = new Elysia({ name: "authenticated-deployments" })
       if (!(await ownsDeploymentTarget(identity.userId, params.id))) {
         set.status = 404;
         return notFound({ tool: "rollback", resource: `server ${params.id}` });
+      }
+
+      const targetError = rollbackTargetError(params.id, String(body.rule_set_version));
+      if (targetError) {
+        set.status = 409;
+        return { error: targetError };
       }
 
       const claim = rollbackRulesApprovalClaim(

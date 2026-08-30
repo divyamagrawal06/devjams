@@ -22,6 +22,21 @@ const liveByServer = new Map<string, string>();
 
 const nowIso = () => new Date().toISOString();
 
+type RollbackTargetLookup = (serverId: string) => string | undefined;
+
+export function rollbackTargetError(
+  serverId: string,
+  targetVersion: string,
+  lookup: RollbackTargetLookup = (id) => liveByServer.get(id),
+): string | null {
+  const recordedTarget = lookup(serverId);
+  if (!recordedTarget) return "No rollback target recorded for this server";
+  if (recordedTarget !== targetVersion) {
+    return "Rollback target does not match the recorded previous version";
+  }
+  return null;
+}
+
 export function assertApprovedArtifactDigest(approvedDigest: string, builtDigest: string): void {
   if (!digestsEqual(approvedDigest, builtDigest)) {
     throw new Error("Built rule artifact digest does not match the human-approved content digest");
@@ -202,14 +217,11 @@ export async function rollbackServer(input: {
   userId: string;
 }): Promise<DeploymentView> {
   const { serverId } = input;
-  const from = liveByServer.get(serverId);
-  if (!from) throw new Error("No rollback target recorded for this server");
-  if (from !== input.targetVersion) {
-    throw new Error("Rollback target does not match the recorded previous version");
-  }
+  const targetError = rollbackTargetError(serverId, input.targetVersion);
+  if (targetError) throw new Error(targetError);
   return enqueueDeploy({
     serverId,
-    ruleSetVersion: from,
+    ruleSetVersion: input.targetVersion,
     approvedContentDigest: input.approvedContentDigest,
     initiatedBy: input.initiatedBy,
     userId: input.userId,

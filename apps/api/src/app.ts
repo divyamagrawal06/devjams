@@ -8,7 +8,9 @@ import { operationApprovalModule } from "./modules/agent/approval-http";
 import { machineTokenModule } from "./modules/auth/machine-token-http";
 import { AuthService } from "./modules/auth/service";
 import { BackupModule } from "./modules/backup";
+import { changesModule } from "./modules/changes/http";
 import { deployModule } from "./modules/deploy/http";
+import { eventStreamModule } from "./modules/events/http";
 import { quotaModule } from "./modules/quota";
 import { rulesModule } from "./modules/rules";
 import { serversModule } from "./modules/servers";
@@ -35,12 +37,14 @@ export const app = new Elysia()
   })
 
   .use(rulesModule)
+  .use(changesModule)
   .use(serversModule)
   .use(quotaModule)
   .use(adminModule)
   .use(machineTokenModule)
   .use(operationApprovalModule)
   .use(deployModule)
+  .use(eventStreamModule)
   .use(velocityModule)
   .use(telemetryPlugin({ store: new InMemoryRollupStore() }))
   .group("/api/servers/:serverId", (app) => app.use(BackupModule))

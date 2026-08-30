@@ -607,6 +607,138 @@
             "type": "string"
           },
           "type": {
+            "const": "change_submitted",
+            "type": "string"
+          },
+          "server_id": {
+            "pattern": "^srv_[a-z0-9]{3,32}$",
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "description": "ISO-8601 UTC timestamp",
+            "type": "string"
+          },
+          "data": {
+            "type": "object",
+            "required": [
+              "change_id",
+              "title",
+              "rule_version",
+              "content_digest",
+              "artifact_digest"
+            ],
+            "properties": {
+              "change_id": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "rule_version": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "content_digest": {
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "description": "SHA-256 over RFC 8785 canonical JSON, prefixed with the algorithm",
+                "type": "string"
+              },
+              "artifact_digest": {
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "description": "SHA-256 over RFC 8785 canonical JSON, prefixed with the algorithm",
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "object",
+        "required": [
+          "id",
+          "type",
+          "server_id",
+          "ts",
+          "data"
+        ],
+        "properties": {
+          "id": {
+            "description": "Monotonic per server. Sent back as Last-Event-ID.",
+            "type": "string"
+          },
+          "type": {
+            "const": "change_reviewed",
+            "type": "string"
+          },
+          "server_id": {
+            "pattern": "^srv_[a-z0-9]{3,32}$",
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "description": "ISO-8601 UTC timestamp",
+            "type": "string"
+          },
+          "data": {
+            "type": "object",
+            "required": [
+              "change_id",
+              "verdict",
+              "artifact_digest",
+              "deployment_id"
+            ],
+            "properties": {
+              "change_id": {
+                "type": "string"
+              },
+              "verdict": {
+                "anyOf": [
+                  {
+                    "const": "approved",
+                    "type": "string"
+                  },
+                  {
+                    "const": "rejected",
+                    "type": "string"
+                  }
+                ]
+              },
+              "artifact_digest": {
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "description": "SHA-256 over RFC 8785 canonical JSON, prefixed with the algorithm",
+                "type": "string"
+              },
+              "deployment_id": {
+                "anyOf": [
+                  {
+                    "pattern": "^dep_[a-z0-9]{3,32}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "object",
+        "required": [
+          "id",
+          "type",
+          "server_id",
+          "ts",
+          "data"
+        ],
+        "properties": {
+          "id": {
+            "description": "Monotonic per server. Sent back as Last-Event-ID.",
+            "type": "string"
+          },
+          "type": {
             "const": "server_log",
             "type": "string"
           },

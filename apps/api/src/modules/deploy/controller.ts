@@ -41,7 +41,7 @@ export function assertApprovedArtifactDigest(approvedDigest: string, builtDigest
     throw new Error("Built rule artifact digest does not match the human-approved content digest");
   }
 }
-function deploymentId(): string {
+function mintDeploymentId(): string {
   return "dep_" + randomUUID().replaceAll("-", "");
 }
 
@@ -668,23 +668,27 @@ export async function getDeployment(id: string): Promise<DeploymentView | null> 
   return row ? view(row) : null;
 }
 
-export async function enqueueDeploy(input: {
+export type DeploymentEnqueueInput = {
+  deploymentId?: string;
   serverId: string;
   ruleSetVersion: string;
   approvedContentDigest: string;
   initiatedBy: string;
   userId: string;
-}): Promise<DeploymentView> {
-  const id = deploymentId();
-  const head = await deploymentStore.findRuleHead(input.serverId);
-  const created = await deploymentStore.create({
-    id,
+};
+
+export function queuedDeploymentRecord(
+  input: DeploymentEnqueueInput & { deploymentId: string },
+  fromVersion: string | null,
+): Omit<DeploymentRecord, "queueSequence"> {
+  return {
+    id: input.deploymentId,
     serverId: input.serverId,
     state: "queued",
     queuePosition: null,
     candidatePod: null,
     snapshotId: null,
-    fromVersion: head?.currentVersion ?? null,
+    fromVersion,
     toVersion: input.ruleSetVersion,
     error: null,
     startedAt: nowIso(),
@@ -713,9 +717,39 @@ export async function enqueueDeploy(input: {
     queueStatus: "waiting",
     workerId: null,
     leaseExpiresAt: null,
-  });
-  const admitted = await deploymentQueue.claimNext();
-  if (admitted) startMachine(admitted);
+  };
+}
+
+/** Admit durable waiting rows only after their authorizing transaction commits. */
+export async function admitQueuedDeployments(): Promise<void> {
+  await startNext();
+}
+
+export async function enqueueDeploy(input: DeploymentEnqueueInput): Promise<DeploymentView> {
+  const id = input.deploymentId ?? mintDeploymentId();
+  if (!/^dep_[a-z0-9]{3,32}$/.test(id)) {
+    throw new Error("Deployment id is invalid");
+  }
+  const existing = await deploymentStore.find(id);
+  if (existing) {
+    if (
+      existing.serverId !== input.serverId ||
+      existing.userId !== input.userId ||
+      existing.initiatedBy !== input.initiatedBy ||
+      existing.toVersion !== input.ruleSetVersion ||
+      !digestsEqual(existing.approvedContentDigest, input.approvedContentDigest)
+    ) {
+      throw new Error("Deployment id is already bound to a different reviewed operation");
+    }
+    const admitted = await deploymentQueue.claimNext();
+    if (admitted) startMachine(admitted);
+    return view((await deploymentStore.find(id)) ?? existing);
+  }
+  const head = await deploymentStore.findRuleHead(input.serverId);
+  const created = await deploymentStore.create(
+    queuedDeploymentRecord({ ...input, deploymentId: id }, head?.currentVersion ?? null),
+  );
+  await admitQueuedDeployments();
   const current = (await deploymentStore.find(id)) ?? created;
   return view(current);
 }

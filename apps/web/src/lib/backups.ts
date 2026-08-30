@@ -1,4 +1,4 @@
-import type { Backup, BackupSchedule } from "./api";
+import type { Backup, BackupSchedule, LiveServer } from "./api";
 
 const DAYS = [
   "Sunday",
@@ -74,4 +74,9 @@ export function backupIsBusy(backup: Pick<Backup, "activeOperation" | "status">)
   return (
     backup.activeOperation != null || backup.status === "pending" || backup.status === "in_progress"
   );
+}
+
+/** Mirrors the backend's destructive restore precondition exactly. */
+export function backupRestoreAllowed(state: LiveServer["currentState"]): boolean {
+  return state === "stopped";
 }

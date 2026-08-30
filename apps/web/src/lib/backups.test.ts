@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   backupIsBusy,
+  backupRestoreAllowed,
   backupStatusLabel,
   backupStatusTone,
   formatBytes,
@@ -32,5 +33,12 @@ describe("backup presentation helpers", () => {
     );
     expect(formatUtcDateTime("2026-08-30T03:05:00.000Z")).toContain("UTC");
     expect(formatUtcDateTime(null)).toBe("Not yet");
+  });
+
+  test("offers destructive restore only in the backend-accepted stopped state", () => {
+    expect(backupRestoreAllowed("stopped")).toBe(true);
+    for (const state of ["ready", "running", "starting", "stopping", "failed"] as const) {
+      expect(backupRestoreAllowed(state)).toBe(false);
+    }
   });
 });

@@ -30,4 +30,21 @@ describe("backup route authentication", () => {
     expect(response.status).toBe(401);
     expect(await response.text()).toBe("Authentication required");
   });
+
+  test("registers an authenticated schedule endpoint before backup lookup", async () => {
+    const response = await app.handle(
+      new Request("http://localhost/api/servers/server-id/backups/schedule"),
+    );
+
+    expect(response.status).toBe(401);
+    expect(await response.text()).toBe("Authentication required");
+
+    const getPaths = app.routes
+      .filter((route) => route.method === "GET")
+      .map((route) => route.path);
+    expect(getPaths.indexOf("/api/servers/:serverId/backups/schedule")).toBeGreaterThanOrEqual(0);
+    expect(getPaths.indexOf("/api/servers/:serverId/backups/schedule")).toBeLessThan(
+      getPaths.indexOf("/api/servers/:serverId/backups/:backupId"),
+    );
+  });
 });

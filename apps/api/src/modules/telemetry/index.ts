@@ -25,11 +25,23 @@ export {
 } from "./events.ts";
 export { EXTERNAL_ROUTING_HEADERS, externalRoutingHeader, internalOnlyRefusal } from "./guard.ts";
 export {
+  createTelemetryReadModule,
+  EMPTY_WORLD_FEED_METRICS,
+  summarizeWorldFeed,
+  TELEMETRY_WINDOWS,
+  type TelemetryWindow,
+} from "./http.ts";
+export {
   type TelemetryIngestResponse,
   type TelemetryPlugin,
   type TelemetryPluginOptions,
   telemetryPlugin,
 } from "./plugin.ts";
 export { DEFAULT_MAX_SESSION_SECONDS, SessionLedger } from "./sessions.ts";
-export { InMemoryRollupStore, type RollupStore } from "./store.ts";
+export {
+  DrizzleRollupStore,
+  InMemoryRollupStore,
+  type RollupListOptions,
+  type RollupStore,
+} from "./store.ts";
 export { WindowAccumulator } from "./window.ts";

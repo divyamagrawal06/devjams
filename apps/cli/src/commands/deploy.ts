@@ -72,7 +72,11 @@ export function deployCommand(ctx: CommandContext) {
         api,
         target,
         start: () =>
-          api.deploy(serverId, { rule_set_version: version, approval_token: approvalToken }),
+          api.deploy(serverId, {
+            rule_set_version: version,
+            content_digest: target.digest,
+            approval_token: approvalToken,
+          }),
         watch: Boolean(args.watch),
         onStall: stallPolicy(args["on-stall"]),
         stallBudgetMs: optionalMs(args["stall-budget-ms"], "--stall-budget-ms"),

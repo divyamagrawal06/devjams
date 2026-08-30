@@ -143,6 +143,22 @@ export class TelemetryAggregator {
     await this.settled();
   }
 
+  /**
+   * Close only windows whose absolute boundary has passed.
+   *
+   * The production cadence calls this method. Using the force-flush above on
+   * a timer would close a five-minute window at an arbitrary point within it,
+   * after which every later event in that same window would be treated as
+   * late. Keeping the two operations separate preserves aligned windows while
+   * still giving shutdown and tests a deterministic force-flush primitive.
+   */
+  async flushExpired(nowMs = Date.now()): Promise<void> {
+    for (const [id, state] of this.servers) {
+      if (state.open && state.open.endMs <= nowMs) this.closeWindow(id, state);
+    }
+    await this.settled();
+  }
+
   /** Resolves once every window handed to the store has been written or dropped. */
   async settled(): Promise<void> {
     await this.writes;

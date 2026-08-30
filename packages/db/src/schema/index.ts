@@ -11,3 +11,4 @@ export * from "./operator";
 export * from "./quotas";
 export * from "./rules";
 export * from "./servers";
+export * from "./telemetry";

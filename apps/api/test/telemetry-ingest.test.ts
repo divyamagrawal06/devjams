@@ -22,6 +22,7 @@ import {
 
 const SERVER = "srv_7f2";
 const T = "2026-08-29T18:00:00.000Z";
+const INTERNAL_KEY = "telemetry-test-key";
 
 const join = (player: string, ts = T) => ({
   kind: "join",
@@ -52,7 +53,11 @@ function harness(overrides: { store?: RollupStore; windowSeconds?: number } = {}
     windowSeconds: overrides.windowSeconds ?? 3600,
     storeTimeoutMs: 50,
   });
-  const app = telemetryPlugin({ store: overrides.store ?? store, aggregator });
+  const app = telemetryPlugin({
+    store: overrides.store ?? store,
+    aggregator,
+    internalKey: INTERNAL_KEY,
+  });
 
   return {
     aggregator,
@@ -63,7 +68,11 @@ function harness(overrides: { store?: RollupStore; windowSeconds?: number } = {}
       const response = await app.handle(
         new Request(`http://localhost/internal/telemetry/${init.server ?? SERVER}`, {
           method: "POST",
-          headers: { "content-type": "application/x-ndjson", ...(init.headers ?? {}) },
+          headers: {
+            "content-type": "application/x-ndjson",
+            "x-internal-key": INTERNAL_KEY,
+            ...(init.headers ?? {}),
+          },
           body,
         }),
       );
@@ -167,6 +176,32 @@ describe("ingest accepts well formed events", () => {
       expect(status).toBe(200);
       expect(body.accepted).toBe(1);
     }
+  });
+});
+
+describe("ingest requires internal service authentication", () => {
+  test("refuses a missing or wrong key without opening a telemetry window", async () => {
+    const { post, aggregator } = harness();
+    for (const key of ["", "wrong-key"]) {
+      const { status, body } = await post(ndjson(join("mossgrove")), {
+        headers: { "x-internal-key": key },
+      });
+      expect(status).toBe(401);
+      expect(body.error).toBe("Unauthorized");
+    }
+    expect(aggregator.liveState()).toEqual({});
+  });
+
+  test("fails closed when no production key is configured", async () => {
+    const store = new InMemoryRollupStore();
+    const app = telemetryPlugin({ store, internalKey: " " });
+    const response = await app.handle(
+      new Request(`http://localhost/internal/telemetry/${SERVER}`, {
+        method: "POST",
+        body: ndjson(join("mossgrove")),
+      }),
+    );
+    expect(response.status).toBe(503);
   });
 });
 

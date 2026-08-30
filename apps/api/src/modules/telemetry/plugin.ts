@@ -1,5 +1,6 @@
 import { ServerId } from "@farlands/contracts";
 import { Elysia, getSchemaValidator } from "elysia";
+import { internalAuthRefusal, verifyInternalServiceRequest } from "../auth/internal-service";
 import { type AggregatorOptions, TelemetryAggregator } from "./aggregator.ts";
 import { MAX_BATCH_BYTES, MAX_BATCH_EVENTS, parseNdjsonBatch } from "./events.ts";
 import { externalRoutingHeader, internalOnlyRefusal } from "./guard.ts";
@@ -28,6 +29,10 @@ const serverIdValidator = getSchemaValidator(ServerId, {});
 export interface TelemetryPluginOptions extends AggregatorOptions {
   /** Supply an aggregator to share one instance across routes. */
   aggregator?: TelemetryAggregator;
+  /** Injected by tests; production defaults to INTERNAL_API_KEY and fails closed when absent. */
+  internalKey?: string;
+  /** Close quiet windows on a bounded cadence. */
+  flushIntervalMs?: number;
 }
 
 export interface TelemetryIngestResponse {
@@ -42,80 +47,105 @@ export interface TelemetryIngestResponse {
 
 export function telemetryPlugin(options: TelemetryPluginOptions) {
   const aggregator = options.aggregator ?? new TelemetryAggregator(options);
+  let flushTimer: ReturnType<typeof setInterval> | undefined;
 
-  return new Elysia({ name: "farlands-telemetry" }).decorate("telemetry", aggregator).post(
-    "/internal/telemetry/:serverId",
-    async ({ params, request, headers, set }) => {
-      // The guard runs before anything reads the body, so an externally
-      // routed request costs one header lookup rather than a parse.
-      const forwarded = externalRoutingHeader(headers);
-      if (forwarded !== null) {
-        set.status = 404;
-        return internalOnlyRefusal(forwarded);
-      }
+  return new Elysia({ name: "farlands-telemetry" })
+    .decorate("telemetry", aggregator)
+    .onStart(() => {
+      flushTimer = setInterval(() => {
+        void aggregator.flushExpired().catch((error) => {
+          console.error("Telemetry flush failed", {
+            message: error instanceof Error ? error.message : "Unknown flush error",
+          });
+        });
+      }, options.flushIntervalMs ?? 60_000);
+      flushTimer.unref?.();
+    })
+    .onStop(async () => {
+      if (flushTimer) clearInterval(flushTimer);
+      await aggregator.flush();
+    })
+    .post(
+      "/internal/telemetry/:serverId",
+      async ({ params, request, headers, set }) => {
+        // The guard runs before anything reads the body, so an externally
+        // routed request costs one header lookup rather than a parse.
+        const forwarded = externalRoutingHeader(headers);
+        if (forwarded !== null) {
+          set.status = 404;
+          return internalOnlyRefusal(forwarded);
+        }
 
-      // A path segment becomes a store key, so it is validated against the
-      // contract's ServerId rather than trusted because it came from a router.
-      if (!serverIdValidator.Check(params.serverId)) {
-        set.status = 404;
-        return {
-          error: "not_found" as const,
-          tool: "telemetry_ingest",
-          resource: "server",
-          message: "That server id is not a valid server id.",
-          resolution: "Post to /internal/telemetry/{server_id} using the id issued for the world.",
+        const authResult = verifyInternalServiceRequest(headers, options.internalKey);
+        if (authResult !== "authorized") {
+          const refusal = internalAuthRefusal(authResult);
+          set.status = refusal.status;
+          return refusal.body;
+        }
+
+        // A path segment becomes a store key, so it is validated against the
+        // contract's ServerId rather than trusted because it came from a router.
+        if (!serverIdValidator.Check(params.serverId)) {
+          set.status = 404;
+          return {
+            error: "not_found" as const,
+            tool: "telemetry_ingest",
+            resource: "server",
+            message: "That server id is not a valid server id.",
+            resolution:
+              "Post to /internal/telemetry/{server_id} using the id issued for the world.",
+          };
+        }
+
+        const body = await request.text();
+        if (body.length > MAX_BATCH_BYTES) {
+          set.status = 413;
+          return {
+            error: "batch_too_large" as const,
+            limit_bytes: MAX_BATCH_BYTES,
+            limit_events: MAX_BATCH_EVENTS,
+            message: "Telemetry batch exceeded the size limit and was not read.",
+            resolution: `Send at most ${MAX_BATCH_EVENTS} events per batch.`,
+          };
+        }
+
+        const batch = parseNdjsonBatch(body);
+        if (batch.oversized) {
+          set.status = 413;
+          return {
+            error: "batch_too_large" as const,
+            limit_bytes: MAX_BATCH_BYTES,
+            limit_events: MAX_BATCH_EVENTS,
+            message: "Telemetry batch exceeded the event limit and was not read.",
+            resolution: `Send at most ${MAX_BATCH_EVENTS} events per batch.`,
+          };
+        }
+
+        // Synchronous: counters only. The store is written on the aggregator's
+        // own chain, so a database outage cannot slow this response down.
+        const outcome = aggregator.ingest(params.serverId, batch.events);
+
+        const response: TelemetryIngestResponse = {
+          server_id: params.serverId,
+          accepted: outcome.accepted,
+          rejected: batch.rejections.length,
+          late: outcome.late,
+          rejections: batch.rejections,
         };
-      }
 
-      const body = await request.text();
-      if (body.length > MAX_BATCH_BYTES) {
-        set.status = 413;
-        return {
-          error: "batch_too_large" as const,
-          limit_bytes: MAX_BATCH_BYTES,
-          limit_events: MAX_BATCH_EVENTS,
-          message: "Telemetry batch exceeded the size limit and was not read.",
-          resolution: `Send at most ${MAX_BATCH_EVENTS} events per batch.`,
-        };
-      }
+        // Partial success stays a 200 because one bad line in a batch of a
+        // hundred is not a failed request. A batch that produced nothing usable
+        // is a different outcome and says so, so a broken emitter is visible
+        // instead of looking like a quiet world.
+        if (outcome.accepted === 0 && batch.rejections.length > 0) set.status = 422;
 
-      const batch = parseNdjsonBatch(body);
-      if (batch.oversized) {
-        set.status = 413;
-        return {
-          error: "batch_too_large" as const,
-          limit_bytes: MAX_BATCH_BYTES,
-          limit_events: MAX_BATCH_EVENTS,
-          message: "Telemetry batch exceeded the event limit and was not read.",
-          resolution: `Send at most ${MAX_BATCH_EVENTS} events per batch.`,
-        };
-      }
-
-      // Synchronous: counters only. The store is written on the aggregator's
-      // own chain, so a database outage cannot slow this response down.
-      const outcome = aggregator.ingest(params.serverId, batch.events);
-
-      const response: TelemetryIngestResponse = {
-        server_id: params.serverId,
-        accepted: outcome.accepted,
-        rejected: batch.rejections.length,
-        late: outcome.late,
-        rejections: batch.rejections,
-      };
-
-      // Partial success stays a 200 because one bad line in a batch of a
-      // hundred is not a failed request. A batch that produced nothing usable
-      // is a different outcome and says so, so a broken emitter is visible
-      // instead of looking like a quiet world.
-      if (outcome.accepted === 0 && batch.rejections.length > 0) set.status = 422;
-
-      return response;
-    },
-    // NDJSON is not a shape Elysia's body parsers understand, and the
-    // emitter's content-type must not decide whether a batch is readable.
-    // Reading the request directly makes the route indifferent to it.
-    { parse: "none" },
-  );
+        return response;
+      },
+      // NDJSON is not a shape Elysia's body parsers understand, and the
+      // emitter's content-type must not decide whether a batch is readable.
+      // Reading the request directly makes the route indifferent to it.
+      { parse: "none" },
+    );
 }
 
 export type TelemetryPlugin = ReturnType<typeof telemetryPlugin>;

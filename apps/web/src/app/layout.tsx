@@ -22,6 +22,12 @@ export const metadata: Metadata = {
   title: "indexd | Workload control room",
   description:
     "A private control room for game servers, Node services, and bounded container workloads.",
+  manifest: "/manifest.webmanifest",
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "default",
+    title: "indexd",
+  },
 };
 
 export default async function RootLayout({ children }: { children: ReactNode }) {

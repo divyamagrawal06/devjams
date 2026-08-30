@@ -24,10 +24,10 @@ names and a per-region total. Nothing in the module has an array of events, and 
 interface has no method that takes or returns one. Memory is a function of distinct players
 and elapsed windows, never of event volume.
 
-**Cluster-internal is enforced in two halves.** The NetworkPolicy is Engineer 2's; this
-module refuses requests carrying `x-forwarded-for` and its relatives, which is what an
-accidental public route leaves behind. The refusal is a `not_found`, so a scanner that
-reaches it does not learn that `/internal/*` exists.
+**Cluster-internal is enforced in layers.** The NetworkPolicy limits reachability, this module
+refuses edge-forwarding headers, and every request must carry the shared `x-internal-key`.
+Missing production configuration fails closed with 503. An accidentally proxied request still
+gets `not_found`, so a scanner does not learn that `/internal/*` exists.
 
 **Session pairing at a window boundary.** A session still open when a window closes is
 carried forward, not truncated, and the full duration is credited to the window in which the
@@ -39,11 +39,8 @@ to `mean_session_seconds`. `mean_session_seconds` is `null`, never `0`, when not
 them, or interpolates them, and the rejection path reports schema paths rather than values so
 player-authored text never reaches a log line.
 
-## Not written here
+## Production wiring
 
-- `world_events_rollup` and its Drizzle migration. Migrations are one sequence with one owner
-  (Engineer 3); this module requests the table by pull request rather than forking the
-  sequence. Swap `InMemoryRollupStore` for the Drizzle implementation of `RollupStore` when it
-  lands; nothing else changes.
-- The Java emitter under `plugin-runtime/`. Deferred: the project targets Java 25 and this
-  environment has Java 17 with no Maven, so it could not be compiled or tested.
+`DrizzleRollupStore` writes immutable closed windows to `world_events_rollup`. The Paper emitter
+uses a bounded queue and Java's asynchronous HTTP client; it never sends chat content and never
+blocks the game thread on telemetry delivery.

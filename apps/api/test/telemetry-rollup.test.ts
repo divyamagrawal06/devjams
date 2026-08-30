@@ -32,6 +32,7 @@ const fixturePath = joinPath(
 );
 
 const SERVER = "srv_7f2";
+const INTERNAL_KEY = "telemetry-test-key";
 const rollupValidator = getSchemaValidator(WorldEventsRollup, {});
 
 async function fixtureText(): Promise<string> {
@@ -42,7 +43,7 @@ async function fixtureText(): Promise<string> {
 async function replayOverHttp(text: string, windowSeconds: number, batchSize = 25) {
   const store = new InMemoryRollupStore();
   const aggregator = new TelemetryAggregator({ store, windowSeconds });
-  const app = telemetryPlugin({ store, aggregator });
+  const app = telemetryPlugin({ store, aggregator, internalKey: INTERNAL_KEY });
 
   const lines = text.trim().split("\n");
   for (let i = 0; i < lines.length; i += batchSize) {
@@ -50,7 +51,10 @@ async function replayOverHttp(text: string, windowSeconds: number, batchSize = 2
     const response = await app.handle(
       new Request(`http://localhost/internal/telemetry/${SERVER}`, {
         method: "POST",
-        headers: { "content-type": "application/x-ndjson" },
+        headers: {
+          "content-type": "application/x-ndjson",
+          "x-internal-key": INTERNAL_KEY,
+        },
         body,
       }),
     );
@@ -577,6 +581,43 @@ describe("events that arrive after their window closed", () => {
 
     expect(outcome.late).toBe(1);
     expect(await store.list(SERVER)).toHaveLength(1);
+  });
+});
+
+describe("scheduled window closure", () => {
+  test("a cadence tick never closes the current aligned window early", async () => {
+    const store = new InMemoryRollupStore();
+    const aggregator = new TelemetryAggregator({ store, windowSeconds: 300 });
+    const join = {
+      kind: "join" as const,
+      ts: "2026-08-29T18:00:10.000Z",
+      player_name: "cadence-player",
+      region: null,
+      subject: null,
+      value: 1,
+    };
+    const leave = {
+      kind: "leave" as const,
+      ts: "2026-08-29T18:04:50.000Z",
+      player_name: "cadence-player",
+      region: null,
+      subject: null,
+      value: 1,
+    };
+
+    aggregator.ingest(SERVER, [join]);
+    await aggregator.flushExpired(Date.parse("2026-08-29T18:04:59.999Z"));
+    expect(await store.list(SERVER)).toHaveLength(0);
+
+    const outcome = aggregator.ingest(SERVER, [leave]);
+    expect(outcome).toEqual({ accepted: 1, late: 0, closed: 0 });
+
+    await aggregator.flushExpired(Date.parse("2026-08-29T18:05:00.000Z"));
+    const rows = await store.list(SERVER);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.metrics.joins).toBe(1);
+    expect(rows[0]?.metrics.leaves).toBe(1);
+    expect(rows[0]?.metrics.mean_session_seconds).toBe(280);
   });
 });
 

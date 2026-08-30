@@ -6,7 +6,7 @@ import { deleteCandidate, provisionCandidate } from "../provisioning/candidate";
 import { releaseDeploymentHeadroom, reserveDeploymentHeadroom } from "../quota/headroom";
 import { issueTransfer, waitForAck } from "../velocity/transfers";
 import { AuthClient } from "./invariant";
-import { deploymentQueue } from "./queue";
+import { type DurableDeploymentQueue, deploymentQueue } from "./queue";
 import {
   type DeploymentPatch,
   type DeploymentRecord,
@@ -159,7 +159,7 @@ async function runMachine(id: string): Promise<void> {
   assertApprovedArtifactDigest(row.approvedContentDigest, built.contentDigest);
 
   await transition(id, "staging");
-  let candidate;
+  let candidate: Awaited<ReturnType<typeof provisionCandidate>>;
   try {
     await reserveDeploymentHeadroom(row.userId, row.serverId, id);
     candidate = await provisionCandidate({
@@ -167,6 +167,18 @@ async function runMachine(id: string): Promise<void> {
       deploymentId: id,
       jarUrl: built.jarUrl,
     });
+    const leaseRetained = await fenceProvisionedCandidate({
+      renew: () => deploymentQueue.renew(id),
+      cleanup: () =>
+        deleteCandidate({
+          namespace: candidate.namespace,
+          deploymentName: candidate.deploymentName,
+          liveServerId: row.serverId,
+          deploymentId: id,
+        }),
+      releaseHeadroom: () => releaseDeploymentHeadroom(id),
+    });
+    if (!leaseRetained) return;
     await transition(id, "staging", {
       candidatePod: candidate.deploymentName,
       namespace: candidate.namespace,
@@ -198,7 +210,26 @@ type ExpiredRecoveryActions = {
   releaseHeadroom(id: string): Promise<void>;
 };
 
+type ProvisionedCandidateFence = {
+  renew(): Promise<boolean>;
+  cleanup(): Promise<void>;
+  releaseHeadroom(): Promise<void>;
+};
+
+export async function fenceProvisionedCandidate(
+  actions: ProvisionedCandidateFence,
+): Promise<boolean> {
+  if (await actions.renew()) return true;
+  try {
+    await actions.cleanup();
+  } finally {
+    await actions.releaseHeadroom();
+  }
+  return false;
+}
+
 export async function reconcileExpiredDeployments(
+  claimer: Pick<DurableDeploymentQueue, "claimExpired"> = deploymentQueue,
   store: DeploymentStore = deploymentStore,
   actions: ExpiredRecoveryActions = {
     abort: async (id, reason) => {
@@ -208,7 +239,9 @@ export async function reconcileExpiredDeployments(
   },
 ): Promise<string[]> {
   const reclaimed: string[] = [];
-  for (const row of await store.listExpiredRunning()) {
+  while (true) {
+    const row = await claimer.claimExpired();
+    if (!row) break;
     const disposition = restartDisposition(row);
     if (disposition === "abort_pre_cutover") {
       await actions.abort(row.id, "deployment worker lease expired before cutover");

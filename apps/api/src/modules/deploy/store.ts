@@ -53,10 +53,10 @@ export interface DeploymentStore {
   ): Promise<DeploymentRecord>;
   queuePosition(id: string): Promise<number | null>;
   claimNext(workerId: string, maxConcurrent: number, leaseMs: number): Promise<string | null>;
+  claimExpired(workerId: string, leaseMs: number): Promise<DeploymentRecord | null>;
   renewLease(id: string, workerId: string, leaseMs: number): Promise<boolean>;
   completeQueue(id: string): Promise<void>;
   listRecoverable(): Promise<DeploymentRecord[]>;
-  listExpiredRunning(): Promise<DeploymentRecord[]>;
   findRuleHead(serverId: string): Promise<RuleHead | null>;
   commitCutover(input: {
     serverId: string;
@@ -230,6 +230,42 @@ export class DrizzleDeploymentStore implements DeploymentStore {
     });
   }
 
+  async claimExpired(workerId: string, leaseMs: number): Promise<DeploymentRecord | null> {
+    return db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(1835103842)`);
+      const [candidate] = await tx
+        .select({ id: deployments.id })
+        .from(deployments)
+        .where(
+          and(
+            eq(deployments.queueStatus, "running"),
+            sql`(${deployments.leaseExpiresAt} IS NULL OR ${deployments.leaseExpiresAt} <= now())`,
+          ),
+        )
+        .orderBy(asc(deployments.queueSequence))
+        .limit(1)
+        .for("update", { skipLocked: true });
+      if (!candidate) return null;
+
+      const [claimed] = await tx
+        .update(deployments)
+        .set({
+          workerId,
+          leaseExpiresAt: sql`now() + (${leaseMs} * interval '1 millisecond')`,
+          updatedAt: sql`now()`,
+        })
+        .where(
+          and(
+            eq(deployments.id, candidate.id),
+            eq(deployments.queueStatus, "running"),
+            sql`(${deployments.leaseExpiresAt} IS NULL OR ${deployments.leaseExpiresAt} <= now())`,
+          ),
+        )
+        .returning();
+      return claimed ? toRecord(claimed) : null;
+    });
+  }
+
   async completeQueue(id: string): Promise<void> {
     await db
       .update(deployments)
@@ -269,20 +305,6 @@ export class DrizzleDeploymentStore implements DeploymentStore {
         and(
           notInArray(deployments.state, ["idle", "aborted", "failed"]),
           inArray(deployments.queueStatus, ["waiting", "running"]),
-        ),
-      )
-      .orderBy(asc(deployments.queueSequence));
-    return rows.map(toRecord);
-  }
-
-  async listExpiredRunning(): Promise<DeploymentRecord[]> {
-    const rows = await db
-      .select()
-      .from(deployments)
-      .where(
-        and(
-          eq(deployments.queueStatus, "running"),
-          sql`(${deployments.leaseExpiresAt} IS NULL OR ${deployments.leaseExpiresAt} <= now())`,
         ),
       )
       .orderBy(asc(deployments.queueSequence));
@@ -420,6 +442,21 @@ export class MemoryDeploymentStore implements DeploymentStore {
     return candidate.id;
   }
 
+  async claimExpired(workerId: string, leaseMs: number): Promise<DeploymentRecord | null> {
+    const now = this.now();
+    const candidate = [...this.records.values()]
+      .filter(
+        (row) =>
+          row.queueStatus === "running" &&
+          (row.leaseExpiresAt === null || new Date(row.leaseExpiresAt) <= now),
+      )
+      .sort((a, b) => a.queueSequence - b.queueSequence)[0];
+    if (!candidate) return null;
+    candidate.workerId = workerId;
+    candidate.leaseExpiresAt = new Date(now.getTime() + leaseMs).toISOString();
+    return { ...candidate };
+  }
+
   async completeQueue(id: string): Promise<void> {
     const record = this.records.get(id);
     if (!record) return;
@@ -448,18 +485,6 @@ export class MemoryDeploymentStore implements DeploymentStore {
         (row) =>
           !(["idle", "aborted", "failed"] as DeploymentState[]).includes(row.state) &&
           row.queueStatus !== "complete",
-      )
-      .sort((a, b) => a.queueSequence - b.queueSequence)
-      .map((row) => ({ ...row }));
-  }
-
-  async listExpiredRunning(): Promise<DeploymentRecord[]> {
-    const now = this.now();
-    return [...this.records.values()]
-      .filter(
-        (row) =>
-          row.queueStatus === "running" &&
-          (row.leaseExpiresAt === null || new Date(row.leaseExpiresAt) <= now),
       )
       .sort((a, b) => a.queueSequence - b.queueSequence)
       .map((row) => ({ ...row }));

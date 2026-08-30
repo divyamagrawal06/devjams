@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { reconcileExpiredDeployments, restartDisposition } from "../src/modules/deploy/controller";
+import {
+  fenceProvisionedCandidate,
+  reconcileExpiredDeployments,
+  restartDisposition,
+} from "../src/modules/deploy/controller";
 import { DurableDeploymentQueue } from "../src/modules/deploy/queue";
 import { type DeploymentRecord, MemoryDeploymentStore } from "../src/modules/deploy/store";
 import { MemoryHeadroomStore } from "../src/modules/quota/headroom";
@@ -103,8 +107,10 @@ describe("durable deployment queue and reconciliation", () => {
     now = new Date("2026-08-30T12:00:01.001Z");
     const aborted: string[] = [];
     await expect(
-      reconcileExpiredDeployments(store, {
+      reconcileExpiredDeployments(queue, store, {
         abort: async (id) => {
+          expect((await store.find(id))?.workerId).toBe("recovery_worker_recovery");
+          await expect(queue.renew(id)).resolves.toBe(false);
           aborted.push(id);
           await store.transition(id, "aborted", {
             queueStatus: "complete",
@@ -117,6 +123,22 @@ describe("durable deployment queue and reconciliation", () => {
     ).resolves.toEqual(["dep_abandoned"]);
     expect(aborted).toEqual(["dep_abandoned"]);
     await expect(queue.claimAvailable()).resolves.toEqual(["dep_waiting"]);
+  });
+
+  test("fences and cleans provisioning that returns after lease recovery", async () => {
+    const effects: string[] = [];
+    await expect(
+      fenceProvisionedCandidate({
+        renew: async () => false,
+        cleanup: async () => {
+          effects.push("candidate deleted");
+        },
+        releaseHeadroom: async () => {
+          effects.push("headroom released");
+        },
+      }),
+    ).resolves.toBe(false);
+    expect(effects).toEqual(["candidate deleted", "headroom released"]);
   });
 
   test("defines conservative restart actions for every in-flight boundary", () => {

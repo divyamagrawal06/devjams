@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { type DeploymentStore, deploymentStore } from "./store";
+import { type DeploymentRecord, type DeploymentStore, deploymentStore } from "./store";
 
 const DEFAULT_MAX_CONCURRENT = 1;
 const DEFAULT_LEASE_MS = 15 * 60 * 1000;
@@ -37,6 +37,10 @@ export class DurableDeploymentQueue {
 
   claimNext(): Promise<string | null> {
     return this.store.claimNext(this.workerId, this.maxConcurrent, this.leaseMs);
+  }
+
+  claimExpired(): Promise<DeploymentRecord | null> {
+    return this.store.claimExpired(`recovery_${this.workerId}`, this.leaseMs);
   }
 
   async claimAvailable(): Promise<string[]> {

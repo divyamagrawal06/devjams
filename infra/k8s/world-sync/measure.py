@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import struct
 import sys
@@ -101,16 +102,54 @@ def post(url: str) -> None:
             raise RuntimeError(f"candidate start returned HTTP {response.status}")
 
 
-def wait_ready(url: str, timeout_seconds: int) -> int:
+def readiness_error(
+    payload: object, expected_deployment_id: str, expected_artifact_digest: str
+) -> str | None:
+    if not isinstance(payload, dict):
+        return "readiness response is not an object"
+    if payload.get("status") != "ready":
+        return "readiness status is not ready"
+    if payload.get("deployment_id") != expected_deployment_id:
+        return "readiness deployment identity mismatch"
+    if payload.get("artifact_digest") != expected_artifact_digest:
+        return "readiness artifact identity mismatch"
+    return None
+
+
+def wait_ready(
+    url: str,
+    timeout_seconds: int,
+    expected_deployment_id: str,
+    expected_artifact_digest: str,
+) -> int:
+    parsed = urllib.parse.urlparse(url)
+    if (
+        parsed.scheme != "http"
+        or not parsed.hostname
+        or not parsed.hostname.endswith(".svc.cluster.local")
+    ):
+        raise RuntimeError("CANDIDATE_READY_URL must be an internal cluster service")
     started = time.monotonic_ns()
     deadline = time.monotonic() + timeout_seconds
     last_error = "not ready"
     while time.monotonic() < deadline:
         try:
             with urllib.request.urlopen(url, timeout=5) as response:
-                if 200 <= response.status < 300:
-                    return int((time.monotonic_ns() - started) / 1_000_000)
-                last_error = f"HTTP {response.status}"
+                if response.status != 200:
+                    last_error = f"HTTP {response.status}"
+                elif response.headers.get_content_type() != "application/json":
+                    last_error = "readiness response is not application/json"
+                else:
+                    raw_payload = response.read(16_385)
+                    if len(raw_payload) > 16_384:
+                        last_error = "readiness response is too large"
+                    else:
+                        payload = json.loads(raw_payload)
+                        last_error = readiness_error(
+                            payload, expected_deployment_id, expected_artifact_digest
+                        ) or ""
+                        if not last_error:
+                            return int((time.monotonic_ns() - started) / 1_000_000)
         except Exception as error:  # readiness is expected to fail during boot
             last_error = str(error)
         time.sleep(0.25)
@@ -151,7 +190,16 @@ def main() -> int:
 
     delta_bytes = max(0, tree_size(destination) - delta_before)
     post(env("CANDIDATE_START_URL"))
-    cold_boot_ms = wait_ready(env("CANDIDATE_READY_URL"), args.ready_timeout_seconds)
+    deployment_id = env("CANDIDATE_DEPLOYMENT_ID")
+    artifact_digest = env("CANDIDATE_ARTIFACT_DIGEST")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", artifact_digest):
+        raise RuntimeError("CANDIDATE_ARTIFACT_DIGEST must be a sha256 digest")
+    cold_boot_ms = wait_ready(
+        env("CANDIDATE_READY_URL"),
+        args.ready_timeout_seconds,
+        deployment_id,
+        artifact_digest,
+    )
     freeze_ms = int((time.monotonic_ns() - freeze_started) / 1_000_000)
     result = {
         "status": "measured",
@@ -166,6 +214,8 @@ def main() -> int:
             "players_drained": True,
             "save_order": ["save-off", "save-all flush", "delta", "save-on"],
             "candidate_ready_url": urllib.parse.urlparse(env("CANDIDATE_READY_URL")).path,
+            "candidate_deployment_id": deployment_id,
+            "candidate_artifact_digest": artifact_digest,
         },
         "measured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }

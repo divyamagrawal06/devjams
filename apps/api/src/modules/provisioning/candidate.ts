@@ -6,7 +6,7 @@ import {
   makeKubernetesClients,
   waitForDeploymentReplicasReady,
 } from "./kubernetes";
-import { ensureTenantNamespace, WORLD_SYNC_PORT } from "./tenancy";
+import { artifactServiceAccountName, ensureTenantNamespace, WORLD_SYNC_PORT } from "./tenancy";
 import { calculateContainerMemory, MinecraftUtils } from "./utils";
 
 const SERVER_PORT = 25565;
@@ -125,8 +125,7 @@ export async function provisionCandidate(input: {
           metadata: { labels, annotations },
           spec: {
             automountServiceAccountToken: false,
-            serviceAccountName:
-              process.env.FARLANDS_ARTIFACT_SERVICE_ACCOUNT ?? "farlands-artifact-reader",
+            serviceAccountName: artifactServiceAccountName(),
             securityContext: { fsGroup: 1000, seccompProfile: { type: "RuntimeDefault" } },
             tolerations: [
               {

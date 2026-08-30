@@ -20,6 +20,33 @@ export const WORLD_SYNC_PORT = 8080;
 export const RCON_PORT = 25575;
 export const VELOCITY_SECRET_NAME =
   process.env.FARLANDS_VELOCITY_SECRET_NAME ?? "velocity-forwarding-secret";
+const DEFAULT_ARTIFACT_SERVICE_ACCOUNT = "farlands-artifact-reader";
+
+export function artifactServiceAccountName(
+  configured = process.env.FARLANDS_ARTIFACT_SERVICE_ACCOUNT,
+): string {
+  const name = configured?.trim() || DEFAULT_ARTIFACT_SERVICE_ACCOUNT;
+  if (name.length > 63 || !/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(name)) {
+    throw new Error("FARLANDS_ARTIFACT_SERVICE_ACCOUNT must be a DNS-1123 service account name");
+  }
+  return name;
+}
+
+export function buildArtifactServiceAccount(
+  namespace: string,
+  name = artifactServiceAccountName(),
+  roleArn = process.env.FARLANDS_ARTIFACT_ROLE_ARN?.trim(),
+): k8s.V1ServiceAccount {
+  return {
+    metadata: {
+      name,
+      namespace,
+      labels: { "farlands.dev/kind": "rule-artifact-reader" },
+      ...(roleArn ? { annotations: { "eks.amazonaws.com/role-arn": roleArn } } : {}),
+    },
+    automountServiceAccountToken: false,
+  };
+}
 
 export type TenantQuotaMirror = {
   cpuLimit: string;
@@ -223,6 +250,31 @@ async function ensureRconSecret(core: k8s.CoreV1Api, namespace: string): Promise
   });
 }
 
+async function ensureArtifactServiceAccount(core: k8s.CoreV1Api, namespace: string): Promise<void> {
+  const body = buildArtifactServiceAccount(namespace);
+  const name = body.metadata?.name;
+  if (!name) throw new Error("Artifact ServiceAccount name is unavailable");
+  try {
+    const existing = await core.readNamespacedServiceAccount({ name, namespace });
+    const expectedRole = body.metadata?.annotations?.["eks.amazonaws.com/role-arn"];
+    if (
+      expectedRole &&
+      existing.metadata?.annotations?.["eks.amazonaws.com/role-arn"] !== expectedRole
+    ) {
+      throw new Error(`Artifact ServiceAccount ${namespace}/${name} has the wrong IAM role`);
+    }
+    return;
+  } catch (error) {
+    if (!notFound(error)) throw error;
+  }
+
+  try {
+    await core.createNamespacedServiceAccount({ namespace, body });
+  } catch (error) {
+    if (!alreadyExists(error)) throw error;
+  }
+}
+
 async function copyVelocitySecret(core: k8s.CoreV1Api, namespace: string): Promise<void> {
   try {
     await core.readNamespacedSecret({
@@ -345,6 +397,7 @@ export async function ensureTenantNamespace(
   await upsertQuota(clients.core, namespace, quota);
   await ensureLimitRange(clients.core, namespace);
   await ensureDefaultDeny(clients.networking, namespace);
+  await ensureArtifactServiceAccount(clients.core, namespace);
   await ensureRconSecret(clients.core, namespace);
   await copyVelocitySecret(clients.core, namespace);
   await ensureWorldSyncConfigMap(clients.core, namespace);

@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { buildRuleJar, readStaticRule } from "@farlands/plugin-builder";
+import { contentDigest } from "@farlands/contracts";
+import { readStaticRule } from "@farlands/plugin-builder";
 import { Elysia } from "elysia";
 import {
   assertApprovedArtifactDigest,
@@ -66,11 +67,9 @@ describe("deployment authority boundary", () => {
       /human-approved content digest/,
     );
 
-    const built = await buildRuleJar(readStaticRule());
-    expect(built.contentDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
-    expect(() =>
-      assertApprovedArtifactDigest(built.contentDigest, built.contentDigest),
-    ).not.toThrow();
+    const reviewedDigest = contentDigest(readStaticRule());
+    expect(reviewedDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(() => assertApprovedArtifactDigest(reviewedDigest, reviewedDigest)).not.toThrow();
   });
 
   test("checks rollback targets before a single-use approval is redeemed", async () => {

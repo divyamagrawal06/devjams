@@ -23,6 +23,7 @@ describe("backup presentation helpers", () => {
     expect(backupStatusLabel({ activeOperation: null, status: "completed" })).toBe("Ready");
     expect(backupStatusTone({ activeOperation: null, status: "failed" })).toBe("bad");
     expect(backupIsBusy({ activeOperation: "delete", status: "completed" })).toBe(true);
+    expect(backupIsBusy({ status: "completed" })).toBe(false);
   });
 
   test("formats the weekly policy and timestamps in its declared timezone", () => {

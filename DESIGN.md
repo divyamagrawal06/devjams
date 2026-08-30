@@ -97,6 +97,18 @@ and error behavior when those states apply.
 - Approval surfaces show the exact principal, operation, target, digest, expiry, and redemption
   status.
 
+### Review and Trust Surfaces
+
+- Rule Forge creates a bounded Minecraft rule draft and never deploys it.
+- Every Change Envelope shows its immutable content digest, artifact digest, runtime version, and
+  provenance before review.
+- Approval requires a deliberate human confirmation against the exact artifact digest. Rejection
+  requires a reason and leaves no deployment controls active.
+- The Trust Ledger replays durable operational receipts from the last acknowledged event ID.
+  Reconnect states stay visible, and duplicate receipts are suppressed by their durable IDs.
+- A deployment timeline reports review and control-plane evidence only. It never implies player,
+  chat, or world telemetry that the product has not collected.
+
 ### Empty and Unavailable States
 
 - Empty states teach the first useful action.

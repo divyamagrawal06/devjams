@@ -55,6 +55,65 @@ export type BackupScheduleResponse = {
   data: BackupSchedule;
 };
 
+export type ChangeStatus = "pending_review" | "approved" | "rejected";
+
+export type ChangeEnvelope = {
+  id: string;
+  serverId: string;
+  serverName: string;
+  ruleVersionId: string;
+  ruleVersion: number;
+  title: string;
+  rationale: string;
+  source: "form" | "agent" | "director";
+  document: Record<string, unknown>;
+  contentDigest: string;
+  artifactDigest: string;
+  runtimeDigest: string;
+  runtimeMinecraftVersion: string;
+  status: ChangeStatus;
+  reviewedArtifactDigest: string | null;
+  reviewedAt: string | null;
+  rejectionReason: string | null;
+  deploymentId: string | null;
+  deploymentState: string | null;
+  deploymentError: string | null;
+  deploymentStartedAt: string | null;
+  deploymentFinishedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ChangeDiffEntry = {
+  kind: "added" | "removed" | "changed";
+  path: string;
+  before: string | null;
+  after: string | null;
+  summary: string;
+};
+
+export type ChangeTimelineEntry = {
+  id: string;
+  type: string;
+  data: Record<string, unknown>;
+  createdAt: string;
+};
+
+export type ChangeEnvelopeDetail = ChangeEnvelope & {
+  diff: ChangeDiffEntry[];
+  timeline: ChangeTimelineEntry[];
+};
+
+export type ChangeListResponse = {
+  success: boolean;
+  data: ChangeEnvelope[];
+};
+
+export type ChangeDetailResponse = {
+  success: boolean;
+  data: ChangeEnvelopeDetail;
+};
+
 type ApiErrorBody = Record<string, unknown> | string | null;
 
 export class ApiError extends Error {

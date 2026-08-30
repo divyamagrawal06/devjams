@@ -9,7 +9,6 @@ import {
   CircleAlert,
   Clipboard,
   ClipboardCheck,
-  Compass,
   Cpu,
   Database,
   Hammer,
@@ -19,6 +18,7 @@ import {
   Map as MapIcon,
   MemoryStick,
   RefreshCw,
+  ScrollText,
   Server,
   ShieldCheck,
   UserRound,
@@ -29,10 +29,14 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { api, joinAddress, type LiveListResponse, type LiveServer } from "@/lib/api";
 import { authClient } from "@/lib/auth-client";
+import { desktopWindowForRoute, isDesktopApp } from "@/lib/routes";
 import { AllayCompanion } from "./allay-companion";
 import { BackupsWindow } from "./backups-window";
 import { BillingPanel } from "./billing-panel";
 import { PanoramaBackground } from "./panorama-background";
+import { ReviewQueueWindow } from "./review-queue-window";
+import { RuleForgeWindow } from "./rule-forge-window";
+import { TrustLedgerWindow } from "./trust-ledger-window";
 
 type AppId = "realms" | "backups" | "review" | "forge" | "activity" | "account";
 
@@ -248,55 +252,19 @@ function RealmRow({
   );
 }
 
-function UnavailableFeature({ appId }: { appId: "review" | "forge" | "activity" }) {
-  const content = {
-    review: {
-      eyebrow: "Approval boundary intact",
-      title: "Review Queue is not connected",
-      body: "This desktop does not have a verified proposal connector yet. No placeholder approvals are shown, and no change can be approved from here.",
-      icon: ShieldCheck,
-    },
-    forge: {
-      eyebrow: "Authoring unavailable",
-      title: "Rule Forge is not connected",
-      body: "Rule drafting needs a scoped preview and approval endpoint before it can be safe to use. The editor stays closed until that path exists.",
-      icon: Hammer,
-    },
-    activity: {
-      eyebrow: "No event stream",
-      title: "World Feed is not connected",
-      body: "Live player and world events are not exposed by the current connector. This window will not invent activity while the feed is unavailable.",
-      icon: Compass,
-    },
-  }[appId];
-  const Icon = content.icon;
-
-  return (
-    <div className="unavailable-state">
-      <span className="unavailable-icon" aria-hidden="true">
-        <Icon size={27} />
-      </span>
-      <p className="eyebrow">{content.eyebrow}</p>
-      <h2>{content.title}</h2>
-      <p>{content.body}</p>
-      <div className="unavailable-note">
-        <CircleAlert aria-hidden="true" size={17} />
-        Unavailable is a safe state. Nothing has been sent to a realm.
-      </div>
-    </div>
-  );
-}
-
 type WindowBodyProps = {
   appId: AppId;
   copiedServerId: string | null;
   copyErrorServerId: string | null;
   health: ReturnType<typeof useQuery<HealthResponse>>;
   onOpenBackups: (serverId: string) => void;
+  onOpenReview: (changeId: string) => void;
   onCopy: (server: LiveServer) => void;
+  onSelectChange: (changeId: string) => void;
   onSelectBackupServer: (serverId: string) => void;
   quota: ReturnType<typeof useQuery<QuotaResponse>>;
   selectedBackupServerId: string | null;
+  selectedChangeId: string | null;
   servers: ReturnType<typeof useQuery<LiveListResponse>>;
   signOutError: string | null;
   signingOut: boolean;
@@ -315,10 +283,13 @@ function WindowBody({
   health,
   onCopy,
   onOpenBackups,
+  onOpenReview,
+  onSelectChange,
   onSelectBackupServer,
   onSignOut,
   quota,
   selectedBackupServerId,
+  selectedChangeId,
   servers,
   signOutError,
   signingOut,
@@ -401,8 +372,18 @@ function WindowBody({
     );
   }
 
-  if (appId === "review" || appId === "forge" || appId === "activity") {
-    return <UnavailableFeature appId={appId} />;
+  if (appId === "review") {
+    return (
+      <ReviewQueueWindow onSelectChange={onSelectChange} selectedChangeId={selectedChangeId} />
+    );
+  }
+
+  if (appId === "forge") {
+    return <RuleForgeWindow onOpenReview={onOpenReview} servers={servers.data?.data ?? []} />;
+  }
+
+  if (appId === "activity") {
+    return <TrustLedgerWindow servers={servers.data?.data ?? []} />;
   }
 
   const quotaData = quota.data?.data;
@@ -641,10 +622,36 @@ export function Desktop() {
   const compact = useCompactViewport();
   const [windows, setWindows] = useState<WindowState[]>(initialWindows);
   const [selectedBackupServerId, setSelectedBackupServerId] = useState<string | null>(null);
+  const [selectedChangeId, setSelectedChangeId] = useState<string | null>(null);
   const [copiedServerId, setCopiedServerId] = useState<string | null>(null);
   const [copyErrorServerId, setCopyErrorServerId] = useState<string | null>(null);
   const [signingOut, setSigningOut] = useState(false);
   const [signOutError, setSignOutError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const route = new URLSearchParams(window.location.search).get("app");
+    if (!isDesktopApp(route)) return;
+    const appId = desktopWindowForRoute(route);
+    setWindows((items) => {
+      if (items.some((item) => item.appId === appId)) {
+        return items.map((item) =>
+          item.appId === appId ? { ...item, minimized: false, z: nextWindowZ(items) } : item,
+        );
+      }
+      const offset = 30 * (items.length % 5);
+      return [
+        ...items,
+        {
+          appId,
+          x: 118 + offset,
+          y: 108 + offset,
+          z: nextWindowZ(items),
+          minimized: false,
+          maximized: false,
+        },
+      ];
+    });
+  }, []);
 
   useEffect(() => {
     const billingResult = new URLSearchParams(window.location.search).get("billing");
@@ -719,22 +726,22 @@ export function Desktop() {
       {
         id: "review",
         label: "Review Queue",
-        detail: "Not connected",
+        detail: "Exact human gate",
         icon: ClipboardCheck,
         color: "oklch(0.63 0.10 70)",
       },
       {
         id: "forge",
         label: "Rule Forge",
-        detail: "Not connected",
+        detail: "Bounded JSON rules",
         icon: Hammer,
         color: "oklch(0.58 0.08 48)",
       },
       {
         id: "activity",
-        label: "World Feed",
-        detail: "Not connected",
-        icon: Compass,
+        label: "Trust Ledger",
+        detail: "Durable receipts",
+        icon: ScrollText,
         color: "oklch(0.52 0.07 34)",
       },
       {
@@ -783,6 +790,11 @@ export function Desktop() {
       setSelectedBackupServerId(servers.data.data[0].id);
     }
     open("backups");
+  };
+
+  const openReview = (changeId: string) => {
+    setSelectedChangeId(changeId);
+    open("review");
   };
 
   const close = (appId: AppId) =>
@@ -939,10 +951,13 @@ export function Desktop() {
                 health={health}
                 onCopy={copyAddress}
                 onOpenBackups={openBackups}
+                onOpenReview={openReview}
+                onSelectChange={setSelectedChangeId}
                 onSelectBackupServer={setSelectedBackupServerId}
                 onSignOut={signOut}
                 quota={quota}
                 selectedBackupServerId={selectedBackupServerId}
+                selectedChangeId={selectedChangeId}
                 servers={servers}
                 signOutError={signOutError}
                 signingOut={signingOut}

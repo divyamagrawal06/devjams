@@ -3,7 +3,7 @@ import { headers } from "next/headers";
 import type { ReactNode } from "react";
 
 import { LoginScreen } from "@/components/login-screen";
-import { auth } from "@/lib/auth";
+import { getAuth } from "@/lib/auth";
 
 import "./globals.css";
 import { Providers } from "./providers";
@@ -20,7 +20,7 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
   let session = null;
 
   try {
-    session = await auth.api.getSession({ headers: await headers() });
+    session = await getAuth().api.getSession({ headers: await headers() });
   } catch (error) {
     console.error("Unable to read the indexd session", {
       message: error instanceof Error ? error.message : "Unknown authentication error",

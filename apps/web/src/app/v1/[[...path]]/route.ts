@@ -1,5 +1,5 @@
 import type { NextRequest } from "next/server";
-import { auth } from "@/lib/auth";
+import { getSession } from "@/lib/auth";
 import { listLiveServers, liveApi } from "@/lib/live";
 
 export const runtime = "nodejs";
@@ -12,7 +12,9 @@ function joinPath(path: string[] | undefined): string {
 }
 
 export async function GET(request: NextRequest, context: RouteContext) {
-  const session = await auth.api.getSession({ headers: request.headers });
+  const authResult = await getSession(request.headers);
+  if (authResult.response) return authResult.response;
+  const session = authResult.session;
   if (!session) return Response.json({ error: "Authentication required" }, { status: 401 });
 
   const pathname = joinPath((await context.params).path);
@@ -47,7 +49,9 @@ export async function GET(request: NextRequest, context: RouteContext) {
 }
 
 export async function POST(request: NextRequest, context: RouteContext) {
-  const session = await auth.api.getSession({ headers: request.headers });
+  const authResult = await getSession(request.headers);
+  if (authResult.response) return authResult.response;
+  const session = authResult.session;
   if (!session) return Response.json({ error: "Authentication required" }, { status: 401 });
 
   const pathname = joinPath((await context.params).path);

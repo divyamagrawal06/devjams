@@ -15,7 +15,9 @@ export function connectorPathAllowed(pathname: string): boolean {
     pathname === "/api/billing/checkout" ||
     pathname === "/api/billing/portal" ||
     pathname === "/api/rules" ||
-    pathname.startsWith("/api/rules/")
+    pathname.startsWith("/api/rules/") ||
+    pathname === "/api/changes" ||
+    pathname.startsWith("/api/changes/")
   );
 }
 

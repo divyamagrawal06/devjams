@@ -7,7 +7,8 @@ package com.farlands.proxy;
  * touching polling or registration logic.  In a future iteration these values
  * could be read from a TOML/YAML file placed next to the proxy jar; for now
  * they are compile-time constants that are easy to override via environment
- * variables at startup (see the static initialiser below).
+     * variables at startup (see the static initialiser below). Secrets have no
+     * built-in fallback: an unset value disables internal calls.
  */
 public final class PluginConfig {
 
@@ -38,6 +39,8 @@ public final class PluginConfig {
 
     /** How often (in seconds) the sync task polls the backend. */
     public static final long POLL_INTERVAL_SECONDS = 30;
+    /** Transfers and route rosters are latency-sensitive control-plane signals. */
+    public static final long TRANSFER_POLL_INTERVAL_SECONDS = 2;
 
     /**
      * Initial delay (in seconds) before the first poll fires.
@@ -66,9 +69,7 @@ public final class PluginConfig {
                 : "http://localhost:3000";
 
         String secret = System.getenv("FARLANDS_API_SECRET");
-        API_SECRET = (secret != null && !secret.isBlank())
-                ? secret
-                : "change-me-in-production";
+        API_SECRET = (secret != null && !secret.isBlank()) ? secret : "";
     }
 
     // Prevent instantiation – this is a constants-only class.

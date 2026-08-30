@@ -255,9 +255,19 @@ async function copyVelocitySecret(core: k8s.CoreV1Api, namespace: string): Promi
 
 async function ensureWorldSyncConfigMap(core: k8s.CoreV1Api, namespace: string): Promise<void> {
   const sender = `#!/usr/bin/env python3
-import http.server, os, subprocess, sys
+import http.server, json, os, subprocess, sys, tempfile, urllib.parse
 PORT = int(os.environ.get("WORLD_SYNC_PORT", "8080"))
 ROOT = os.environ.get("WORLD_ROOT", "/data/world")
+
+def source_manifest():
+    paths = []
+    for current, directories, files in os.walk(ROOT):
+        directories.sort(); files.sort()
+        relative_root = os.path.relpath(current, ROOT)
+        for name in directories + files:
+            relative = os.path.normpath(os.path.join(relative_root, name))
+            if relative != ".farlands-source-manifest.json": paths.append(relative)
+    return paths
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -267,42 +277,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return
         self.send_response(404); self.end_headers()
     def do_POST(self):
-        if not self.path.startswith("/stream"):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/stream":
             self.send_response(404); self.end_headers(); return
         if not os.path.isdir(ROOT):
             self.send_response(204); self.end_headers(); return
-        extra = []
-        if "delta=1" in self.path:
-            extra = ["--newer-mtime", os.environ.get("DELTA_SINCE", "1970-01-01")]
-        proc = subprocess.Popen(["tar", "-C", ROOT, "-cf", "-", *extra, "."], stdout=subprocess.PIPE)
-        self.send_response(200)
-        self.send_header("Content-Type", "application/x-tar")
-        self.end_headers()
-        assert proc.stdout is not None
-        while True:
-            chunk = proc.stdout.read(1024 * 256)
-            if not chunk: break
-            self.wfile.write(chunk)
-        proc.wait()
-        if proc.returncode != 0:
-            sys.stderr.write("tar failed %s\\n" % proc.returncode)
+        query = urllib.parse.parse_qs(parsed.query, strict_parsing=True) if parsed.query else {}
+        delta = query.get("delta") == ["1"]
+        since = query.get("since", [None])[0]
+        if delta and not since:
+            self.send_response(400); self.end_headers(); self.wfile.write(b"delta requires since"); return
+        with tempfile.TemporaryDirectory(prefix="farlands-manifest-") as temp:
+            manifest = os.path.join(temp, ".farlands-source-manifest.json")
+            with open(manifest, "w", encoding="utf-8") as handle:
+                json.dump(source_manifest(), handle, separators=(",", ":"))
+            extra = ["--newer-mtime", since] if delta else []
+            proc = subprocess.Popen(
+                ["tar", "-C", ROOT, "-cf", "-", *extra, ".", "-C", temp, ".farlands-source-manifest.json"],
+                stdout=subprocess.PIPE,
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-tar")
+            self.end_headers()
+            assert proc.stdout is not None
+            while True:
+                chunk = proc.stdout.read(1024 * 256)
+                if not chunk: break
+                self.wfile.write(chunk)
+            proc.wait()
+            if proc.returncode != 0:
+                sys.stderr.write("tar failed %s\\n" % proc.returncode)
 
 http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 `;
 
   const receiver = `#!/usr/bin/env python3
-import os, sys, tarfile, urllib.parse, urllib.request
+import json, os, shutil, sys, tarfile, urllib.parse, urllib.request
 PORT = int(os.environ.get("WORLD_SYNC_PORT", "8080"))
 ROOT = os.environ.get("WORLD_ROOT", "/data/world")
 SOURCE = os.environ["SOURCE_SYNC_URL"]
 PHASE = os.environ.get("WORLD_SYNC_PHASE", "presync")
+SINCE = os.environ.get("WORLD_SYNC_SINCE")
+MARKER = os.environ.get("WORLD_SYNC_MARKER")
+
+if PHASE == "presync" and MARKER and os.path.isfile(MARKER):
+    sys.exit(0)
 
 parsed = urllib.parse.urlparse(SOURCE)
 if parsed.scheme != "http" or parsed.port != PORT or parsed.path != "/stream":
     raise ValueError("SOURCE_SYNC_URL must name the tenant world-sync service")
 if not parsed.hostname or not parsed.hostname.endswith(".svc.cluster.local"):
     raise ValueError("SOURCE_SYNC_URL must stay inside cluster DNS")
-query = "?delta=1" if PHASE == "delta" else ""
+if PHASE == "delta" and not SINCE:
+    raise ValueError("WORLD_SYNC_SINCE is required for delta sync")
+query = "?" + urllib.parse.urlencode({"delta": "1", "since": SINCE}) if PHASE == "delta" else ""
 request = urllib.request.Request(SOURCE + query, data=b"", method="POST")
 os.makedirs(ROOT, exist_ok=True)
 with urllib.request.urlopen(request, timeout=900) as response:
@@ -312,6 +340,26 @@ with urllib.request.urlopen(request, timeout=900) as response:
         raise RuntimeError("world-sync sender returned an unexpected content type")
     with tarfile.open(fileobj=response, mode="r|") as archive:
         archive.extractall(path=ROOT, filter="data")
+manifest_path = os.path.join(ROOT, ".farlands-source-manifest.json")
+if not os.path.isfile(manifest_path):
+    raise RuntimeError("world-sync response did not include the source manifest")
+with open(manifest_path, "r", encoding="utf-8") as handle:
+    expected = set(json.load(handle))
+for current, directories, files in os.walk(ROOT, topdown=False):
+    for name in files:
+        path = os.path.join(current, name)
+        relative = os.path.normpath(os.path.relpath(path, ROOT))
+        if relative != ".farlands-source-manifest.json" and relative not in expected:
+            os.unlink(path)
+    for name in directories:
+        path = os.path.join(current, name)
+        relative = os.path.normpath(os.path.relpath(path, ROOT))
+        if relative not in expected and not os.listdir(path):
+            os.rmdir(path)
+os.unlink(manifest_path)
+if PHASE == "presync" and MARKER:
+    with open(MARKER, "w", encoding="utf-8") as handle:
+        handle.write("complete\\n")
 `;
 
   const body: k8s.V1ConfigMap = {

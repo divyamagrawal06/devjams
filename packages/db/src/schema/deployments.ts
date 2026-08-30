@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   bigserial,
+  boolean,
   check,
   index,
   integer,
@@ -43,6 +44,18 @@ export const deployments = pgTable(
     namespace: text("namespace"),
     liveDeployment: text("live_deployment"),
     liveService: text("live_service"),
+    livePvc: text("live_pvc"),
+    liveProxyTarget: text("live_proxy_target"),
+    candidateService: text("candidate_service"),
+    candidatePvc: text("candidate_pvc"),
+    sourcePlayers: jsonb("source_players").$type<string[]>().notNull().default([]),
+    lobbyPlayers: jsonb("lobby_players").$type<string[]>().notNull().default([]),
+    sourcePlayerCount: integer("source_player_count").notNull().default(0),
+    presyncCompletedAt: timestamp("presync_completed_at", { withTimezone: true }),
+    savesDisabled: boolean("saves_disabled").notNull().default(false),
+    candidateHealthy: boolean("candidate_healthy").notNull().default(false),
+    routeSwitched: boolean("route_switched").notNull().default(false),
+    abortRequestedAt: timestamp("abort_requested_at", { withTimezone: true }),
     error: text("error"),
     startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -161,4 +174,22 @@ export const velocityTransfers = pgTable(
     ),
     index("velocity_transfers_pending_idx").on(table.status, table.expiresAt, table.createdAt),
   ],
+);
+
+/**
+ * Fresh proxy observations used to bind a deployment to the exact source-realm
+ * roster and to wait for a route update without guessing at Velocity's poll
+ * interval. Usernames are kept only in the latest row for each route.
+ */
+export const velocityRouteRosters = pgTable(
+  "velocity_route_rosters",
+  {
+    route: text("route").primaryKey().notNull(),
+    targetHost: text("target_host").notNull(),
+    targetPort: integer("target_port").notNull(),
+    players: jsonb("players").$type<string[]>().notNull().default([]),
+    observedAt: timestamp("observed_at", { withTimezone: true }).notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("velocity_route_rosters_observed_idx").on(table.observedAt)],
 );

@@ -108,7 +108,7 @@ public final class FarlandsProxyPlugin {
         // placeholders.  Applying the bundled manifests without replacing the
         // Secret will cause every poll to get a 401 from the backend; operators
         // must see a clear warning rather than a false "✔ custom value" message.
-        boolean isPlaceholder = PluginConfig.API_SECRET.equals("change-me-in-production")
+        boolean isPlaceholder = PluginConfig.API_SECRET.isBlank()
                 || PluginConfig.API_SECRET.equals("dummy-secret-replace-me");
         logger.info("[FarlandsProxy] API secret configured : {}",
                 isPlaceholder
@@ -126,7 +126,7 @@ public final class FarlandsProxyPlugin {
         transferTask = proxyServer.getScheduler()
                 .buildTask(this, new TransferSyncTask(proxyServer, logger))
                 .delay(PluginConfig.INITIAL_DELAY_SECONDS, TimeUnit.SECONDS)
-                .repeat(PluginConfig.POLL_INTERVAL_SECONDS, TimeUnit.SECONDS)
+                .repeat(PluginConfig.TRANSFER_POLL_INTERVAL_SECONDS, TimeUnit.SECONDS)
                 .schedule();
 
         /*

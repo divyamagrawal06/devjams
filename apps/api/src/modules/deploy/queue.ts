@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { type DeploymentStore, deploymentStore } from "./store";
 
 const DEFAULT_MAX_CONCURRENT = 1;
-const DEFAULT_LEASE_MS = 15 * 60 * 1000;
+const DEFAULT_LEASE_MS = 60_000;
 
 function positiveInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
@@ -41,6 +41,10 @@ export class DurableDeploymentQueue {
 
   complete(id: string): Promise<void> {
     return this.store.completeQueue(id);
+  }
+
+  takeoverExpired(id: string, now = new Date()): Promise<boolean> {
+    return this.store.takeoverExpiredLease(id, this.workerId, this.leaseMs, now);
   }
 }
 

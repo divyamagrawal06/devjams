@@ -1,6 +1,10 @@
-import type { DeploymentState, DeploymentView } from "@farlands/contracts";
+import {
+  type DeploymentState,
+  type DeploymentView,
+  PRE_CUTOVER_STATES,
+} from "@farlands/contracts";
 import { deploymentStateEvents, deployments, serverRuleHeads } from "@repo/db";
-import { and, asc, count, eq, inArray, lt, notInArray, sql } from "drizzle-orm";
+import { and, asc, count, eq, inArray, isNull, lt, notInArray, sql } from "drizzle-orm";
 
 import { db } from "../../db";
 
@@ -11,6 +15,18 @@ export type DeploymentRecord = DeploymentView & {
   namespace: string | null;
   liveDeployment: string | null;
   liveService: string | null;
+  livePvc: string | null;
+  liveProxyTarget: string | null;
+  candidateService: string | null;
+  candidatePvc: string | null;
+  sourcePlayers: string[];
+  lobbyPlayers: string[];
+  sourcePlayerCount: number;
+  presyncCompletedAt: string | null;
+  savesDisabled: boolean;
+  candidateHealthy: boolean;
+  routeSwitched: boolean;
+  abortRequestedAt: string | null;
   approvedContentDigest: string;
   artifactUrl: string | null;
   artifactDigest: string | null;
@@ -30,6 +46,18 @@ export type DeploymentPatch = Partial<
     | "namespace"
     | "liveDeployment"
     | "liveService"
+    | "livePvc"
+    | "liveProxyTarget"
+    | "candidateService"
+    | "candidatePvc"
+    | "sourcePlayers"
+    | "lobbyPlayers"
+    | "sourcePlayerCount"
+    | "presyncCompletedAt"
+    | "savesDisabled"
+    | "candidateHealthy"
+    | "routeSwitched"
+    | "abortRequestedAt"
     | "artifactUrl"
     | "artifactDigest"
     | "artifactRuntimeVersion"
@@ -56,10 +84,19 @@ export interface DeploymentStore {
     state: DeploymentState,
     patch?: DeploymentPatch,
     detail?: string | null,
+    expectedStates?: readonly DeploymentState[],
+    allowAbortRequested?: boolean,
   ): Promise<DeploymentRecord>;
+  requestAbort(id: string, requestedAt: Date): Promise<DeploymentRecord | null>;
   queuePosition(id: string): Promise<number | null>;
   claimNext(workerId: string, maxConcurrent: number, leaseMs: number): Promise<string | null>;
   renewLease(id: string, workerId: string, leaseMs: number): Promise<boolean>;
+  takeoverExpiredLease(
+    id: string,
+    workerId: string,
+    leaseMs: number,
+    now: Date,
+  ): Promise<boolean>;
   completeQueue(id: string): Promise<void>;
   listRecoverable(): Promise<DeploymentRecord[]>;
   findRuleHead(serverId: string): Promise<RuleHead | null>;
@@ -90,6 +127,18 @@ function toRecord(row: DeploymentRow): DeploymentRecord {
     namespace: row.namespace,
     liveDeployment: row.liveDeployment,
     liveService: row.liveService,
+    livePvc: row.livePvc,
+    liveProxyTarget: row.liveProxyTarget,
+    candidateService: row.candidateService,
+    candidatePvc: row.candidatePvc,
+    sourcePlayers: row.sourcePlayers,
+    lobbyPlayers: row.lobbyPlayers,
+    sourcePlayerCount: row.sourcePlayerCount,
+    presyncCompletedAt: row.presyncCompletedAt?.toISOString() ?? null,
+    savesDisabled: row.savesDisabled,
+    candidateHealthy: row.candidateHealthy,
+    routeSwitched: row.routeSwitched,
+    abortRequestedAt: row.abortRequestedAt?.toISOString() ?? null,
     approvedContentDigest: row.approvedContentDigest,
     artifactUrl: row.artifactUrl,
     artifactDigest: row.artifactDigest,
@@ -123,6 +172,18 @@ function insertValues(record: Omit<DeploymentRecord, "queueSequence">) {
     namespace: record.namespace,
     liveDeployment: record.liveDeployment,
     liveService: record.liveService,
+    livePvc: record.livePvc,
+    liveProxyTarget: record.liveProxyTarget,
+    candidateService: record.candidateService,
+    candidatePvc: record.candidatePvc,
+    sourcePlayers: record.sourcePlayers,
+    lobbyPlayers: record.lobbyPlayers,
+    sourcePlayerCount: record.sourcePlayerCount,
+    presyncCompletedAt: record.presyncCompletedAt ? new Date(record.presyncCompletedAt) : null,
+    savesDisabled: record.savesDisabled,
+    candidateHealthy: record.candidateHealthy,
+    routeSwitched: record.routeSwitched,
+    abortRequestedAt: record.abortRequestedAt ? new Date(record.abortRequestedAt) : null,
     error: record.error,
     startedAt: new Date(record.startedAt),
     finishedAt: record.finishedAt ? new Date(record.finishedAt) : null,
@@ -136,6 +197,32 @@ function updateValues(patch: DeploymentPatch) {
     ...(patch.namespace !== undefined ? { namespace: patch.namespace } : {}),
     ...(patch.liveDeployment !== undefined ? { liveDeployment: patch.liveDeployment } : {}),
     ...(patch.liveService !== undefined ? { liveService: patch.liveService } : {}),
+    ...(patch.livePvc !== undefined ? { livePvc: patch.livePvc } : {}),
+    ...(patch.liveProxyTarget !== undefined ? { liveProxyTarget: patch.liveProxyTarget } : {}),
+    ...(patch.candidateService !== undefined ? { candidateService: patch.candidateService } : {}),
+    ...(patch.candidatePvc !== undefined ? { candidatePvc: patch.candidatePvc } : {}),
+    ...(patch.sourcePlayers !== undefined ? { sourcePlayers: patch.sourcePlayers } : {}),
+    ...(patch.lobbyPlayers !== undefined ? { lobbyPlayers: patch.lobbyPlayers } : {}),
+    ...(patch.sourcePlayerCount !== undefined
+      ? { sourcePlayerCount: patch.sourcePlayerCount }
+      : {}),
+    ...(patch.presyncCompletedAt !== undefined
+      ? {
+          presyncCompletedAt: patch.presyncCompletedAt
+            ? new Date(patch.presyncCompletedAt)
+            : null,
+        }
+      : {}),
+    ...(patch.savesDisabled !== undefined ? { savesDisabled: patch.savesDisabled } : {}),
+    ...(patch.candidateHealthy !== undefined
+      ? { candidateHealthy: patch.candidateHealthy }
+      : {}),
+    ...(patch.routeSwitched !== undefined ? { routeSwitched: patch.routeSwitched } : {}),
+    ...(patch.abortRequestedAt !== undefined
+      ? {
+          abortRequestedAt: patch.abortRequestedAt ? new Date(patch.abortRequestedAt) : null,
+        }
+      : {}),
     ...(patch.artifactUrl !== undefined ? { artifactUrl: patch.artifactUrl } : {}),
     ...(patch.artifactDigest !== undefined ? { artifactDigest: patch.artifactDigest } : {}),
     ...(patch.artifactRuntimeVersion !== undefined
@@ -180,17 +267,43 @@ export class DrizzleDeploymentStore implements DeploymentStore {
     state: DeploymentState,
     patch: DeploymentPatch = {},
     detail: string | null = null,
+    expectedStates?: readonly DeploymentState[],
+    allowAbortRequested = false,
   ): Promise<DeploymentRecord> {
     return db.transaction(async (tx) => {
+      const conditions = [eq(deployments.id, id)];
+      if (expectedStates?.length) conditions.push(inArray(deployments.state, [...expectedStates]));
+      if (!allowAbortRequested) conditions.push(isNull(deployments.abortRequestedAt));
       const [updated] = await tx
         .update(deployments)
         .set({ state, ...updateValues(patch), updatedAt: sql`now()` })
-        .where(eq(deployments.id, id))
+        .where(and(...conditions))
         .returning();
-      if (!updated) throw new Error(`Unknown deployment ${id}`);
+      if (!updated) {
+        const [current] = await tx.select().from(deployments).where(eq(deployments.id, id));
+        if (!current) throw new Error(`Unknown deployment ${id}`);
+        throw new DeploymentInterruptedError(id, current.state as DeploymentState);
+      }
       await tx.insert(deploymentStateEvents).values({ deploymentId: id, state, detail });
       return toRecord(updated);
     });
+  }
+
+  async requestAbort(id: string, requestedAt: Date): Promise<DeploymentRecord | null> {
+    const [updated] = await db
+      .update(deployments)
+      .set({ abortRequestedAt: requestedAt, updatedAt: sql`now()` })
+      .where(
+        and(
+          eq(deployments.id, id),
+          inArray(deployments.state, [...PRE_CUTOVER_STATES]),
+          isNull(deployments.abortRequestedAt),
+        ),
+      )
+      .returning();
+    if (updated) return toRecord(updated);
+    const current = await db.query.deployments.findFirst({ where: eq(deployments.id, id) });
+    return current ? toRecord(current) : null;
   }
 
   async queuePosition(id: string): Promise<number | null> {
@@ -277,6 +390,30 @@ export class DrizzleDeploymentStore implements DeploymentStore {
     return renewed.length === 1;
   }
 
+  async takeoverExpiredLease(
+    id: string,
+    workerId: string,
+    leaseMs: number,
+    now: Date,
+  ): Promise<boolean> {
+    const claimed = await db
+      .update(deployments)
+      .set({
+        workerId,
+        leaseExpiresAt: sql`now() + (${leaseMs} * interval '1 millisecond')`,
+        updatedAt: sql`now()`,
+      })
+      .where(
+        and(
+          eq(deployments.id, id),
+          eq(deployments.queueStatus, "running"),
+          sql`${deployments.leaseExpiresAt} <= ${now}`,
+        ),
+      )
+      .returning({ id: deployments.id });
+    return claimed.length === 1;
+  }
+
   async listRecoverable(): Promise<DeploymentRecord[]> {
     const rows = await db
       .select()
@@ -326,6 +463,7 @@ export class DrizzleDeploymentStore implements DeploymentStore {
         current_digest = excluded.current_digest,
         current_deployment_id = excluded.current_deployment_id,
         updated_at = now()
+      WHERE ${serverRuleHeads.currentDeploymentId} IS DISTINCT FROM excluded.current_deployment_id
     `);
   }
 }
@@ -335,6 +473,7 @@ export class MemoryDeploymentStore implements DeploymentStore {
   readonly events: Array<{ deploymentId: string; state: DeploymentState; detail: string | null }> =
     [];
   readonly heads = new Map<string, RuleHead>();
+  readonly headDeploymentIds = new Map<string, string>();
   private nextSequence = 1;
   private now: () => Date;
 
@@ -360,13 +499,33 @@ export class MemoryDeploymentStore implements DeploymentStore {
     state: DeploymentState,
     patch: DeploymentPatch = {},
     detail: string | null = null,
+    expectedStates?: readonly DeploymentState[],
+    allowAbortRequested = false,
   ): Promise<DeploymentRecord> {
     const record = this.records.get(id);
     if (!record) throw new Error(`Unknown deployment ${id}`);
+    if (
+      (expectedStates?.length && !expectedStates.includes(record.state)) ||
+      (!allowAbortRequested && record.abortRequestedAt)
+    ) {
+      throw new DeploymentInterruptedError(id, record.state);
+    }
     const updated = { ...record, ...patch, state };
     this.records.set(id, updated);
     this.events.push({ deploymentId: id, state, detail });
     return { ...updated };
+  }
+
+  async requestAbort(id: string, requestedAt: Date): Promise<DeploymentRecord | null> {
+    const record = this.records.get(id);
+    if (!record) return null;
+    if (
+      PRE_CUTOVER_STATES.includes(record.state as (typeof PRE_CUTOVER_STATES)[number]) &&
+      !record.abortRequestedAt
+    ) {
+      record.abortRequestedAt = requestedAt.toISOString();
+    }
+    return { ...record };
   }
 
   async queuePosition(id: string): Promise<number | null> {
@@ -418,6 +577,25 @@ export class MemoryDeploymentStore implements DeploymentStore {
     return true;
   }
 
+  async takeoverExpiredLease(
+    id: string,
+    workerId: string,
+    leaseMs: number,
+    now: Date,
+  ): Promise<boolean> {
+    const record = this.records.get(id);
+    if (
+      record?.queueStatus !== "running" ||
+      !record.leaseExpiresAt ||
+      new Date(record.leaseExpiresAt) > now
+    ) {
+      return false;
+    }
+    record.workerId = workerId;
+    record.leaseExpiresAt = new Date(now.getTime() + leaseMs).toISOString();
+    return true;
+  }
+
   async listRecoverable(): Promise<DeploymentRecord[]> {
     return [...this.records.values()]
       .filter(
@@ -439,6 +617,7 @@ export class MemoryDeploymentStore implements DeploymentStore {
     version: string;
     digest: string;
   }): Promise<void> {
+    if (this.headDeploymentIds.get(input.serverId) === input.deploymentId) return;
     const current = this.heads.get(input.serverId);
     this.heads.set(input.serverId, {
       currentVersion: input.version,
@@ -446,7 +625,18 @@ export class MemoryDeploymentStore implements DeploymentStore {
       previousVersion: current?.currentVersion ?? null,
       previousDigest: current?.currentDigest ?? null,
     });
+    this.headDeploymentIds.set(input.serverId, input.deploymentId);
   }
 }
 
 export const deploymentStore: DeploymentStore = new DrizzleDeploymentStore();
+
+export class DeploymentInterruptedError extends Error {
+  constructor(
+    readonly deploymentId: string,
+    readonly currentState: DeploymentState,
+  ) {
+    super(`Deployment ${deploymentId} was interrupted in state ${currentState}`);
+    this.name = "DeploymentInterruptedError";
+  }
+}

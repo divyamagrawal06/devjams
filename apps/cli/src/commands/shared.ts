@@ -50,7 +50,7 @@ export async function resolveDeployTarget(
       hint: `Versions on this server: ${known}. Draft a new one with: farlands rules author ${serverId} "..."`,
     });
   }
-  return { serverId, version, digest: match.content_digest };
+  return { serverId, version, digest: match.artifact_digest };
 }
 
 /**
@@ -71,7 +71,7 @@ export async function resolveRollbackTarget(api: ApiClient, serverId: string): P
   }
   const { items } = await api.listRuleSets(serverId);
   const match = items.find((entry) => entry.version === target);
-  return { serverId, version: target, digest: match?.content_digest ?? preview.content_digest };
+  return { serverId, version: target, digest: match?.artifact_digest ?? preview.content_digest };
 }
 
 /**

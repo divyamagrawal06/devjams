@@ -15,6 +15,8 @@ describe("connectorPathAllowed", () => {
     expect(connectorPathAllowed("/api/billing")).toBe(true);
     expect(connectorPathAllowed("/api/billing/checkout")).toBe(true);
     expect(connectorPathAllowed("/api/billing/portal")).toBe(true);
+    expect(connectorPathAllowed("/api/machine-tokens")).toBe(true);
+    expect(connectorPathAllowed(`/api/machine-tokens/mtk_${"a".repeat(32)}`)).toBe(true);
     expect(connectorPathAllowed("/api/changes?status=pending_review")).toBe(false);
     expect(connectorPathAllowed("/api/changes")).toBe(true);
     expect(connectorPathAllowed("/api/changes/change-1/approve")).toBe(true);
@@ -27,6 +29,7 @@ describe("connectorPathAllowed", () => {
     expect(connectorPathAllowed("/v1/servers/another-users-server/deploy")).toBe(false);
     expect(connectorPathAllowed("/api/admin/users")).toBe(false);
     expect(connectorPathAllowed("/api/billing/subscriptions")).toBe(false);
+    expect(connectorPathAllowed("/api/machine-tokens/not-a-token-id")).toBe(false);
     expect(connectorPathAllowed("/api/billing/checkout/anything-else")).toBe(false);
     expect(connectorPathAllowed("/api/operator/receipts/export")).toBe(false);
     expect(connectorPathAllowed("/metrics")).toBe(false);

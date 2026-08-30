@@ -1,5 +1,17 @@
 import type { RollupMetrics, WorldEvent } from "@farlands/contracts";
+import type { WindowCheckpoint } from "./checkpoint.ts";
 import type { SessionLedger } from "./sessions.ts";
+
+const PLAYER_TOKEN = /^[a-f0-9]{64}$/;
+
+function finiteNonNegative(value: unknown, integer = false): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    value >= 0 &&
+    (!integer || Number.isInteger(value))
+  );
+}
 
 /**
  * One open window's accumulator.
@@ -33,6 +45,56 @@ export class WindowAccumulator {
     readonly startMs: number,
     readonly endMs: number,
   ) {}
+
+  static fromCheckpoint(value: unknown): WindowAccumulator {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error("Telemetry window checkpoint is invalid");
+    }
+    const checkpoint = value as Partial<WindowCheckpoint>;
+    if (
+      !finiteNonNegative(checkpoint.start_ms) ||
+      !finiteNonNegative(checkpoint.end_ms) ||
+      checkpoint.end_ms <= checkpoint.start_ms ||
+      !finiteNonNegative(checkpoint.joins, true) ||
+      !finiteNonNegative(checkpoint.leaves, true) ||
+      !finiteNonNegative(checkpoint.deaths, true) ||
+      !finiteNonNegative(checkpoint.blocks_placed, true) ||
+      !finiteNonNegative(checkpoint.blocks_broken, true) ||
+      !finiteNonNegative(checkpoint.chat_messages, true) ||
+      !finiteNonNegative(checkpoint.closed_session_seconds) ||
+      !finiteNonNegative(checkpoint.closed_sessions, true) ||
+      !Array.isArray(checkpoint.players) ||
+      !checkpoint.players.every(
+        (player) => typeof player === "string" && PLAYER_TOKEN.test(player),
+      ) ||
+      !Array.isArray(checkpoint.seconds_in_region)
+    ) {
+      throw new Error("Telemetry window checkpoint is invalid");
+    }
+    const accumulator = new WindowAccumulator(checkpoint.start_ms, checkpoint.end_ms);
+    accumulator.joins = checkpoint.joins;
+    accumulator.leaves = checkpoint.leaves;
+    accumulator.deaths = checkpoint.deaths;
+    accumulator.blocksPlaced = checkpoint.blocks_placed;
+    accumulator.blocksBroken = checkpoint.blocks_broken;
+    accumulator.chatMessages = checkpoint.chat_messages;
+    accumulator.closedSessionSeconds = checkpoint.closed_session_seconds;
+    accumulator.closedSessions = checkpoint.closed_sessions;
+    for (const player of checkpoint.players) accumulator.players.add(player);
+    for (const entry of checkpoint.seconds_in_region) {
+      if (
+        !Array.isArray(entry) ||
+        entry.length !== 2 ||
+        typeof entry[0] !== "string" ||
+        entry[0].length > 32 ||
+        !finiteNonNegative(entry[1])
+      ) {
+        throw new Error("Telemetry window checkpoint is invalid");
+      }
+      accumulator.secondsInRegion.set(entry[0], entry[1]);
+    }
+    return accumulator;
+  }
 
   /**
    * Fold one event in.
@@ -117,6 +179,25 @@ export class WindowAccumulator {
       mean_session_seconds:
         this.closedSessions === 0 ? null : this.closedSessionSeconds / this.closedSessions,
       seconds_in_region: Object.fromEntries(this.secondsInRegion),
+    };
+  }
+
+  checkpoint(): WindowCheckpoint {
+    return {
+      start_ms: this.startMs,
+      end_ms: this.endMs,
+      joins: this.joins,
+      leaves: this.leaves,
+      deaths: this.deaths,
+      blocks_placed: this.blocksPlaced,
+      blocks_broken: this.blocksBroken,
+      chat_messages: this.chatMessages,
+      closed_session_seconds: this.closedSessionSeconds,
+      closed_sessions: this.closedSessions,
+      players: [...this.players].sort(),
+      seconds_in_region: [...this.secondsInRegion.entries()].sort(([left], [right]) =>
+        left.localeCompare(right),
+      ),
     };
   }
 }

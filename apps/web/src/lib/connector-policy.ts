@@ -18,6 +18,8 @@ export function connectorPathAllowed(pathname: string): boolean {
     pathname === "/api/billing" ||
     pathname === "/api/billing/checkout" ||
     pathname === "/api/billing/portal" ||
+    pathname === "/api/machine-tokens" ||
+    /^\/api\/machine-tokens\/mtk_[0-9a-f]{32}$/.test(pathname) ||
     pathname === "/api/servers/templates" ||
     pathname === "/api/rules" ||
     pathname.startsWith("/api/rules/") ||

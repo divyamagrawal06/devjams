@@ -5,6 +5,7 @@ import { Elysia } from "elysia";
 import { db } from "./db";
 import { adminModule } from "./modules/admin";
 import { operationApprovalModule } from "./modules/agent/approval-http";
+import { agentCompatibilityModule } from "./modules/agent/compatibility";
 import { machineTokenModule } from "./modules/auth/machine-token-http";
 import { AuthService } from "./modules/auth/service";
 import { BackupModule } from "./modules/backup";
@@ -23,8 +24,14 @@ import {
   startPodLogPolling,
 } from "./modules/servers/logs";
 import { ServerService } from "./modules/servers/service";
-import { InMemoryRollupStore, telemetryPlugin } from "./modules/telemetry/index.ts";
+import {
+  createTelemetryReadModule,
+  DrizzleRollupStore,
+  telemetryPlugin,
+} from "./modules/telemetry/index.ts";
 import { velocityModule } from "./modules/velocity/http";
+
+export const telemetryRollupStore = new DrizzleRollupStore();
 
 export const app = new Elysia()
   .get("/", () => "Hello Elysia")
@@ -51,10 +58,12 @@ export const app = new Elysia()
   .use(adminModule)
   .use(machineTokenModule)
   .use(operationApprovalModule)
+  .use(agentCompatibilityModule)
   .use(deployModule)
   .use(eventStreamModule)
   .use(velocityModule)
-  .use(telemetryPlugin({ store: new InMemoryRollupStore() }))
+  .use(createTelemetryReadModule(telemetryRollupStore))
+  .use(telemetryPlugin({ store: telemetryRollupStore }))
   .group("/api/servers/:serverId", (app) => app.use(BackupModule))
   .ws("/api/servers/:serverId/logs", {
     async open(ws: any) {

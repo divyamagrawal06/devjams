@@ -34,6 +34,7 @@ export type ApiResult<T> = { ok: true; value: T } | { ok: false; refusal: Refusa
 export interface RuleVersionSummary {
   version: number;
   content_digest: string;
+  artifact_digest: string;
   source: string;
   source_prompt: string | null;
   created_at: string;
@@ -131,23 +132,24 @@ export class ApiClient {
     window: string,
   ): Promise<{
     server_id: string;
-    window_start: string;
-    window_end: string;
-    metrics: RollupMetrics;
+    window_start: string | null;
+    window_end: string | null;
+    available: boolean;
+    metrics: RollupMetrics | null;
   }> {
     return this.expect("GET", `/v1/servers/${serverId}/telemetry?window=${window}`);
   }
 
   deploy(
     serverId: string,
-    input: { rule_set_version: number; approval_token?: string },
+    input: { rule_set_version: number; content_digest: string; approval_token?: string },
   ): Promise<ApiResult<{ deployment: Deployment }>> {
     return this.refusable("POST", `/v1/servers/${serverId}/deploy`, input);
   }
 
   rollback(
     serverId: string,
-    input: { approval_token?: string },
+    input: { rule_set_version: number; content_digest: string; approval_token?: string },
   ): Promise<ApiResult<{ deployment: Deployment }>> {
     return this.refusable("POST", `/v1/servers/${serverId}/rollback`, input);
   }

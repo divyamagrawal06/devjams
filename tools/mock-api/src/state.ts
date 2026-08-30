@@ -28,6 +28,7 @@ export interface RuleVersionRecord {
   version: number;
   document: unknown;
   content_digest: string;
+  artifact_digest: string;
   source: "form" | "agent" | "director";
   source_prompt: string | null;
   created_at: string;
@@ -133,11 +134,15 @@ export function seed(): void {
     ],
   };
 
+  const baseDigest = contentDigest(baseDocument);
   ruleVersions.set(serverId, [
     {
       version: 3,
       document: baseDocument,
-      content_digest: contentDigest(baseDocument),
+      content_digest: baseDigest,
+      // The mock has no JAR builder. Keeping the values equal preserves the
+      // two-field wire contract without pretending to produce artifact bytes.
+      artifact_digest: baseDigest,
       source: "form",
       source_prompt: null,
       created_at: new Date().toISOString(),

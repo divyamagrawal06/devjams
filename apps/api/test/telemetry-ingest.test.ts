@@ -22,6 +22,7 @@ import {
 
 const SERVER = "srv_7f2";
 const T = "2026-08-29T18:00:00.000Z";
+const INTERNAL_KEY = "telemetry-test-key";
 
 const join = (player: string, ts = T) => ({
   kind: "join",
@@ -39,7 +40,7 @@ function ndjson(...events: unknown[]): string {
 interface Harness {
   post: (
     body: string,
-    init?: { headers?: Record<string, string>; server?: string },
+    init?: { headers?: Record<string, string>; server?: string; sequence?: number },
   ) => Promise<{ status: number; body: Record<string, unknown> }>;
   aggregator: TelemetryAggregator;
   store: InMemoryRollupStore;
@@ -52,7 +53,12 @@ function harness(overrides: { store?: RollupStore; windowSeconds?: number } = {}
     windowSeconds: overrides.windowSeconds ?? 3600,
     storeTimeoutMs: 50,
   });
-  const app = telemetryPlugin({ store: overrides.store ?? store, aggregator });
+  const app = telemetryPlugin({
+    store: overrides.store ?? store,
+    aggregator,
+    internalKey: INTERNAL_KEY,
+  });
+  let sequence = 0;
 
   return {
     aggregator,
@@ -63,7 +69,13 @@ function harness(overrides: { store?: RollupStore; windowSeconds?: number } = {}
       const response = await app.handle(
         new Request(`http://localhost/internal/telemetry/${init.server ?? SERVER}`, {
           method: "POST",
-          headers: { "content-type": "application/x-ndjson", ...(init.headers ?? {}) },
+          headers: {
+            "content-type": "application/x-ndjson",
+            "x-internal-key": INTERNAL_KEY,
+            "x-telemetry-emitter-id": "00000000-0000-4000-8000-000000000001",
+            "x-telemetry-sequence": String(init.sequence ?? ++sequence),
+            ...(init.headers ?? {}),
+          },
           body,
         }),
       );
@@ -74,6 +86,36 @@ function harness(overrides: { store?: RollupStore; windowSeconds?: number } = {}
 }
 
 describe("ingest accepts well formed events", () => {
+  test("requires an emitter identity and sequence", async () => {
+    const { post } = harness();
+    const { status, body } = await post(ndjson(join("a")), {
+      headers: { "x-telemetry-emitter-id": "", "x-telemetry-sequence": "0" },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toBe("invalid_telemetry_cursor");
+  });
+
+  test("returns the same receipt when delivery of an acknowledged batch is ambiguous", async () => {
+    const { post, aggregator, store } = harness();
+    const body = ndjson(join("a"));
+    const first = await post(body, { sequence: 1 });
+    const retry = await post(body, { sequence: 1 });
+    expect(first.body.reused).toBe(false);
+    expect(retry.body.reused).toBe(true);
+    await aggregator.flush();
+    expect((await store.list(SERVER))[0]?.metrics.joins).toBe(1);
+  });
+
+  test("refuses a changed retry or sequence gap without acknowledging either", async () => {
+    const { post } = harness();
+    expect((await post(ndjson(join("a")), { sequence: 1 })).status).toBe(200);
+    const changed = await post(ndjson(join("b")), { sequence: 1 });
+    const gap = await post(ndjson(join("c")), { sequence: 3 });
+    expect(changed.status).toBe(409);
+    expect(changed.body.error).toBe("telemetry_cursor_conflict");
+    expect(gap.status).toBe(409);
+  });
+
   test("a batch of valid events is accepted whole", async () => {
     const { post } = harness();
     const { status, body } = await post(
@@ -167,6 +209,32 @@ describe("ingest accepts well formed events", () => {
       expect(status).toBe(200);
       expect(body.accepted).toBe(1);
     }
+  });
+});
+
+describe("ingest requires internal service authentication", () => {
+  test("refuses a missing or wrong key without opening a telemetry window", async () => {
+    const { post, aggregator } = harness();
+    for (const key of ["", "wrong-key"]) {
+      const { status, body } = await post(ndjson(join("mossgrove")), {
+        headers: { "x-internal-key": key },
+      });
+      expect(status).toBe(401);
+      expect(body.error).toBe("Unauthorized");
+    }
+    expect(aggregator.liveState()).toEqual({});
+  });
+
+  test("fails closed when no production key is configured", async () => {
+    const store = new InMemoryRollupStore();
+    const app = telemetryPlugin({ store, internalKey: " " });
+    const response = await app.handle(
+      new Request(`http://localhost/internal/telemetry/${SERVER}`, {
+        method: "POST",
+        body: ndjson(join("mossgrove")),
+      }),
+    );
+    expect(response.status).toBe(503);
   });
 });
 
@@ -306,7 +374,7 @@ describe("ingest refuses a request that looks externally routed", () => {
   });
 });
 
-describe("a failing store never reaches the request path", () => {
+describe("durable ingest fails closed until the store commits", () => {
   const batch = ndjson(
     join("a", "2026-08-29T18:00:00.000Z"),
     join("b", "2026-08-29T19:00:00.000Z"),
@@ -320,10 +388,8 @@ describe("a failing store never reaches the request path", () => {
     const { post, aggregator } = harness({ store: failing, windowSeconds: 60 });
 
     const { status, body } = await post(batch);
-    expect(status).toBe(200);
-    expect(body.accepted).toBe(2);
-
-    await aggregator.flush();
+    expect(status).toBe(503);
+    expect(body.error).toBe("telemetry_store_unavailable");
     expect(aggregator.storeFailures).toBeGreaterThan(0);
   });
 
@@ -337,9 +403,7 @@ describe("a failing store never reaches the request path", () => {
     const { post, aggregator } = harness({ store: failing, windowSeconds: 60 });
 
     const { status } = await post(batch);
-    expect(status).toBe(200);
-
-    await aggregator.flush();
+    expect(status).toBe(503);
     expect(aggregator.storeFailures).toBeGreaterThan(0);
   });
 
@@ -354,36 +418,36 @@ describe("a failing store never reaches the request path", () => {
 
     const started = Date.now();
     const { status } = await post(batch);
-    expect(status).toBe(200);
-    // The response does not wait for the store, so it returns well inside the
-    // 50ms deadline this harness gives a write.
-    expect(Date.now() - started).toBeLessThan(50);
-
-    await aggregator.flush();
+    expect(status).toBe(503);
+    expect(Date.now() - started).toBeLessThan(150);
     expect(aggregator.storeFailures).toBeGreaterThan(0);
   });
 
   test("a store that recovers keeps the windows that come after the outage", async () => {
-    let healthy = false;
-    const rows: WorldEventsRollup[] = [];
-    const flaky: RollupStore = {
-      put: async (rollup) => {
-        if (!healthy) throw new Error("connection refused");
-        rows.push(rollup);
-      },
-      list: async () => rows,
-    };
+    class FlakyStore extends InMemoryRollupStore {
+      healthy = false;
+
+      override async commitBatch(
+        input: import("../src/modules/telemetry/index.ts").CommitTelemetryBatchInput,
+      ) {
+        if (!this.healthy) throw new Error("connection refused");
+        return super.commitBatch(input);
+      }
+    }
+    const flaky = new FlakyStore();
     const { post, aggregator } = harness({ store: flaky, windowSeconds: 60 });
 
-    await post(
-      ndjson(join("a", "2026-08-29T18:00:00.000Z"), join("b", "2026-08-29T18:01:00.000Z")),
+    const first = ndjson(
+      join("a", "2026-08-29T18:00:00.000Z"),
+      join("b", "2026-08-29T18:01:00.000Z"),
     );
-    await aggregator.settled();
-    expect(rows).toHaveLength(0);
+    expect((await post(first, { sequence: 1 })).status).toBe(503);
+    expect(await flaky.list(SERVER)).toHaveLength(0);
 
-    healthy = true;
-    await post(ndjson(join("c", "2026-08-29T18:02:00.000Z")));
+    flaky.healthy = true;
+    expect((await post(first, { sequence: 1 })).status).toBe(200);
+    await post(ndjson(join("c", "2026-08-29T18:02:00.000Z")), { sequence: 2 });
     await aggregator.flush();
-    expect(rows).toHaveLength(2);
+    expect(await flaky.list(SERVER)).toHaveLength(3);
   });
 });

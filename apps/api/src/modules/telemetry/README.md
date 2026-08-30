@@ -14,20 +14,23 @@ Raw events are not stored. Everything downstream reads rollups.
 | `events.ts` | NDJSON parsing and validation compiled from the `WorldEvent` contract. |
 | `window.ts` | One open window's counters. No event is ever held. |
 | `sessions.ts` | Join/leave pairing and the two window-boundary decisions. |
-| `aggregator.ts` | Window rotation and handoff to the store. |
-| `store.ts` | `RollupStore` plus the in-memory implementation. |
+| `aggregator.ts` | Window rotation, HMAC pseudonymisation, and durable reduction. |
+| `checkpoint.ts` | Versioned aggregate-only crash-recovery state. |
+| `store.ts` | Atomic rollup, checkpoint, and emitter-cursor persistence. |
 
 ## The rules this module is built to keep
 
-**No raw events, anywhere.** `WindowAccumulator` holds counters, a set of distinct player
-names and a per-region total. Nothing in the module has an array of events, and the store
-interface has no method that takes or returns one. Memory is a function of distinct players
-and elapsed windows, never of event volume.
+**No raw events, anywhere.** Before state crosses the persistence boundary, player names are
+replaced with stable HMAC tokens. The crash checkpoint contains counters, HMAC-token sets,
+open-session timestamps, and per-region totals—never raw events, names, or chat content.
+Memory and storage are functions of distinct players and elapsed windows, never event volume.
+Set `TELEMETRY_PRIVACY_KEY` to a stable secret so internal-service key rotation does not change
+tokens mid-session; deployments without it use `INTERNAL_API_KEY` as a fail-closed fallback.
 
-**Cluster-internal is enforced in two halves.** The NetworkPolicy is Engineer 2's; this
-module refuses requests carrying `x-forwarded-for` and its relatives, which is what an
-accidental public route leaves behind. The refusal is a `not_found`, so a scanner that
-reaches it does not learn that `/internal/*` exists.
+**Cluster-internal is enforced in layers.** The NetworkPolicy limits reachability, this module
+refuses edge-forwarding headers, and every request must carry the shared `x-internal-key`.
+Missing production configuration fails closed with 503. An accidentally proxied request still
+gets `not_found`, so a scanner does not learn that `/internal/*` exists.
 
 **Session pairing at a window boundary.** A session still open when a window closes is
 carried forward, not truncated, and the full duration is credited to the window in which the
@@ -35,15 +38,18 @@ session actually closed. A leave with no join counts toward `leaves` and contrib
 to `mean_session_seconds`. `mean_session_seconds` is `null`, never `0`, when nothing closed.
 `sessions.ts` states the reasoning; `test/telemetry-rollup.test.ts` asserts both cases.
 
-**Player names are opaque.** They are Set keys and Map keys. Nothing parses them, matches
-them, or interpolates them, and the rejection path reports schema paths rather than values so
-player-authored text never reaches a log line.
+**Player names are opaque and ephemeral.** Nothing parses, logs, or branches on them. The
+HTTP boundary converts them to HMAC tokens before checkpoint reduction, and the rejection
+path reports schema paths rather than values.
 
-## Not written here
+**Acknowledgement is durable and idempotent.** Each emitter boot has a UUID and a strictly
+increasing sequence. The same sequence and payload digest reuses its committed receipt;
+conflicting retries and gaps fail closed. The cursor, open checkpoint, and any closed rollups
+commit in one transaction before HTTP success, so an ambiguous response retry counts once.
 
-- `world_events_rollup` and its Drizzle migration. Migrations are one sequence with one owner
-  (Engineer 3); this module requests the table by pull request rather than forking the
-  sequence. Swap `InMemoryRollupStore` for the Drizzle implementation of `RollupStore` when it
-  lands; nothing else changes.
-- The Java emitter under `plugin-runtime/`. Deferred: the project targets Java 25 and this
-  environment has Java 17 with no Maven, so it could not be compiled or tested.
+## Production wiring
+
+`DrizzleRollupStore` writes immutable closed windows plus aggregate-only open checkpoints. The
+Paper emitter uses a bounded queue and Java's asynchronous HTTP client; retries retain the same
+cursor identity, it never sends chat content, and shutdown never performs network I/O on the
+game thread.

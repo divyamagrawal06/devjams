@@ -19,7 +19,9 @@ export function serversCommand(ctx: CommandContext) {
             server.server_id,
             server.name,
             server.state,
-            `${server.player_count}/${server.max_players}`,
+            server.player_count === null
+              ? "-"
+              : `${server.player_count}/${server.max_players ?? "-"}`,
             server.tps === null ? "-" : server.tps.toFixed(1),
             server.current_version === null ? "-" : `v${server.current_version}`,
           ]),

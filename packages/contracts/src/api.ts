@@ -11,15 +11,29 @@ import { RuleDiff, RuleSetVersion } from "./rules.ts";
 export const ServerSummary = Type.Object({
   server_id: ServerId,
   name: Type.String(),
-  hostname: Type.String({ description: "Stable public address, safe to share" }),
+  hostname: Type.Union([
+    Type.String({ description: "Stable public address, safe to share" }),
+    Type.Null({ description: "No public route has been assigned yet" }),
+  ]),
   state: Type.Union([
+    Type.Literal("ready"),
     Type.Literal("running"),
     Type.Literal("stopped"),
     Type.Literal("starting"),
+    Type.Literal("stopping"),
+    Type.Literal("restarting"),
+    Type.Literal("provisioning"),
     Type.Literal("deploying"),
+    Type.Literal("failed"),
   ]),
-  player_count: Type.Integer({ minimum: 0 }),
-  max_players: Type.Integer({ minimum: 0 }),
+  player_count: Type.Union([
+    Type.Integer({ minimum: 0 }),
+    Type.Null({ description: "No fresh roster connector reading is available" }),
+  ]),
+  max_players: Type.Union([
+    Type.Integer({ minimum: 0 }),
+    Type.Null({ description: "This workload has no player-capacity field" }),
+  ]),
   tps: Type.Union([Type.Number({ minimum: 0, maximum: 20 }), Type.Null()]),
   current_version: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
   regions: Type.Array(Type.String()),
@@ -105,6 +119,8 @@ export type PreviewDeployResponse = Static<typeof PreviewDeployResponse>;
 
 export const DeployRequest = Type.Object({
   rule_set_version: Type.Integer({ minimum: 1 }),
+  /** SHA-256 of the exact JAR bytes the candidate will mount. */
+  content_digest: ContentDigest,
   approval_token: Type.Optional(Type.String()),
 });
 export type DeployRequest = Static<typeof DeployRequest>;

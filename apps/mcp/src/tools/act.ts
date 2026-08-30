@@ -1,6 +1,7 @@
 import type { ApiRequest } from "../api-client.ts";
 import {
   approvalRefusalFrom,
+  failed,
   notFoundRefusalFrom,
   ok,
   refused,
@@ -8,12 +9,41 @@ import {
   type ToolOutcome,
 } from "../results.ts";
 import {
+  asItems,
   asRecord,
   isContractNotFound,
+  refuseUnreadable,
   type ToolContext,
   type ToolHandler,
   upstreamFailure,
 } from "./context.ts";
+
+async function exactArtifactDigest(
+  context: ToolContext,
+  serverId: string,
+  version: number,
+  tool: string,
+): Promise<{ digest: string } | { outcome: ToolOutcome }> {
+  const result = await context.api.send(context.caller, {
+    method: "GET",
+    path: `/v1/servers/${serverId}/rule-sets`,
+  });
+  const refusal = refuseUnreadable(result, tool, `server ${serverId}`);
+  if (refusal) return { outcome: refusal };
+  const row = asItems(result.body)
+    .map(asRecord)
+    .find((item) => item?.version === version);
+  const digest = row?.artifact_digest;
+  if (typeof digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(digest)) {
+    return {
+      outcome: failed("artifact_unavailable", {
+        error: "artifact_unavailable",
+        message: `Rule set version ${version} has no immutable artifact digest to approve.`,
+      }),
+    };
+  }
+  return { digest };
+}
 
 /**
  * ACT tools: they touch a live world, they carry an approval token, and they
@@ -67,6 +97,8 @@ const deploy_rules: ToolHandler = async (args, context) => {
     version: number;
     approval_token?: string;
   };
+  const artifact = await exactArtifactDigest(context, server_id, version, "deploy_rules");
+  if ("outcome" in artifact) return artifact.outcome;
   return act({
     tool: "deploy_rules",
     context,
@@ -74,7 +106,11 @@ const deploy_rules: ToolHandler = async (args, context) => {
     request: {
       method: "POST",
       path: `/v1/servers/${server_id}/deploy`,
-      body: { rule_set_version: version, approval_token },
+      body: {
+        rule_set_version: version,
+        content_digest: artifact.digest,
+        approval_token,
+      },
     },
     note: "Queued. Follow it with get_deployment; players move only after the candidate passes health checks.",
   });
@@ -85,6 +121,22 @@ const rollback: ToolHandler = async (args, context) => {
     server_id: string;
     approval_token?: string;
   };
+  const preview = await context.api.send(context.caller, {
+    method: "POST",
+    path: `/v1/servers/${server_id}/preview`,
+    body: {},
+  });
+  const previewRefusal = refuseUnreadable(preview, "rollback", `server ${server_id}`);
+  if (previewRefusal) return previewRefusal;
+  const target = asRecord(preview.body)?.rollback_target;
+  if (typeof target !== "number" || !Number.isInteger(target) || target < 1) {
+    return failed("rollback_unavailable", {
+      error: "rollback_unavailable",
+      message: `Server ${server_id} has no previous immutable rule version to restore.`,
+    });
+  }
+  const artifact = await exactArtifactDigest(context, server_id, target, "rollback");
+  if ("outcome" in artifact) return artifact.outcome;
   return act({
     tool: "rollback",
     context,
@@ -92,7 +144,11 @@ const rollback: ToolHandler = async (args, context) => {
     request: {
       method: "POST",
       path: `/v1/servers/${server_id}/rollback`,
-      body: { approval_token },
+      body: {
+        rule_set_version: target,
+        content_digest: artifact.digest,
+        approval_token,
+      },
     },
     note: "Queued. Rollback restores the previous rules and preserves play since the change; it does not undo what the rule already did to the world.",
   });

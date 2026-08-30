@@ -65,7 +65,12 @@ export function rollbackCommand(ctx: CommandContext) {
       ctx.outcome.exitCode = await startAndFollow(ctx, {
         api,
         target,
-        start: () => api.rollback(serverId, { approval_token: approvalToken }),
+        start: () =>
+          api.rollback(serverId, {
+            rule_set_version: target.version,
+            content_digest: target.digest,
+            approval_token: approvalToken,
+          }),
         watch: Boolean(args.watch),
         onStall: args["on-stall"] === "abort" ? "abort" : "report",
         stallBudgetMs: parseOptionalMs(args["stall-budget-ms"]),

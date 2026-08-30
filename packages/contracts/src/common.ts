@@ -18,7 +18,11 @@ export const ContentDigest = Type.String({
 });
 export type ContentDigest = Static<typeof ContentDigest>;
 
-export const ServerId = Type.String({ pattern: "^srv_[a-z0-9]{3,32}$" });
+export const ServerId = Type.String({
+  pattern:
+    "^(?:srv_[a-z0-9]{3,32}|[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$",
+  description: "A legacy srv_ identifier or the UUID used by the live control plane",
+});
 export type ServerId = Static<typeof ServerId>;
 
 export const DeploymentId = Type.String({ pattern: "^dep_[a-z0-9]{3,32}$" });

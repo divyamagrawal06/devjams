@@ -33,10 +33,36 @@
 /** A join older than this is presumed lost rather than still open. */
 export const DEFAULT_MAX_SESSION_SECONDS = 12 * 60 * 60;
 
+export type SessionLedgerCheckpoint = Array<[string, number]>;
+
+const PLAYER_TOKEN = /^[a-f0-9]{64}$/;
+
 export class SessionLedger {
   private readonly openJoins = new Map<string, number>();
 
   constructor(private readonly maxSessionMs = DEFAULT_MAX_SESSION_SECONDS * 1000) {}
+
+  static fromCheckpoint(
+    checkpoint: unknown,
+    maxSessionMs = DEFAULT_MAX_SESSION_SECONDS * 1000,
+  ): SessionLedger {
+    if (!Array.isArray(checkpoint)) throw new Error("Telemetry session checkpoint is invalid");
+    const ledger = new SessionLedger(maxSessionMs);
+    for (const entry of checkpoint) {
+      if (
+        !Array.isArray(entry) ||
+        entry.length !== 2 ||
+        typeof entry[0] !== "string" ||
+        !PLAYER_TOKEN.test(entry[0]) ||
+        typeof entry[1] !== "number" ||
+        !Number.isFinite(entry[1])
+      ) {
+        throw new Error("Telemetry session checkpoint is invalid");
+      }
+      ledger.openJoins.set(entry[0], entry[1]);
+    }
+    return ledger;
+  }
 
   /**
    * Record a join.
@@ -83,5 +109,9 @@ export class SessionLedger {
   /** Currently open sessions. Exposed so tests can assert the ledger stays bounded. */
   get openCount(): number {
     return this.openJoins.size;
+  }
+
+  checkpoint(): SessionLedgerCheckpoint {
+    return [...this.openJoins.entries()].sort(([left], [right]) => left.localeCompare(right));
   }
 }

@@ -183,7 +183,12 @@ export abstract class ChangeService {
     };
   }
 
-  static async create(userId: string, input: ChangeDraftInput) {
+  static async create(
+    userId: string,
+    input: ChangeDraftInput,
+    options: { source?: "form" | "agent" | "director" } = {},
+  ) {
+    const source = options.source ?? "form";
     const [server] = await db
       .select({ id: gameServers.id, name: gameServers.name, game: gameServers.game })
       .from(gameServers)
@@ -295,7 +300,7 @@ export abstract class ChangeService {
         version,
         jsonUrl: built.jsonUrl,
         contentDigest: built.contentDigest,
-        source: "form",
+        source,
         provenanceRef: createdId,
         createdBy: userId,
       });
@@ -320,7 +325,7 @@ export abstract class ChangeService {
         ruleVersion: version,
         title: input.title,
         rationale: input.rationale,
-        source: "form",
+        source,
         document,
         contentDigest: built.contentDigest,
         artifactDigest: built.artifactDigest,

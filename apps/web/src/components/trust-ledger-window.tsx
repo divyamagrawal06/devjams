@@ -1,9 +1,10 @@
 "use client";
 
-import { CircleAlert, RefreshCw, ScrollText, ShieldCheck } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
+import { Activity, CircleAlert, RefreshCw, ScrollText, ShieldCheck } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
-import { farlandsApiPath, type LiveServer } from "@/lib/api";
+import { api, farlandsApiPath, type LiveServer, type WorldFeedResponse } from "@/lib/api";
 import {
   type ControlPlaneEvent,
   controlEventSummary,
@@ -33,11 +34,22 @@ export function TrustLedgerWindow({
   const [events, setEvents] = useState<ControlPlaneEvent[]>([]);
   const [streamState, setStreamState] = useState<StreamState>("connecting");
   const [generation, setGeneration] = useState(0);
+  const [feedWindow, setFeedWindow] = useState<"1h" | "6h" | "24h">("1h");
   const selected = useMemo(
     () => servers.find((server) => server.id === serverId) ?? servers[0] ?? null,
     [serverId, servers],
   );
   const selectedId = selected?.id ?? "";
+  const worldFeed = useQuery<WorldFeedResponse>({
+    queryKey: ["world-feed", selectedId, feedWindow],
+    queryFn: () =>
+      api<WorldFeedResponse>(
+        `/api/servers/${encodeURIComponent(selectedId)}/telemetry?window=${feedWindow}`,
+      ),
+    enabled: Boolean(selectedId),
+    refetchInterval: 30_000,
+    retry: 1,
+  });
 
   useEffect(() => {
     if (!serverId && servers[0]) setServerId(servers[0].id);
@@ -126,13 +138,90 @@ export function TrustLedgerWindow({
         </button>
       </div>
 
-      <div className="ledger-scope-note">
-        <CircleAlert aria-hidden="true" size={18} />
-        <span>
-          World Feed remains unavailable until privacy-aware telemetry rollups are connected. This
-          window shows operational evidence only and does not infer player activity.
-        </span>
-      </div>
+      <section className="world-feed" aria-labelledby="world-feed-title">
+        <div className="world-feed-heading">
+          <div>
+            <p className="eyebrow">Privacy-aware aggregates</p>
+            <h3 id="world-feed-title">World Feed</h3>
+          </div>
+          <label>
+            Window
+            <select
+              onChange={(event) => setFeedWindow(event.target.value as "1h" | "6h" | "24h")}
+              value={feedWindow}
+            >
+              <option value="1h">1 hour</option>
+              <option value="6h">6 hours</option>
+              <option value="24h">24 hours</option>
+            </select>
+          </label>
+        </div>
+
+        {worldFeed.isPending ? (
+          <div className="world-feed-state" role="status">
+            <Activity aria-hidden="true" size={20} /> Loading closed aggregate windows…
+          </div>
+        ) : null}
+        {worldFeed.isError ? (
+          <div className="world-feed-state unavailable" role="status">
+            <CircleAlert aria-hidden="true" size={20} /> World Feed is unavailable from the live
+            connector. No player activity was inferred.
+          </div>
+        ) : null}
+        {worldFeed.data && !worldFeed.data.available ? (
+          <div className="world-feed-state" role="status">
+            <ShieldCheck aria-hidden="true" size={20} /> No closed telemetry window exists yet. This
+            is unavailable evidence, not zero activity.
+          </div>
+        ) : null}
+        {worldFeed.data?.available && worldFeed.data.metrics ? (
+          <>
+            <dl className="world-feed-grid">
+              <div>
+                <dt>Unique players</dt>
+                <dd>{worldFeed.data.metrics.unique_players}+</dd>
+              </div>
+              <div>
+                <dt>Joins / leaves</dt>
+                <dd>
+                  {worldFeed.data.metrics.joins} / {worldFeed.data.metrics.leaves}
+                </dd>
+              </div>
+              <div>
+                <dt>Deaths</dt>
+                <dd>{worldFeed.data.metrics.deaths}</dd>
+              </div>
+              <div>
+                <dt>Blocks changed</dt>
+                <dd>
+                  {worldFeed.data.metrics.blocks_placed + worldFeed.data.metrics.blocks_broken}
+                </dd>
+              </div>
+              <div>
+                <dt>Chat volume</dt>
+                <dd>{worldFeed.data.metrics.chat_messages}</dd>
+              </div>
+              <div>
+                <dt>Mean session</dt>
+                <dd>
+                  {worldFeed.data.metrics.mean_session_seconds === null
+                    ? "Unavailable"
+                    : `${Math.round(worldFeed.data.metrics.mean_session_seconds / 60)} min`}
+                </dd>
+              </div>
+            </dl>
+            <p className="world-feed-receipt">
+              {worldFeed.data.rollup_windows} closed window
+              {worldFeed.data.rollup_windows === 1 ? "" : "s"} · through{" "}
+              {worldFeed.data.window_end ? timestamp(worldFeed.data.window_end) : "unavailable"}
+            </p>
+          </>
+        ) : null}
+        <p className="world-feed-privacy">
+          Aggregate counters only. Unique players is a lower bound across windows. Raw events,
+          player names, and chat content are not retained.
+        </p>
+      </section>
 
       {events.length === 0 ? (
         <div className="query-state">

@@ -59,6 +59,18 @@ function SessionLifecycle() {
   return null;
 }
 
+function StaticServiceWorker() {
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "production" || !("serviceWorker" in navigator)) return;
+    void navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch((error) => {
+      console.warn("Static service worker registration failed", {
+        message: error instanceof Error ? error.message : "Unknown registration failure",
+      });
+    });
+  }, []);
+  return null;
+}
+
 export function useOnlineStatus() {
   return useContext(OnlineContext);
 }
@@ -68,6 +80,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
   return (
     <QueryClientProvider client={client}>
       <SessionLifecycle />
+      <StaticServiceWorker />
       <OnlineState>{children}</OnlineState>
     </QueryClientProvider>
   );

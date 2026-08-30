@@ -8,9 +8,8 @@ export { app };
 
 /**
  * The telemetry module's mount point, kept to one call so the shell owner can
- * move or rename it without reading the module. Pass the Drizzle-backed
- * RollupStore once the `world_events_rollup` migration lands; until then
- * InMemoryRollupStore from the same module is a working stand-in.
+ * move or rename it without reading the module. The production app mounts a
+ * shared DrizzleRollupStore; this helper remains for focused composition tests.
  */
 export function registerTelemetry<T extends Elysia>(instance: T, store: RollupStore) {
   return instance.use(telemetryPlugin({ store }));

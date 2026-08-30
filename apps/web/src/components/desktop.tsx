@@ -53,6 +53,10 @@ const BillingPanel = dynamic(
   () => import("./billing-panel").then((module) => module.BillingPanel),
   { loading: WindowLoading },
 );
+const AgentConnectionsPanel = dynamic(
+  () => import("./agent-connections-panel").then((module) => module.AgentConnectionsPanel),
+  { loading: WindowLoading },
+);
 const OperatorHome = dynamic(
   () => import("./operator-home").then((module) => module.OperatorHome),
   { loading: WindowLoading },
@@ -395,6 +399,11 @@ function WindowBody({
       </div>
 
       <BillingPanel controlMessage={controlMessage} controlsAvailable={controlsAvailable} />
+
+      <AgentConnectionsPanel
+        controlMessage={controlMessage}
+        controlsAvailable={controlsAvailable}
+      />
 
       <div className="account-actions">
         <p>Signing out clears this browser session. It does not stop or change any realm.</p>

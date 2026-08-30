@@ -30,6 +30,18 @@ export function telemetryCommand(ctx: CommandContext) {
       const rollup = await api.telemetry(serverId, window);
       const metrics = rollup.metrics;
 
+      if (!rollup.available || metrics === null) {
+        ctx.runtime.out.view({
+          records: () => [{ event: "world_activity_unavailable", window, ...rollup }],
+          table: () => ({
+            columns: ["status", "detail"],
+            rows: [["unavailable", "No closed aggregate telemetry window is available yet."]],
+            footer: "No activity was inferred and no zero counters were invented.",
+          }),
+        });
+        return;
+      }
+
       ctx.runtime.out.view({
         records: () => [{ event: "world_activity", window, ...rollup }],
         table: () => ({

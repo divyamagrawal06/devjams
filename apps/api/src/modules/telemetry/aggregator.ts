@@ -1,63 +1,59 @@
+import { createHmac } from "node:crypto";
 import type { WorldEvent, WorldEventsRollup } from "@farlands/contracts";
+import {
+  EMPTY_TELEMETRY_CHECKPOINT,
+  type TelemetryBatchMutation,
+  type TelemetryServerCheckpoint,
+  type TelemetryStateMutation,
+} from "./checkpoint.ts";
 import { DEFAULT_MAX_SESSION_SECONDS, SessionLedger } from "./sessions.ts";
-import type { RollupStore } from "./store.ts";
+import { type DurableIngestResult, isDurableRollupStore, type RollupStore } from "./store.ts";
 import { WindowAccumulator } from "./window.ts";
 
-/**
- * Rolling window aggregation, one open window per server.
- *
- * Windows are aligned to absolute time (floor of the event timestamp over the
- * window length) rather than to the first event seen. Alignment matters because
- * the evaluation harness compares a window before a deployment with a window
- * after it, and two windows are only comparable if their boundaries were not
- * chosen by whichever batch happened to arrive first.
- *
- * Exactly one window per server is open at a time. An event that belongs to a
- * window already closed is dropped and counted, because reopening it would
- * require having kept the events that built it, which is the thing this module
- * does not do. In practice the emitter batches in order and the drop count
- * stays at zero; a non-zero count is a signal that batches are arriving out of
- * order and is worth surfacing rather than hiding.
- */
-
+/** Rolling, absolute-time telemetry aggregation with crash-safe checkpoints. */
 export const DEFAULT_WINDOW_SECONDS = 300;
-
-/**
- * A store that never answers is the same problem as a store that rejects, but
- * it fails in the worse direction: without a deadline the write chain stops
- * forever and every later window queues behind it.
- */
 export const DEFAULT_STORE_TIMEOUT_MS = 5_000;
 
 export interface AggregatorOptions {
   store: RollupStore;
-  /** Window length. Aligned to absolute time, so this also fixes the boundaries. */
   windowSeconds?: number;
-  /** A join older than this is presumed lost. Bounds the open-session ledger. */
   maxSessionSeconds?: number;
-  /** Deadline for one store write before the window is abandoned. */
   storeTimeoutMs?: number;
-  /**
-   * Called when the store refuses a window. The default is deliberately quiet;
-   * a caller that wants a metric or a log line supplies one.
-   */
   onStoreError?: (error: unknown, rollup: WorldEventsRollup) => void;
 }
 
 export interface IngestOutcome {
-  /** Events folded into a window. */
   accepted: number;
-  /** Events whose window had already closed. */
   late: number;
-  /** Windows closed by this call and handed to the store. */
   closed: number;
+}
+
+export interface DurableIngestInput {
+  serverId: string;
+  emitterId: string;
+  sequence: number;
+  payloadDigest: string;
+  privacyKey: string;
+  events: readonly WorldEvent[];
 }
 
 interface ServerState {
   open: WindowAccumulator | null;
   sessions: SessionLedger;
-  /** Newest window start already closed, so late events are recognisable. */
   lastClosedStartMs: number;
+}
+
+function validCheckpoint(value: unknown): value is TelemetryServerCheckpoint {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const checkpoint = value as Partial<TelemetryServerCheckpoint>;
+  return (
+    checkpoint.version === 1 &&
+    (checkpoint.last_closed_start_ms === null ||
+      (typeof checkpoint.last_closed_start_ms === "number" &&
+        Number.isFinite(checkpoint.last_closed_start_ms))) &&
+    Array.isArray(checkpoint.sessions) &&
+    (checkpoint.open === null || typeof checkpoint.open === "object")
+  );
 }
 
 export class TelemetryAggregator {
@@ -66,13 +62,8 @@ export class TelemetryAggregator {
   private readonly maxSessionMs: number;
   private readonly storeTimeoutMs: number;
   private readonly onStoreError: (error: unknown, rollup: WorldEventsRollup) => void;
+  /** Legacy synchronous/test states. Production ingest uses durable checkpoints. */
   private readonly servers = new Map<string, ServerState>();
-
-  /**
-   * Writes are chained rather than awaited by callers. The request path must
-   * never wait on persistence: a slow store would turn into a slow ingest, and
-   * a slow ingest turns into an emitter backing up inside the game server.
-   */
   private writes: Promise<void> = Promise.resolve();
   private droppedWindows = 0;
   private lateEvents = 0;
@@ -86,84 +77,101 @@ export class TelemetryAggregator {
   }
 
   /**
-   * Fold a validated batch into the open windows.
-   *
-   * Synchronous on purpose. Everything this method does is arithmetic over
-   * counters, so there is nothing to await, and having no await means there is
-   * no path by which a store, a network or a database can make ingest slow.
+   * Pure in-memory compatibility seam for rollup unit tests. HTTP ingest uses
+   * `ingestDurably`, because acknowledging an uncommitted batch loses it when
+   * the API restarts or when the response is lost in transit.
    */
   ingest(serverId: string, events: readonly WorldEvent[]): IngestOutcome {
     const state = this.stateFor(serverId);
-    let accepted = 0;
-    let late = 0;
-    let closed = 0;
-
-    for (const event of events) {
-      const startMs = Math.floor(Date.parse(event.ts) / this.windowMs) * this.windowMs;
-
-      if (state.open === null) {
-        // A window that was already closed cannot be reopened without the
-        // events that built it, and those are gone by design.
-        if (startMs <= state.lastClosedStartMs) {
-          late += 1;
-          this.lateEvents += 1;
-          continue;
-        }
-        state.open = new WindowAccumulator(startMs, startMs + this.windowMs);
-      } else if (startMs > state.open.startMs) {
-        this.closeWindow(serverId, state);
-        closed += 1;
-        state.open = new WindowAccumulator(startMs, startMs + this.windowMs);
-      } else if (startMs < state.open.startMs) {
-        late += 1;
-        this.lateEvents += 1;
-        continue;
-      }
-
-      state.open.add(event, state.sessions);
-      accepted += 1;
-    }
-
-    return { accepted, late, closed };
+    const mutation = this.fold(serverId, state, events);
+    this.lateEvents += mutation.receipt.late;
+    for (const rollup of mutation.rollups) this.enqueue(rollup);
+    return mutation.receipt;
   }
 
-  /**
-   * Close every open window and wait for persistence to settle.
-   *
-   * Two callers: the scheduled flush that closes a window whose wall clock has
-   * passed even though no further events arrived, and tests, which need a point
-   * at which the store is known to have been written.
-   */
+  /** Atomically commits aggregate state, closed rollups, and the retry cursor. */
+  async ingestDurably(input: DurableIngestInput): Promise<DurableIngestResult> {
+    if (!isDurableRollupStore(this.store)) {
+      this.droppedWindows += 1;
+      throw new Error("Telemetry ingest requires a durable rollup store");
+    }
+
+    const events = input.events.map((event) => ({
+      ...event,
+      player_name:
+        event.player_name === null
+          ? null
+          : createHmac("sha256", input.privacyKey)
+              .update("telemetry-player:v1\0", "utf8")
+              .update(input.serverId, "utf8")
+              .update("\0", "utf8")
+              .update(event.player_name, "utf8")
+              .digest("hex"),
+    }));
+
+    try {
+      const result = await this.withDeadline(
+        this.store.commitBatch({
+          serverId: input.serverId,
+          emitterId: input.emitterId,
+          sequence: input.sequence,
+          payloadDigest: input.payloadDigest,
+          reduce: (checkpoint) => this.fold(input.serverId, this.restore(checkpoint), events),
+        }),
+      );
+      if (!result.reused) this.lateEvents += result.late;
+      return result;
+    } catch (error) {
+      this.droppedWindows += 1;
+      throw error;
+    }
+  }
+
+  /** Force-close open checkpoints, including checkpoints created before restart. */
   async flush(serverId?: string): Promise<void> {
-    const ids = serverId === undefined ? [...this.servers.keys()] : [serverId];
-    for (const id of ids) {
+    const legacyIds = serverId === undefined ? [...this.servers.keys()] : [serverId];
+    for (const id of legacyIds) {
       const state = this.servers.get(id);
-      if (state?.open) this.closeWindow(id, state);
+      if (state?.open) {
+        const rollup = this.closeWindow(id, state);
+        if (rollup) this.enqueue(rollup);
+      }
     }
     await this.settled();
+
+    if (!isDurableRollupStore(this.store)) return;
+    const ids = serverId === undefined ? await this.store.checkpointServerIds() : [serverId];
+    for (const id of ids) await this.mutateDurableState(id, true, Date.now());
   }
 
-  /** Resolves once every window handed to the store has been written or dropped. */
+  /** Close only absolute windows whose boundary has passed. */
+  async flushExpired(nowMs = Date.now()): Promise<void> {
+    for (const [id, state] of this.servers) {
+      if (state.open && state.open.endMs <= nowMs) {
+        const rollup = this.closeWindow(id, state);
+        if (rollup) this.enqueue(rollup);
+      }
+    }
+    await this.settled();
+
+    if (!isDurableRollupStore(this.store)) return;
+    for (const id of await this.store.checkpointServerIds()) {
+      await this.mutateDurableState(id, false, nowMs);
+    }
+  }
+
   async settled(): Promise<void> {
     await this.writes;
   }
 
-  /** Windows the store refused. A rising count means telemetry is being lost, not the game. */
   get storeFailures(): number {
     return this.droppedWindows;
   }
 
-  /** Events that arrived after their window closed. */
   get lateDropped(): number {
     return this.lateEvents;
   }
 
-  /**
-   * Everything held in memory right now, for tests that inspect rather than
-   * trust. It reports sizes, not contents, because there are no contents to
-   * report: an open window is counters and a name set, and the ledger is one
-   * timestamp per online player.
-   */
   liveState(): Record<string, { hasOpenWindow: boolean; openSessions: number }> {
     const out: Record<string, { hasOpenWindow: boolean; openSessions: number }> = {};
     for (const [id, state] of this.servers) {
@@ -172,50 +180,104 @@ export class TelemetryAggregator {
     return out;
   }
 
+  private fold(
+    serverId: string,
+    state: ServerState,
+    events: readonly WorldEvent[],
+  ): TelemetryBatchMutation {
+    let accepted = 0;
+    let late = 0;
+    const rollups: WorldEventsRollup[] = [];
+
+    for (const event of events) {
+      const startMs = Math.floor(Date.parse(event.ts) / this.windowMs) * this.windowMs;
+      if (state.open === null) {
+        if (startMs <= state.lastClosedStartMs) {
+          late += 1;
+          continue;
+        }
+        state.open = new WindowAccumulator(startMs, startMs + this.windowMs);
+      } else if (startMs > state.open.startMs) {
+        const rollup = this.closeWindow(serverId, state);
+        if (rollup) rollups.push(rollup);
+        state.open = new WindowAccumulator(startMs, startMs + this.windowMs);
+      } else if (startMs < state.open.startMs) {
+        late += 1;
+        continue;
+      }
+      state.open.add(event, state.sessions);
+      accepted += 1;
+    }
+
+    return {
+      checkpoint: this.checkpoint(state),
+      rollups,
+      receipt: { accepted, late, closed: rollups.length },
+    };
+  }
+
+  private restore(value: unknown): ServerState {
+    const checkpoint = value ?? EMPTY_TELEMETRY_CHECKPOINT;
+    if (!validCheckpoint(checkpoint)) throw new Error("Telemetry server checkpoint is invalid");
+    return {
+      open: checkpoint.open === null ? null : WindowAccumulator.fromCheckpoint(checkpoint.open),
+      sessions: SessionLedger.fromCheckpoint(checkpoint.sessions, this.maxSessionMs),
+      lastClosedStartMs: checkpoint.last_closed_start_ms ?? Number.NEGATIVE_INFINITY,
+    };
+  }
+
+  private checkpoint(state: ServerState): TelemetryServerCheckpoint {
+    return {
+      version: 1,
+      open: state.open?.checkpoint() ?? null,
+      sessions: state.sessions.checkpoint(),
+      last_closed_start_ms:
+        state.lastClosedStartMs === Number.NEGATIVE_INFINITY ? null : state.lastClosedStartMs,
+    };
+  }
+
   private stateFor(serverId: string): ServerState {
     const existing = this.servers.get(serverId);
     if (existing) return existing;
-    const created: ServerState = {
-      open: null,
-      sessions: new SessionLedger(this.maxSessionMs),
-      lastClosedStartMs: Number.NEGATIVE_INFINITY,
-    };
+    const created = this.restore(null);
     this.servers.set(serverId, created);
     return created;
   }
 
-  private closeWindow(serverId: string, state: ServerState): void {
+  private closeWindow(serverId: string, state: ServerState): WorldEventsRollup | null {
     const open = state.open;
-    if (open === null) return;
-
+    if (open === null) return null;
     const rollup: WorldEventsRollup = {
       server_id: serverId,
       window_start: new Date(open.startMs).toISOString(),
       window_end: new Date(open.endMs).toISOString(),
       metrics: open.toMetrics(),
     };
-
-    // Dropping the accumulator here is what makes the window the only place
-    // individual events are ever reflected, and even there only as counters.
     state.open = null;
     state.lastClosedStartMs = open.startMs;
     state.sessions.prune(open.endMs);
-
-    this.enqueue(rollup);
+    return rollup;
   }
 
-  /**
-   * Hand one rollup to the store without letting it reach the caller.
-   *
-   * A store that rejects, throws before returning a promise, or never resolves
-   * must not fail an ingest request. The chain keeps writes ordered, the catch
-   * makes every failure terminal for that one window, and the counter means a
-   * broken store is visible rather than silent.
-   */
+  private async mutateDurableState(serverId: string, force: boolean, nowMs: number): Promise<void> {
+    if (!isDurableRollupStore(this.store)) return;
+    await this.withDeadline(
+      this.store.mutateCheckpoint(serverId, (checkpoint): TelemetryStateMutation => {
+        const state = this.restore(checkpoint);
+        const rollups: WorldEventsRollup[] = [];
+        if (state.open && (force || state.open.endMs <= nowMs)) {
+          const rollup = this.closeWindow(serverId, state);
+          if (rollup) rollups.push(rollup);
+        }
+        return { checkpoint: this.checkpoint(state), rollups };
+      }),
+    );
+  }
+
   private enqueue(rollup: WorldEventsRollup): void {
     this.writes = this.writes.then(async () => {
       try {
-        await this.putWithDeadline(rollup);
+        await this.withDeadline(this.store.put(rollup));
       } catch (error) {
         this.droppedWindows += 1;
         this.onStoreError(error, rollup);
@@ -223,16 +285,14 @@ export class TelemetryAggregator {
     });
   }
 
-  private async putWithDeadline(rollup: WorldEventsRollup): Promise<void> {
+  private async withDeadline<T>(operation: Promise<T>): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await Promise.race([
-        // Called inside the race rather than before it so a store that throws
-        // synchronously is caught here too, not on the caller's stack.
-        (async () => this.store.put(rollup))(),
+      return await Promise.race([
+        operation,
         new Promise<never>((_resolve, reject) => {
           timer = setTimeout(
-            () => reject(new Error("rollup store did not respond in time")),
+            () => reject(new Error("telemetry store did not respond in time")),
             this.storeTimeoutMs,
           );
         }),

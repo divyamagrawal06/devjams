@@ -131,6 +131,8 @@ const app = new Elysia()
     }
     return {
       server_id: params.id,
+      window: "1h",
+      available: true,
       window_start: new Date(Date.now() - 3_600_000).toISOString(),
       window_end: new Date().toISOString(),
       metrics: rollups.get(params.id),
@@ -215,6 +217,13 @@ const app = new Elysia()
       const versions = ruleVersions.get(params.id) ?? [];
       const target = versions.find((v) => v.version === body.rule_set_version);
       const digest = target?.content_digest ?? contentDigest({ unknown: body.rule_set_version });
+      if (
+        body.content_digest !== undefined &&
+        (!target?.artifact_digest || !digestsEqual(body.content_digest, target.artifact_digest))
+      ) {
+        set.status = 409;
+        return { error: "Requested digest is not the immutable candidate artifact" };
+      }
 
       const reason = checkApproval({
         token: body.approval_token,
@@ -267,6 +276,7 @@ const app = new Elysia()
     {
       body: t.Object({
         rule_set_version: t.Integer(),
+        content_digest: t.Optional(t.String()),
         approval_token: t.Optional(t.String()),
       }),
       query: t.Object({

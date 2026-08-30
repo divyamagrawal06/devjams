@@ -119,3 +119,26 @@ export const controlPlaneEvents = pgTable(
     ),
   ],
 );
+
+/**
+ * Cost guard for agent authoring. The prompt and model output are deliberately
+ * absent: this table records only that a principal spent one bounded attempt.
+ */
+export const agentDraftAttempts = pgTable(
+  "agent_draft_attempts",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    serverId: text("server_id")
+      .notNull()
+      .references(() => gameServers.id, { onDelete: "cascade" }),
+    principalId: text("principal_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("agent_draft_attempts_scope_idx").on(table.serverId, table.principalId, table.createdAt),
+    check(
+      "agent_draft_attempts_principal_length_check",
+      sql`char_length(${table.principalId}) BETWEEN 1 AND 128`,
+    ),
+  ],
+);

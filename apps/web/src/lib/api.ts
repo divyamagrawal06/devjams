@@ -200,6 +200,48 @@ export type ChangeDetailResponse = {
   data: ChangeEnvelopeDetail;
 };
 
+export type MachineTokenSummary = {
+  id: string;
+  name: string;
+  created_at: string;
+  expires_at: string;
+  revoked_at: string | null;
+  active: boolean;
+};
+
+export type MachineTokenListResponse = { items: MachineTokenSummary[] };
+
+export type MintedMachineToken = {
+  id: string;
+  name: string;
+  token: string;
+  created_at: string;
+  expires_at: string;
+};
+
+export type WorldFeedResponse = {
+  server_id: string;
+  window: "1h" | "6h" | "24h";
+  available: boolean;
+  window_start: string | null;
+  window_end: string | null;
+  rollup_windows: number;
+  observed_at: string;
+  privacy: string;
+  unique_players_is_lower_bound: boolean;
+  metrics: {
+    joins: number;
+    leaves: number;
+    deaths: number;
+    blocks_placed: number;
+    blocks_broken: number;
+    chat_messages: number;
+    unique_players: number;
+    mean_session_seconds: number | null;
+    seconds_in_region: Record<string, number>;
+  } | null;
+};
+
 type ApiErrorBody = Record<string, unknown> | string | null;
 
 export class ApiError extends Error {

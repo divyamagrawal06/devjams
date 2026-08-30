@@ -57,12 +57,13 @@ export interface DeploymentStore {
   completeQueue(id: string): Promise<void>;
   listRecoverable(): Promise<DeploymentRecord[]>;
   findRuleHead(serverId: string): Promise<RuleHead | null>;
-  recordCutover(input: {
+  commitCutover(input: {
     serverId: string;
     deploymentId: string;
     version: string;
     digest: string;
-  }): Promise<void>;
+    workerId: string;
+  }): Promise<DeploymentRecord>;
 }
 
 type DeploymentRow = typeof deployments.$inferSelect;
@@ -202,9 +203,7 @@ export class DrizzleDeploymentStore implements DeploymentStore {
       const [active] = await tx
         .select({ value: count() })
         .from(deployments)
-        .where(
-          and(eq(deployments.queueStatus, "running"), sql`${deployments.leaseExpiresAt} > now()`),
-        );
+        .where(eq(deployments.queueStatus, "running"));
       if (Number(active?.value ?? 0) >= maxConcurrent) return null;
 
       const [candidate] = await tx
@@ -254,6 +253,7 @@ export class DrizzleDeploymentStore implements DeploymentStore {
           eq(deployments.id, id),
           eq(deployments.queueStatus, "running"),
           eq(deployments.workerId, workerId),
+          sql`${deployments.leaseExpiresAt} > now()`,
         ),
       )
       .returning({ id: deployments.id });
@@ -288,28 +288,52 @@ export class DrizzleDeploymentStore implements DeploymentStore {
       : null;
   }
 
-  async recordCutover(input: {
+  async commitCutover(input: {
     serverId: string;
     deploymentId: string;
     version: string;
     digest: string;
-  }): Promise<void> {
-    await db.execute(sql`
-      INSERT INTO ${serverRuleHeads} (
-        server_id, current_version, current_digest, previous_version,
-        previous_digest, current_deployment_id, updated_at
-      ) VALUES (
-        ${input.serverId}, ${input.version}, ${input.digest}, NULL,
-        NULL, ${input.deploymentId}, now()
-      )
-      ON CONFLICT (server_id) DO UPDATE SET
-        previous_version = ${serverRuleHeads.currentVersion},
-        previous_digest = ${serverRuleHeads.currentDigest},
-        current_version = excluded.current_version,
-        current_digest = excluded.current_digest,
-        current_deployment_id = excluded.current_deployment_id,
-        updated_at = now()
-    `);
+    workerId: string;
+  }): Promise<DeploymentRecord> {
+    return db.transaction(async (tx) => {
+      const [updated] = await tx
+        .update(deployments)
+        .set({ state: "draining", updatedAt: sql`now()` })
+        .where(
+          and(
+            eq(deployments.id, input.deploymentId),
+            eq(deployments.state, "verifying"),
+            eq(deployments.queueStatus, "running"),
+            eq(deployments.workerId, input.workerId),
+            sql`${deployments.leaseExpiresAt} > now()`,
+          ),
+        )
+        .returning();
+      if (!updated) throw new Error(`Deployment ${input.deploymentId} lost its cutover lease`);
+
+      await tx.insert(deploymentStateEvents).values({
+        deploymentId: input.deploymentId,
+        state: "draining",
+        detail: "cutover committed",
+      });
+      await tx.execute(sql`
+        INSERT INTO ${serverRuleHeads} (
+          server_id, current_version, current_digest, previous_version,
+          previous_digest, current_deployment_id, updated_at
+        ) VALUES (
+          ${input.serverId}, ${input.version}, ${input.digest}, NULL,
+          NULL, ${input.deploymentId}, now()
+        )
+        ON CONFLICT (server_id) DO UPDATE SET
+          previous_version = ${serverRuleHeads.currentVersion},
+          previous_digest = ${serverRuleHeads.currentDigest},
+          current_version = excluded.current_version,
+          current_digest = excluded.current_digest,
+          current_deployment_id = excluded.current_deployment_id,
+          updated_at = now()
+      `);
+      return toRecord(updated);
+    });
   }
 }
 
@@ -369,12 +393,7 @@ export class MemoryDeploymentStore implements DeploymentStore {
     leaseMs: number,
   ): Promise<string | null> {
     const now = this.now();
-    const active = [...this.records.values()].filter(
-      (row) =>
-        row.queueStatus === "running" &&
-        row.leaseExpiresAt !== null &&
-        new Date(row.leaseExpiresAt) > now,
-    );
+    const active = [...this.records.values()].filter((row) => row.queueStatus === "running");
     if (active.length >= maxConcurrent) return null;
     const candidate = [...this.records.values()]
       .filter((row) => row.queueStatus === "waiting")
@@ -396,7 +415,14 @@ export class MemoryDeploymentStore implements DeploymentStore {
 
   async renewLease(id: string, workerId: string, leaseMs: number): Promise<boolean> {
     const record = this.records.get(id);
-    if (record?.queueStatus !== "running" || record.workerId !== workerId) return false;
+    if (
+      record?.queueStatus !== "running" ||
+      record.workerId !== workerId ||
+      record.leaseExpiresAt === null ||
+      new Date(record.leaseExpiresAt) <= this.now()
+    ) {
+      return false;
+    }
     record.leaseExpiresAt = new Date(this.now().getTime() + leaseMs).toISOString();
     return true;
   }
@@ -416,12 +442,30 @@ export class MemoryDeploymentStore implements DeploymentStore {
     return this.heads.get(serverId) ?? null;
   }
 
-  async recordCutover(input: {
+  async commitCutover(input: {
     serverId: string;
     deploymentId: string;
     version: string;
     digest: string;
-  }): Promise<void> {
+    workerId: string;
+  }): Promise<DeploymentRecord> {
+    const deployment = this.records.get(input.deploymentId);
+    if (
+      deployment?.state !== "verifying" ||
+      deployment.queueStatus !== "running" ||
+      deployment.workerId !== input.workerId ||
+      deployment.leaseExpiresAt === null ||
+      new Date(deployment.leaseExpiresAt) <= this.now()
+    ) {
+      throw new Error(`Deployment ${input.deploymentId} lost its cutover lease`);
+    }
+
+    deployment.state = "draining";
+    this.events.push({
+      deploymentId: input.deploymentId,
+      state: "draining",
+      detail: "cutover committed",
+    });
     const current = this.heads.get(input.serverId);
     this.heads.set(input.serverId, {
       currentVersion: input.version,
@@ -429,6 +473,7 @@ export class MemoryDeploymentStore implements DeploymentStore {
       previousVersion: current?.currentVersion ?? null,
       previousDigest: current?.currentDigest ?? null,
     });
+    return { ...deployment };
   }
 }
 

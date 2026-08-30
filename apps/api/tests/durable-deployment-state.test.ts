@@ -67,6 +67,24 @@ describe("durable deployment queue and reconciliation", () => {
 
     now = new Date("2026-08-30T12:01:30.001Z");
     expect(await store.listRecoverable()).toHaveLength(2);
+    await expect(restartedWorker.claimNext()).resolves.toBeNull();
+    await expect(firstWorker.renew("dep_first")).resolves.toBe(false);
+  });
+
+  test("fills every configured worker slot in durable FIFO order", async () => {
+    const store = new MemoryDeploymentStore();
+    await store.create(deployment("dep_first"));
+    await store.create(deployment("dep_second"));
+    await store.create(deployment("dep_third"));
+    const queue = new DurableDeploymentQueue(store, {
+      workerId: "worker_pool",
+      maxConcurrent: 2,
+      leaseMs: 60_000,
+    });
+
+    await expect(queue.claimAvailable()).resolves.toEqual(["dep_first", "dep_second"]);
+    await queue.complete("dep_first");
+    await expect(queue.claimAvailable()).resolves.toEqual(["dep_third"]);
   });
 
   test("defines conservative restart actions for every in-flight boundary", () => {
@@ -80,25 +98,40 @@ describe("durable deployment queue and reconciliation", () => {
   });
 
   test("persists transitions and rollback heads independently of one worker", async () => {
-    const store = new MemoryDeploymentStore();
+    const store = new MemoryDeploymentStore(() => new Date("2026-08-30T12:00:00.000Z"));
     await store.create(deployment("dep_change"));
     await store.transition("dep_change", "building", {}, "worker admitted");
-    await store.transition("dep_change", "verifying", { candidatePod: "candidate-b" });
-    await store.recordCutover({
+    await store.transition("dep_change", "verifying", {
+      candidatePod: "candidate-b",
+      queueStatus: "running",
+      workerId: "worker_one",
+      leaseExpiresAt: "2026-08-30T12:15:00.000Z",
+    });
+    await store.commitCutover({
       serverId: "srv_alpha",
       deploymentId: "dep_change",
       version: "7",
       digest: `sha256:${"a".repeat(64)}`,
+      workerId: "worker_one",
     });
-    await store.recordCutover({
+    await store.create(
+      deployment("dep_next", {
+        state: "verifying",
+        queueStatus: "running",
+        workerId: "worker_two",
+        leaseExpiresAt: "2026-08-30T12:15:00.000Z",
+      }),
+    );
+    await store.commitCutover({
       serverId: "srv_alpha",
       deploymentId: "dep_next",
       version: "8",
       digest: `sha256:${"c".repeat(64)}`,
+      workerId: "worker_two",
     });
 
     const restartedReader = store;
-    expect((await restartedReader.find("dep_change"))?.state).toBe("verifying");
+    expect((await restartedReader.find("dep_change"))?.state).toBe("draining");
     expect((await restartedReader.find("dep_change"))?.candidatePod).toBe("candidate-b");
     expect(await restartedReader.findRuleHead("srv_alpha")).toEqual({
       currentVersion: "8",
@@ -106,7 +139,38 @@ describe("durable deployment queue and reconciliation", () => {
       previousVersion: "7",
       previousDigest: `sha256:${"a".repeat(64)}`,
     });
-    expect(store.events.map((event) => event.state)).toEqual(["queued", "building", "verifying"]);
+    expect(store.events.map((event) => event.state)).toEqual([
+      "queued",
+      "building",
+      "verifying",
+      "draining",
+      "verifying",
+      "draining",
+    ]);
+  });
+
+  test("does not advance either cutover state or rule head after lease expiry", async () => {
+    const store = new MemoryDeploymentStore(() => new Date("2026-08-30T12:00:00.000Z"));
+    await store.create(
+      deployment("dep_expired", {
+        state: "verifying",
+        queueStatus: "running",
+        workerId: "worker_old",
+        leaseExpiresAt: "2026-08-30T12:00:00.000Z",
+      }),
+    );
+
+    await expect(
+      store.commitCutover({
+        serverId: "srv_alpha",
+        deploymentId: "dep_expired",
+        version: "7",
+        digest: `sha256:${"a".repeat(64)}`,
+        workerId: "worker_old",
+      }),
+    ).rejects.toThrow(/lost its cutover lease/);
+    expect((await store.find("dep_expired"))?.state).toBe("verifying");
+    await expect(store.findRuleHead("srv_alpha")).resolves.toBeNull();
   });
 
   test("makes headroom reservation idempotent and owner-bound", async () => {

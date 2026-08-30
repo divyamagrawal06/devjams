@@ -7,9 +7,35 @@ import { releaseDeploymentHeadroom, reserveDeploymentHeadroom } from "../quota/h
 import { issueTransfer, waitForAck } from "../velocity/transfers";
 import { AuthClient } from "./invariant";
 import { deploymentQueue } from "./queue";
-import { type DeploymentPatch, type DeploymentRecord, deploymentStore } from "./store";
+import {
+  type DeploymentPatch,
+  type DeploymentRecord,
+  deploymentStore,
+  type RuleHead,
+} from "./store";
 
 const nowIso = () => new Date().toISOString();
+
+type RollbackTargetLookup = (serverId: string) => RuleHead | null | Promise<RuleHead | null>;
+
+export async function rollbackTargetError(
+  serverId: string,
+  targetVersion: string,
+  approvedContentDigest: string,
+  lookup: RollbackTargetLookup = (id) => deploymentStore.findRuleHead(id),
+): Promise<string | null> {
+  const head = await lookup(serverId);
+  if (!head?.previousVersion || !head.previousDigest) {
+    return "No rollback target recorded for this server";
+  }
+  if (head.previousVersion !== targetVersion) {
+    return "Rollback target does not match the recorded previous version";
+  }
+  if (!digestsEqual(head.previousDigest, approvedContentDigest)) {
+    return "Rollback digest does not match the recorded previous artifact";
+  }
+  return null;
+}
 
 export function assertApprovedArtifactDigest(approvedDigest: string, builtDigest: string): void {
   if (!digestsEqual(approvedDigest, builtDigest)) {
@@ -50,11 +76,12 @@ async function transition(
   patch: DeploymentPatch = {},
   detail: string | null = null,
 ): Promise<DeploymentRecord> {
-  const row = await deploymentStore.transition(id, state, patch, detail);
-  if (row.queueStatus === "running") {
+  const current = await deploymentStore.find(id);
+  if (current?.queueStatus === "running") {
     const renewed = await deploymentQueue.renew(id);
     if (!renewed) throw new Error(`Deployment ${id} lost its durable queue lease`);
   }
+  const row = await deploymentStore.transition(id, state, patch, detail);
   row.queuePosition = state === "queued" ? await deploymentQueue.position(id) : null;
   return row;
 }
@@ -95,8 +122,7 @@ export async function enqueueDeploy(input: {
     workerId: null,
     leaseExpiresAt: null,
   });
-  const admitted = await deploymentQueue.claimNext();
-  if (admitted) startMachine(admitted);
+  await startAvailable();
   const current = (await deploymentStore.find(id)) ?? created;
   return view(current);
 }
@@ -151,9 +177,9 @@ async function failAndAbort(id: string, error: unknown): Promise<void> {
   await abortDeployment(id, message);
 }
 
-async function startNext(): Promise<void> {
-  const admitted = await deploymentQueue.claimNext();
-  if (admitted) startMachine(admitted);
+async function startAvailable(): Promise<void> {
+  const admitted = await deploymentQueue.claimAvailable();
+  for (const deploymentId of admitted) startMachine(deploymentId);
 }
 
 export async function abortDeployment(id: string, error?: string): Promise<DeploymentView> {
@@ -175,8 +201,7 @@ export async function abortDeployment(id: string, error?: string): Promise<Deplo
     });
   }
   await releaseDeploymentHeadroom(id);
-  await deploymentQueue.complete(id);
-  const next = await transition(
+  const next = await deploymentStore.transition(
     id,
     "aborted",
     {
@@ -189,7 +214,7 @@ export async function abortDeployment(id: string, error?: string): Promise<Deplo
     },
     error ?? "aborted by operator",
   );
-  await startNext();
+  await startAvailable();
   return view(next);
 }
 
@@ -200,19 +225,15 @@ export async function rollbackServer(input: {
   initiatedBy: string;
   userId: string;
 }): Promise<DeploymentView> {
-  const head = await deploymentStore.findRuleHead(input.serverId);
-  if (!head?.previousVersion || !head.previousDigest) {
-    throw new Error("No rollback target recorded for this server");
-  }
-  if (head.previousVersion !== input.targetVersion) {
-    throw new Error("Rollback target does not match the recorded previous version");
-  }
-  if (!digestsEqual(head.previousDigest, input.approvedContentDigest)) {
-    throw new Error("Rollback digest does not match the recorded previous artifact");
-  }
+  const targetError = await rollbackTargetError(
+    input.serverId,
+    input.targetVersion,
+    input.approvedContentDigest,
+  );
+  if (targetError) throw new Error(targetError);
   return enqueueDeploy({
     serverId: input.serverId,
-    ruleSetVersion: head.previousVersion,
+    ruleSetVersion: input.targetVersion,
     approvedContentDigest: input.approvedContentDigest,
     initiatedBy: input.initiatedBy,
     userId: input.userId,
@@ -245,7 +266,7 @@ export async function reconcileInFlight(): Promise<void> {
       await abortDeployment(row.id, "reconciled after backend restart before cutover");
     }
   }
-  await startNext();
+  await startAvailable();
 }
 
 export async function completeCutover(id: string): Promise<void> {
@@ -267,20 +288,19 @@ export async function completeCutover(id: string): Promise<void> {
   await waitForAck(transferId);
   const draining = new AuthClient("draining");
   draining.assertCanRetireA();
-  await deploymentStore.recordCutover({
+  await deploymentStore.commitCutover({
     serverId: row.serverId,
     deploymentId: id,
     version: row.toVersion,
     digest: row.approvedContentDigest,
+    workerId: deploymentQueue.workerId,
   });
-  await transition(id, "draining");
   await transition(id, "idle", {
     finishedAt: nowIso(),
     queueStatus: "complete",
     workerId: null,
     leaseExpiresAt: null,
   });
-  await deploymentQueue.complete(id);
   await releaseDeploymentHeadroom(id);
-  await startNext();
+  await startAvailable();
 }

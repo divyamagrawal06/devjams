@@ -18,7 +18,7 @@ export async function buildRuleJar(ruleJson: unknown): Promise<BuildRuleJarResul
   const payload = existsSync(STATIC_JAR)
     ? readFileSync(STATIC_JAR)
     : Buffer.from(JSON.stringify(ruleJson ?? readStaticRule()), "utf8");
-  const contentDigest = createHash("sha256").update(payload).digest("hex");
+  const contentDigest = `sha256:${createHash("sha256").update(payload).digest("hex")}`;
   return {
     jarUrl: existsSync(STATIC_JAR) ? `file://${STATIC_JAR}` : "fixture://static-rule.json",
     contentDigest,

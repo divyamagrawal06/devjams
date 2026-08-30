@@ -35,6 +35,15 @@ export class DurableDeploymentQueue {
     return this.store.claimNext(this.workerId, this.maxConcurrent, this.leaseMs);
   }
 
+  async claimAvailable(): Promise<string[]> {
+    const claimed: string[] = [];
+    while (true) {
+      const deploymentId = await this.claimNext();
+      if (!deploymentId) return claimed;
+      claimed.push(deploymentId);
+    }
+  }
+
   renew(id: string): Promise<boolean> {
     return this.store.renewLease(id, this.workerId, this.leaseMs);
   }

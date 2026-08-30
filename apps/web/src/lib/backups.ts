@@ -72,8 +72,6 @@ export function backupStatusTone(
 
 export function backupIsBusy(backup: Pick<Backup, "activeOperation" | "status">): boolean {
   return (
-    backup.activeOperation !== null ||
-    backup.status === "pending" ||
-    backup.status === "in_progress"
+    backup.activeOperation != null || backup.status === "pending" || backup.status === "in_progress"
   );
 }
